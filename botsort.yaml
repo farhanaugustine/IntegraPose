@@ -1,3 +1,5 @@
+# Adapted from Ultralytics
+
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 # Default Ultralytics settings for BoT-SORT tracker when using mode="track"
