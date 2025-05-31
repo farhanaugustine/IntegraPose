@@ -1,3 +1,4 @@
+[![DOI](https://zenodo.org/badge/988759361.svg)](https://doi.org/10.5281/zenodo.15565090)
 # IntegraPose - Simultaneous Behavior Classification and Pose Estimation
 ### This repo is to demonstrate multi-task learning for combined object detection and pose-estimations using YOLO-Pose models. IntegraPose enables robust, simultaneous classification of complex behaviors and precise keypoint tracking from a single model.
 
