@@ -1,4 +1,5 @@
-# File: main_integra_pose_app.py (Part 1 Refactored)
+# File: main_integra_pose_app.py (partial refactoring) 
+# Added more visualizations, but visualization doesn't auto-update when making new visualization. Thus, you'll have to restart the app. Will fix in the next update.
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, PanedWindow, simpledialog
 import os
