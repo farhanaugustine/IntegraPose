@@ -181,7 +181,43 @@ class YoloApp:
 
     def _generate_yaml_from_gui(self):
         
-        kp_names = [n.strip() for n in self.keypoint_names_str.get().split(',') if n.strip()]
+        if self.annotator_instance is None:
+            kp_names = [n.strip() for n in self.keypoint_names_str.get().split(',') if n.strip()]
+            if not kp_names:
+                messagebox.showerror("Error", "Valid keypoint names are required to generate YAML.", parent=self.root)
+                return
+            if not self.behaviors_list:
+                messagebox.showerror("Error", "Behaviors list cannot be empty to generate YAML.", parent=self.root)
+                return
+
+            available_behaviors = OrderedDict((b['id'], b['name']) for b in sorted(self.behaviors_list, key=lambda b: b['id']))
+            
+            try:
+                # The annotator will be created without a parent tk_window for this action.
+                temp_annotator = KeypointBehaviorAnnotator(self.root, kp_names, available_behaviors, image_dir=".", output_dir=".")
+                self.annotator_instance = temp_annotator
+            except FileNotFoundError:
+                # This can happen if the dummy image_dir="." has no images. The class is robust enough to handle this for YAML generation.
+                pass
+            except Exception as e:
+                messagebox.showerror("Initialization Error", f"Could not prepare for YAML generation: {e}", parent=self.root)
+                return
+
+    dataset_root = self.dataset_root_yaml.get()
+    train_images = self.train_image_dir_yaml.get()
+    val_images = self.val_image_dir_yaml.get()
+    dataset_name = self.dataset_name_yaml.get()
+
+    
+    if self.annotator_instance:
+        self.annotator_instance.generate_config_yaml(
+            dataset_root_path=dataset_root,
+            train_images_path=train_images,
+            val_images_path=val_images,
+            dataset_name_suggestion=dataset_name
+        )
+    else:
+        messagebox.showerror("Error", "Annotator instance is not available. Please try launching the annotator at least once.", parent=self.root)
         
 
     def _start_training(self):
