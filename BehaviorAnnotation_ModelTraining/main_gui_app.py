@@ -51,7 +51,7 @@ class YoloApp:
         setup_tab.create_setup_tab(self)
         training_tab.create_training_tab(self)
         inference_tab.create_inference_tab(self)
-        # Create the new webcam tab UI
+        
         webcam_tab.create_webcam_tab(self)
 
         self.root.columnconfigure(0, weight=1)
@@ -61,7 +61,7 @@ class YoloApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
         
     def _initialize_variables(self):
-        # This is now a central place for all tk variables.
+        
         # --- Paths & General ---
         self.image_dir_annot = tk.StringVar()
         self.train_image_dir_yaml = tk.StringVar()
@@ -159,7 +159,7 @@ class YoloApp:
 
     # --- Core Functionality Methods ---
     def _launch_annotator(self):
-        # I am adding these calls to ensure no inference processes are running.
+       
         self._stop_inference()
         self._stop_webcam_inference()
 
@@ -189,36 +189,36 @@ class YoloApp:
             if not self.behaviors_list:
                 messagebox.showerror("Error", "Behaviors list cannot be empty to generate YAML.", parent=self.root)
                 return
-
+            
             available_behaviors = OrderedDict((b['id'], b['name']) for b in sorted(self.behaviors_list, key=lambda b: b['id']))
             
             try:
-                # The annotator will be created without a parent tk_window for this action.
+            
                 temp_annotator = KeypointBehaviorAnnotator(self.root, kp_names, available_behaviors, image_dir=".", output_dir=".")
                 self.annotator_instance = temp_annotator
             except FileNotFoundError:
-                # This can happen if the dummy image_dir="." has no images. The class is robust enough to handle this for YAML generation.
-                pass
+            
+                 pass
             except Exception as e:
                 messagebox.showerror("Initialization Error", f"Could not prepare for YAML generation: {e}", parent=self.root)
                 return
 
-    dataset_root = self.dataset_root_yaml.get()
-    train_images = self.train_image_dir_yaml.get()
-    val_images = self.val_image_dir_yaml.get()
-    dataset_name = self.dataset_name_yaml.get()
-
-    
-    if self.annotator_instance:
-        self.annotator_instance.generate_config_yaml(
-            dataset_root_path=dataset_root,
-            train_images_path=train_images,
-            val_images_path=val_images,
-            dataset_name_suggestion=dataset_name
-        )
-    else:
-        messagebox.showerror("Error", "Annotator instance is not available. Please try launching the annotator at least once.", parent=self.root)
         
+        dataset_root = self.dataset_root_yaml.get()
+        train_images = self.train_image_dir_yaml.get()
+        val_images = self.val_image_dir_yaml.get()
+        dataset_name = self.dataset_name_yaml.get()
+
+        
+        if self.annotator_instance:
+            self.annotator_instance.generate_config_yaml(
+                dataset_root_path=dataset_root,
+                train_images_path=train_images,
+                val_images_path=val_images,
+                dataset_name_suggestion=dataset_name
+            )
+        else:
+            messagebox.showerror("Error", "Annotator instance is not available. Please try launching the annotator at least once.", parent=self.root)
 
     def _start_training(self):
         cmd, err = command_builder.build_training_command(self)
