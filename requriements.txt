@@ -1,0 +1,21 @@
+# Main deep learning and computer vision libraries
+ultralytics
+opencv-python
+
+# Data handling and numerical operations
+# Specific numpy version to ensure compatibility with lap
+numpy==1.26.4
+pandas
+PyYAML
+
+# Visualization and GUI
+matplotlib
+Pillow
+
+# Clustering and dimensionality reduction
+umap-learn
+hdbscan
+
+# Utilities
+tqdm
+lap
