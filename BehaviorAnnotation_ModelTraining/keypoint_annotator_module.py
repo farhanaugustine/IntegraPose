@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import cv2
 import os
 import tkinter as tk
@@ -9,19 +8,18 @@ import yaml
 from collections import OrderedDict
 import time
 
-# --- Style Configuration ---
-KP_VISIBLE_COLOR = (0, 255, 0)      # Green
-KP_INVISIBLE_COLOR = (0, 0, 255)    # Red
-BBOX_CURRENT_TEMP_COLOR = (255, 255, 0) # Cyan
-BBOX_CURRENT_FINAL_COLOR = (0, 255, 255) # Yellow
-BBOX_COMPLETED_COLOR = (255, 0, 255)      # Magenta
-TEXT_COLOR = (200, 0, 0) # Main instruction color (BGR: Blue)
-STATUS_TEXT_COLOR = (0, 0, 0)       # Black
-HELP_TEXT_COLOR = (50, 50, 50)      # Dark Gray
-ZOOM_PAN_TEXT_COLOR = (0, 100, 0)   # Dark Green
-AUTOSAVE_MSG_COLOR = (0, 0, 150)    # Dark Red
-BEHAVIOR_TEXT_ON_BOX_COLOR = (0,0,0) # Black
-BEHAVIOR_BOX_BACKGROUND_COLOR = (255, 255, 255) # White
+# --- Constants ---
+KP_VISIBLE_COLOR = (0, 255, 0)
+KP_INVISIBLE_COLOR = (0, 0, 255)
+BBOX_CURRENT_TEMP_COLOR = (255, 255, 0)
+BBOX_COMPLETED_COLOR = (255, 0, 255)
+TEXT_COLOR = (200, 0, 0)
+STATUS_TEXT_COLOR = (0, 0, 0)
+HELP_TEXT_COLOR = (50, 50, 50)
+ZOOM_PAN_TEXT_COLOR = (0, 100, 0)
+AUTOSAVE_MSG_COLOR = (0, 0, 150)
+BEHAVIOR_TEXT_ON_BOX_COLOR = (0,0,0)
+BEHAVIOR_BOX_BACKGROUND_COLOR = (255, 255, 255)
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 FONT_SCALE_MAIN_INSTRUCTION = 0.6
@@ -30,30 +28,29 @@ FONT_SCALE_GENERAL_STATUS = 0.45
 FONT_SCALE_HELP_PROMPT = 0.4
 FONT_SCALE_FULL_HELP = 0.45
 FONT_SCALE_TOOLTIP = 0.45
-FONT_SCALE_ANNOTATION_INFO = 0.4 # For behavior text on completed boxes
-FONT_SCALE_KP_NUMBER = 0.35      # For numbers next to current keypoints
+FONT_SCALE_ANNOTATION_INFO = 0.4
+FONT_SCALE_KP_NUMBER = 0.35
 
 FONT_THICKNESS = 1
 COMPLETED_LINE_THICKNESS = 1
 CURRENT_LINE_THICKNESS = 2
 
-# --- Annotation Modes ---
+# --- Modes & States ---
 MODE_SELECT_BEHAVIOR = "select_behavior"
 MODE_KP = "keypoints"
 MODE_BBOX_START = "bbox_start"
 MODE_BBOX_END = "bbox_end"
 
-# --- Visibility Flags (YOLO standard) ---
 VISIBILITY_NOT_LABELED = 0
-VISIBILITY_LABELED_NOT_VISIBLE = 1 # Often used for occluded keypoints
+VISIBILITY_LABELED_NOT_VISIBLE = 1
 VISIBILITY_LABELED_VISIBLE = 2
 
-# --- Autosave Configuration ---
-AUTOSAVE_INTERVAL_SECONDS = 300 # 5 minutes
+# --- Configuration ---
+AUTOSAVE_INTERVAL_SECONDS = 300
 ENABLE_AUTOSAVE = True
-
-MIN_WINDOW_DIM_THRESHOLD = 100 # Minimum acceptable dimension from getWindowImageRect
-
+MIN_WINDOW_DIM_THRESHOLD = 100
+# Refactored: Added a minimum dimension for bounding boxes to prevent tiny/invalid boxes
+MIN_BBOX_DIMENSION = 4
 
 class KeypointBehaviorAnnotator:
     def __init__(self, master_tk_window, keypoint_names, available_behaviors, image_dir, output_dir):
@@ -74,10 +71,9 @@ class KeypointBehaviorAnnotator:
 
         self.image_files = self._get_image_files()
         if not self.image_files:
-             messagebox.showerror("Error", f"No valid image files found in annotation image directory: {self.image_dir}", parent=self.master_tk_window)
-             raise FileNotFoundError(f"No valid image files for annotation in {self.image_dir}")
+            messagebox.showerror("Error", f"No valid image files found in annotation image directory: {self.image_dir}", parent=self.master_tk_window)
+            raise FileNotFoundError(f"No valid image files for annotation in {self.image_dir}")
 
-        os.makedirs(self.output_dir, exist_ok=True)
         print(f"Annotator initialized for image directory: {self.image_dir}")
         print(f"Found {len(self.image_files)} images for annotation.")
         print(f"Output directory for annotations (labels): {self.output_dir}")
@@ -101,7 +97,7 @@ class KeypointBehaviorAnnotator:
         self.current_bbox_end_point = None
         self.annotations_in_image = []
         self.current_mouse_pos_screen = None
-        self.current_mouse_pos_image = (0,0) # Initialize to avoid None access before first mouse move
+        self.current_mouse_pos_image = (0,0)
 
         self.current_kp_visibility_mode = VISIBILITY_LABELED_VISIBLE
 
@@ -124,15 +120,14 @@ class KeypointBehaviorAnnotator:
         self.default_window_width = 1280
         self.default_window_height = 720
 
-
     def _get_image_files(self):
         valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif')
         try:
             if not os.path.isdir(self.image_dir):
-                 messagebox.showerror("Error", f"Annotation image directory not found: {self.image_dir}", parent=self.master_tk_window)
-                 return []
+                messagebox.showerror("Error", f"Annotation image directory not found: {self.image_dir}", parent=self.master_tk_window)
+                return []
             files = [f for f in os.listdir(self.image_dir) if f.lower().endswith(valid_extensions)]
-            files = [f for f in files if not f.startswith('.')] # Ignore hidden files
+            files = [f for f in files if not f.startswith('.')]
             return sorted([os.path.join(self.image_dir, f) for f in files])
         except Exception as e:
             messagebox.showerror("Error", f"Error reading image directory: {e}", parent=self.master_tk_window)
@@ -155,6 +150,68 @@ class KeypointBehaviorAnnotator:
         self.annotations_changed_since_last_save = True
         print("Cleared all annotations for the current image.")
 
+    def _load_annotations_for_image(self):
+        if not self.current_image_path:
+            return
+
+        label_filename = os.path.splitext(os.path.basename(self.current_image_path))[0] + ".txt"
+        label_path = os.path.join(self.output_dir, label_filename)
+
+        if not os.path.exists(label_path):
+            return
+
+        loaded_annotations = []
+        img_w = float(self.img_width_orig)
+        img_h = float(self.img_height_orig)
+
+        try:
+            with open(label_path, 'r') as f:
+                for line in f:
+                    parts = [float(p) for p in line.strip().split()]
+                    if len(parts) < 5 + self.num_keypoints * 3:
+                        print(f"Warning: Skipping malformed line in {label_path}")
+                        continue
+
+                    b_id = int(parts[0])
+                    norm_cx, norm_cy, norm_w, norm_h = parts[1:5]
+                    box_w = norm_w * img_w
+                    box_h = norm_h * img_h
+                    x1 = int((norm_cx * img_w) - (box_w / 2))
+                    y1 = int((norm_cy * img_h) - (box_h / 2))
+                    x2 = int(x1 + box_w)
+                    y2 = int(y1 + box_h)
+
+                    loaded_kps = []
+                    kp_data_flat = parts[5:]
+                    for i in range(self.num_keypoints):
+                        norm_x = kp_data_flat[i * 3]
+                        norm_y = kp_data_flat[i * 3 + 1]
+                        visibility = int(kp_data_flat[i * 3 + 2])
+                        
+                        if visibility != VISIBILITY_NOT_LABELED:
+                            kp = {
+                                'name': self.keypoint_names[i],
+                                'x': int(norm_x * img_w),
+                                'y': int(norm_y * img_h),
+                                'v': visibility
+                            }
+                            loaded_kps.append(kp)
+
+                    loaded_annotations.append({
+                        'behavior_id': b_id,
+                        'behavior_name': self.available_behaviors.get(b_id, "Unknown"),
+                        'keypoints': loaded_kps,
+                        'bbox': (x1, y1, x2, y2)
+                    })
+            
+            if loaded_annotations:
+                self.annotations_in_image = loaded_annotations
+                self.annotations_changed_since_last_save = False
+                print(f"Loaded {len(loaded_annotations)} annotations from {label_path}")
+
+        except Exception as e:
+            print(f"Error loading annotation file {label_path}: {e}")
+
     def _load_image(self, index):
         if not (0 <= index < len(self.image_files)):
             print("Invalid image index.")
@@ -167,16 +224,15 @@ class KeypointBehaviorAnnotator:
         if raw_img is None:
             messagebox.showerror("Error", f"Failed to load image: {self.current_image_path}", parent=self.master_tk_window)
             return False
-
-        # --- Convert to BGR uint8 for display ---
+        
         display_img = None
         if raw_img.dtype != np.uint8:
-            if len(raw_img.shape) == 2 or (len(raw_img.shape) == 3 and raw_img.shape[2] == 1): # Grayscale
+            if len(raw_img.shape) == 2 or (len(raw_img.shape) == 3 and raw_img.shape[2] == 1):
                 temp_gray = cv2.normalize(raw_img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
                 display_img = cv2.cvtColor(temp_gray, cv2.COLOR_GRAY2BGR)
-            elif len(raw_img.shape) == 3 and raw_img.shape[2] == 3: # Color
+            elif len(raw_img.shape) == 3 and raw_img.shape[2] == 3:
                 display_img = cv2.normalize(raw_img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-            elif len(raw_img.shape) == 3 and raw_img.shape[2] == 4: # Color with Alpha
+            elif len(raw_img.shape) == 3 and raw_img.shape[2] == 4:
                 color_conversion_code = cv2.COLOR_BGRA2BGR
                 try:
                     temp_bgr = cv2.cvtColor(raw_img, color_conversion_code)
@@ -186,12 +242,12 @@ class KeypointBehaviorAnnotator:
             else:
                 messagebox.showerror("Image Error", f"Unsupported image type/channels for normalization: Shape {raw_img.shape}, Dtype {raw_img.dtype}", parent=self.master_tk_window)
                 return False
-        else: # Already uint8
-            if len(raw_img.shape) == 2 or (len(raw_img.shape) == 3 and raw_img.shape[2] == 1): # Grayscale
+        else:
+            if len(raw_img.shape) == 2 or (len(raw_img.shape) == 3 and raw_img.shape[2] == 1):
                 display_img = cv2.cvtColor(raw_img, cv2.COLOR_GRAY2BGR)
-            elif len(raw_img.shape) == 3 and raw_img.shape[2] == 3: # BGR
+            elif len(raw_img.shape) == 3 and raw_img.shape[2] == 3:
                 display_img = raw_img
-            elif len(raw_img.shape) == 3 and raw_img.shape[2] == 4: # BGRA/RGBA
+            elif len(raw_img.shape) == 3 and raw_img.shape[2] == 4:
                 try:
                     display_img = cv2.cvtColor(raw_img, cv2.COLOR_BGRA2BGR)
                 except cv2.error:
@@ -206,6 +262,9 @@ class KeypointBehaviorAnnotator:
         
         self.img_original_unmodified = display_img.copy()
         self.img_height_orig, self.img_width_orig = self.img_original_unmodified.shape[:2]
+
+        self._load_annotations_for_image()
+        
         self.annotations_changed_since_last_save = False
         self.last_autosave_time = time.time()
 
@@ -225,7 +284,7 @@ class KeypointBehaviorAnnotator:
                 if rect[2] > MIN_WINDOW_DIM_THRESHOLD and rect[3] > MIN_WINDOW_DIM_THRESHOLD:
                     win_w, win_h = rect[2], rect[3]
         except cv2.error:
-            pass # Use defaults
+            pass
         return win_w, win_h
 
     def _reset_zoom_pan(self):
@@ -306,7 +365,7 @@ class KeypointBehaviorAnnotator:
         if self.zoom_level != 0:
             self.current_mouse_pos_image = self._screen_to_image_coords(x,y)
         else:
-             self.current_mouse_pos_image = (0,0)
+            self.current_mouse_pos_image = (0,0)
 
         if self.is_panning_with_alt:
             if needs_update: self._update_display()
@@ -347,10 +406,18 @@ class KeypointBehaviorAnnotator:
                     return
                 x1,y1 = self.current_bbox_start_point
                 x2,y2 = img_x_clamped, img_y_clamped
-                if x2 <= x1 or y2 <= y1:
-                    messagebox.showwarning("BBox Error", "Bottom-right must be below and to the right of top-left.", parent=self.master_tk_window)
-                    needs_update=False
+                
+                # --- Refactored Bounding Box Validation ---
+                # This check ensures the box is not inverted AND meets a minimum size.
+                if (x2 - x1) < MIN_BBOX_DIMENSION or (y2 - y1) < MIN_BBOX_DIMENSION:
+                    messagebox.showwarning("BBox Error", 
+                        f"Bounding box is too small or inverted.\n"
+                        f"Both width and height must be at least {MIN_BBOX_DIMENSION} pixels.",
+                        parent=self.master_tk_window)
+                    needs_update=False # Prevent redraw to avoid flashing a bad box
                     return
+                # --- End Refactoring ---
+
                 self.current_bbox_end_point = (x2,y2)
                 print(f"   BBox End Point: ({x2},{y2})")
                 completed_annotation = {
@@ -390,7 +457,7 @@ class KeypointBehaviorAnnotator:
                 if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) >= 1 :
                     cv2.imshow(self.window_name, self.img_display)
             except cv2.error:
-                 pass
+                pass
             return
 
         win_w, win_h = self._get_current_window_dimensions()
@@ -445,8 +512,8 @@ class KeypointBehaviorAnnotator:
         def draw_text_line(text_content, color=STATUS_TEXT_COLOR, scale=FONT_SCALE_GENERAL_STATUS, is_main_instr=False):
             nonlocal y_off; lh = line_height_normal if is_main_instr else line_height_small
             if y_off < win_h - lh :
-                 cv2.putText(self.img_display, text_content, (10, y_off), FONT, scale, color, FONT_THICKNESS, cv2.LINE_AA)
-                 y_off += int(lh * (scale / FONT_SCALE_GENERAL_STATUS) + 5)
+                cv2.putText(self.img_display, text_content, (10, y_off), FONT, scale, color, FONT_THICKNESS, cv2.LINE_AA)
+                y_off += int(lh * (scale / FONT_SCALE_GENERAL_STATUS) + 5)
 
         img_file_name = os.path.basename(self.current_image_path) if self.current_image_path else "N/A"
         mouse_x_str = str(self.current_mouse_pos_image[0]) if self.current_mouse_pos_image else 'N/A'
@@ -497,7 +564,7 @@ class KeypointBehaviorAnnotator:
         if self.autosave_message and time.time() < self.autosave_message_display_time:
             (tw,th),_ = cv2.getTextSize(self.autosave_message,FONT,FONT_SCALE_HELP_PROMPT,FONT_THICKNESS)
             if win_h > th + 20 :
-                 cv2.putText(self.img_display,self.autosave_message,(10,win_h-th-10),FONT,FONT_SCALE_HELP_PROMPT,AUTOSAVE_MSG_COLOR,FONT_THICKNESS,cv2.LINE_AA)
+                cv2.putText(self.img_display,self.autosave_message,(10,win_h-th-10),FONT,FONT_SCALE_HELP_PROMPT,AUTOSAVE_MSG_COLOR,FONT_THICKNESS,cv2.LINE_AA)
         elif self.autosave_message:
             self.autosave_message=""
 
@@ -522,7 +589,7 @@ class KeypointBehaviorAnnotator:
 
         try:
             if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) >= 1 :
-                 cv2.imshow(self.window_name, self.img_display)
+                cv2.imshow(self.window_name, self.img_display)
         except cv2.error:
             pass
 
@@ -539,16 +606,16 @@ class KeypointBehaviorAnnotator:
             self.mode = MODE_BBOX_START
             print(f"   Undo: Canceled BBox end point. Re-click BBox end point.")
         elif self.mode == MODE_SELECT_BEHAVIOR and self.annotations_in_image:
-             removed_ann = self.annotations_in_image.pop()
-             self.annotations_changed_since_last_save = True
-             self.current_behavior_id = removed_ann['behavior_id']
-             self.current_behavior_name = removed_ann['behavior_name']
-             self.current_keypoints = removed_ann['keypoints']
-             self.current_keypoint_index = len(self.current_keypoints)
-             self.current_bbox_start_point = (removed_ann['bbox'][0], removed_ann['bbox'][1])
-             self.current_bbox_end_point = (removed_ann['bbox'][2], removed_ann['bbox'][3])
-             self.mode = MODE_BBOX_END
-             print(f"   Undo: Removed completed instance for behavior '{removed_ann['behavior_name']}'.")
+            removed_ann = self.annotations_in_image.pop()
+            self.annotations_changed_since_last_save = True
+            self.current_behavior_id = removed_ann['behavior_id']
+            self.current_behavior_name = removed_ann['behavior_name']
+            self.current_keypoints = removed_ann['keypoints']
+            self.current_keypoint_index = len(self.current_keypoints)
+            self.current_bbox_start_point = (removed_ann['bbox'][0], removed_ann['bbox'][1])
+            self.current_bbox_end_point = (removed_ann['bbox'][2], removed_ann['bbox'][3])
+            self.mode = MODE_BBOX_END
+            print(f"   Undo: Removed completed instance for behavior '{removed_ann['behavior_name']}'.")
         else:
             print("Nothing to undo.")
             return
@@ -561,7 +628,7 @@ class KeypointBehaviorAnnotator:
             self.annotations_changed_since_last_save = False
             return True
         if not self.annotations_in_image and is_autosave and not self.annotations_changed_since_last_save:
-             return True
+            return True
 
         output_filename = os.path.splitext(os.path.basename(self.current_image_path))[0] + ".txt"
         output_path = os.path.join(self.output_dir, output_filename)
@@ -574,9 +641,8 @@ class KeypointBehaviorAnnotator:
                     print(f"Cleared annotations: Removed existing file {output_path}")
                 self.annotations_changed_since_last_save=False
                 self.last_autosave_time=time.time()
-                if is_autosave:
-                    self.autosave_message=f"Autosaved: {os.path.basename(output_path)} (cleared)"
-                    self.autosave_message_display_time=time.time()+3
+                self.autosave_message=f"Saved: {os.path.basename(output_path)} (cleared)"
+                self.autosave_message_display_time=time.time()+3
                 return True
             except Exception as e:
                 messagebox.showerror("Save Error",f"Could not remove existing annotation file: {e}", parent=self.master_tk_window)
@@ -616,21 +682,24 @@ class KeypointBehaviorAnnotator:
         try:
             with open(output_path,'w') as f:
                 for line in lines_to_write: f.write(line + "\n")
+
             save_type = "Autosaved" if is_autosave else "Saved"
             print(f"{save_type} {len(lines_to_write)} instance(s) to: {output_path}")
             self.annotations_changed_since_last_save=False
             self.last_autosave_time=time.time()
-            if is_autosave:
-                self.autosave_message=f"Autosaved: {os.path.basename(output_path)}"
-                self.autosave_message_display_time=time.time()+3
+            
+            self.autosave_message=f"{save_type}: {os.path.basename(output_path)}"
+            self.autosave_message_display_time=time.time()+3
+            
             return True
         except Exception as e:
             messagebox.showerror("Save Error",f"Could not write annotation file: {e}", parent=self.master_tk_window)
             return False
 
-    def generate_config_yaml(self, dataset_root_path, train_images_path, val_images_path, dataset_name_suggestion="dataset_config"):
+    @staticmethod
+    def generate_config_yaml(master_tk_window, num_keypoints, keypoint_names, available_behaviors, dataset_root_path, train_images_path, val_images_path, dataset_name_suggestion="dataset_config"):
         if not all([dataset_root_path, train_images_path, val_images_path]):
-            messagebox.showerror("Error", "Dataset root, train images folder, and validation images folder are ALL required for YAML generation.", parent=self.master_tk_window)
+            messagebox.showerror("Error", "Dataset root, train images folder, and validation images folder are ALL required for YAML generation.", parent=master_tk_window)
             return None
         try:
             abs_dataset_root = os.path.abspath(dataset_root_path)
@@ -639,27 +708,28 @@ class KeypointBehaviorAnnotator:
             rel_train_path = os.path.relpath(abs_train_images, abs_dataset_root)
             rel_val_path = os.path.relpath(abs_val_images, abs_dataset_root)
             if rel_train_path.startswith('..') or rel_val_path.startswith('..'):
-                 messagebox.showwarning("Path Warning", "Train/Validation image paths seem to be outside the specified Dataset Root Path.", parent=self.master_tk_window)
+                messagebox.showwarning("Path Warning", "Train/Validation image paths seem to be outside the specified Dataset Root Path.", parent=master_tk_window)
         except ValueError as e:
-             messagebox.showerror("Path Error", f"Could not determine relative paths. Error: {e}", parent=self.master_tk_window)
-             return None
+            messagebox.showerror("Path Error", f"Could not determine relative paths. Error: {e}", parent=master_tk_window)
+            return None
 
-        behavior_names_map = {int(bid): name for bid, name in self.available_behaviors.items()}
+        behavior_names_map = {int(bid): name for bid, name in available_behaviors.items()}
+        
         yaml_data = OrderedDict([
             ('path', abs_dataset_root.replace(os.sep,'/')),
             ('train', rel_train_path.replace(os.sep,'/')),
             ('val', rel_val_path.replace(os.sep,'/')),
-            ('test', ''),
-            ('kpt_shape', [self.num_keypoints, 3]),
-            ('nc', len(self.available_behaviors)),
+            ('kpt_shape', [num_keypoints, 3]),
+            ('nc', len(available_behaviors)),
             ('names', behavior_names_map)
         ])
+        
         header = f"""# YOLO Dataset Configuration File
 # Generated by KeypointBehaviorAnnotator
+# Keypoints: {','.join(keypoint_names)}
 # Date: {time.strftime("%Y-%m-%d %H:%M:%S")}
-# Keypoint order: {self.keypoint_names}
-# Keypoint visibility flags: {VISIBILITY_NOT_LABELED}=NotLabeled, {VISIBILITY_LABELED_NOT_VISIBLE}=NotVisible, {VISIBILITY_LABELED_VISIBLE}=Visible
 """
+
         save_path_initial_file = f"{dataset_name_suggestion}.yaml"
         save_path = filedialog.asksaveasfilename(
             title="Save Dataset Config YAML",
@@ -667,7 +737,7 @@ class KeypointBehaviorAnnotator:
             initialfile=save_path_initial_file,
             defaultextension=".yaml",
             filetypes=[("YAML files","*.yaml *.yml")],
-            parent=self.master_tk_window
+            parent=master_tk_window
         )
         if not save_path:
             print("YAML saving cancelled by user.")
@@ -677,10 +747,10 @@ class KeypointBehaviorAnnotator:
                 f.write(header)
                 yaml.dump(dict(yaml_data),f,default_flow_style=None,sort_keys=False,indent=4)
             print(f"Dataset config YAML saved to: {save_path}")
-            messagebox.showinfo("YAML Saved",f"Dataset configuration YAML saved to:\n{save_path}", parent=self.master_tk_window)
+            messagebox.showinfo("YAML Saved",f"Dataset configuration YAML saved to:\n{save_path}", parent=master_tk_window)
             return save_path
         except Exception as e:
-            messagebox.showerror("YAML Save Error",f"Could not save YAML configuration: {e}", parent=self.master_tk_window)
+            messagebox.showerror("YAML Save Error",f"Could not save YAML configuration: {e}", parent=master_tk_window)
             return None
 
     def run(self):
@@ -716,7 +786,7 @@ class KeypointBehaviorAnnotator:
                 running = False; break
 
             if ENABLE_AUTOSAVE and self.annotations_changed_since_last_save and \
-               (time.time() - self.last_autosave_time > AUTOSAVE_INTERVAL_SECONDS):
+                (time.time() - self.last_autosave_time > AUTOSAVE_INTERVAL_SECONDS):
                 self._save_annotations_for_image(is_autosave=True)
                 self._update_display()
 
@@ -742,8 +812,7 @@ class KeypointBehaviorAnnotator:
                     else:
                         messagebox.showinfo("End of Set", f"You are at the {'last' if key == ord('n') else 'first'} image.", parent=self.master_tk_window)
             elif key == ord('s'):
-                if self._save_annotations_for_image():
-                    messagebox.showinfo("Saved", "Annotations saved.", parent=self.master_tk_window)
+                self._save_annotations_for_image()
                 action_taken = True
             elif key == ord('h'): self.show_help_text = not self.show_help_text; action_taken = True
             elif key == ord('u'): self._undo_last_keypoint()
@@ -766,7 +835,7 @@ class KeypointBehaviorAnnotator:
                 self.current_behavior_id = selected_bid
                 self.current_behavior_name = self.available_behaviors[selected_bid]
                 self.mode = MODE_KP
-                self._reset_current_instance_state() # Resets everything but the selected behavior
+                self._reset_current_instance_state()
                 self.current_behavior_id = selected_bid
                 self.current_behavior_name = self.available_behaviors[selected_bid]
                 self.mode = MODE_KP
@@ -778,10 +847,10 @@ class KeypointBehaviorAnnotator:
                     self.autosave_message = ""
                 self._update_display()
             elif key != 255:
-                 self._update_display()
+                self._update_display()
 
         if self.annotations_changed_since_last_save and not running:
-             if messagebox.askyesno("Unsaved Changes", "Save changes for the current image?", parent=self.master_tk_window):
+            if messagebox.askyesno("Unsaved Changes", "Save changes for the current image?", parent=self.master_tk_window):
                 self._save_annotations_for_image()
 
         cv2.destroyAllWindows()

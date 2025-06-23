@@ -1,141 +1,143 @@
+# content of gui/training_tab.py
+
 import tkinter as tk
 from tkinter import ttk
+from .tooltips import CreateToolTip
 
 def create_training_tab(app):
     """
-    Creates and populates the 'Model Training' tab with all its widgets.
-
+    Creates the 'Model Training' tab in the main application window.
+    
     Args:
         app: The main YoloApp instance.
     """
-    # This frame will contain a canvas and a scrollbar to allow for scrolling
-    # through all the training parameters.
-    frame = ttk.Frame(app.training_tab, padding="10")
-    frame.pack(expand=True, fill="both")
+    # --- Main Frames ---
+    paths_frame = ttk.LabelFrame(app.training_tab, text="1. Paths", padding=10)
+    paths_frame.pack(fill=tk.X, padx=5, pady=5)
 
-    canvas = tk.Canvas(frame)
-    scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-    scrollable_frame = ttk.Frame(canvas, padding=(10,0))
+    config_frame = ttk.LabelFrame(app.training_tab, text="2. Model & Run Configuration", padding=10)
+    config_frame.pack(fill=tk.X, padx=5, pady=5)
 
-    scrollable_frame.bind(
-        "<Configure>",
-        lambda e: canvas.configure(
-            scrollregion=canvas.bbox("all")
-        )
-    )
+    hyperparam_frame = ttk.LabelFrame(app.training_tab, text="3. Hyperparameters", padding=10)
+    hyperparam_frame.pack(fill=tk.X, padx=5, pady=5)
 
-    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-    canvas.configure(yscrollcommand=scrollbar.set)
+    augmentation_frame = ttk.LabelFrame(app.training_tab, text="4. Augmentation Settings", padding=10)
+    augmentation_frame.pack(fill=tk.X, padx=5, pady=5)
 
-    canvas.pack(side="left", fill="both", expand=True)
-    scrollbar.pack(side="right", fill="y")
+    # --- 1. Paths ---
+    paths_frame.columnconfigure(1, weight=1)
 
-    current_row = 0
-    scrollable_frame.columnconfigure(1, weight=1)
+    yaml_path_label = ttk.Label(paths_frame, text="Dataset YAML Path:")
+    yaml_path_label.grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+    yaml_path_entry = ttk.Entry(paths_frame, textvariable=app.config.training.dataset_yaml_path_train)
+    yaml_path_entry.grid(row=0, column=1, sticky=tk.EW, padx=5, pady=5)
+    yaml_path_btn = ttk.Button(paths_frame, text="Browse...", command=lambda: app._select_file(app.config.training.dataset_yaml_path_train, "Select dataset.yaml File", (("YAML files", "*.yaml"),)))
+    yaml_path_btn.grid(row=0, column=2, padx=5, pady=5)
+    CreateToolTip(yaml_path_entry, "Path to the dataset.yaml file you generated in the Setup tab.")
 
-    # --- Basic Configuration ---
-    basic_cfg_frame = ttk.LabelFrame(scrollable_frame, text="Basic Configuration", padding="10")
-    basic_cfg_frame.grid(row=current_row, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
-    basic_cfg_frame.columnconfigure(1, weight=1)
-    current_row += 1
+    model_dir_label = ttk.Label(paths_frame, text="Model Save Directory:")
+    model_dir_label.grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+    model_dir_entry = ttk.Entry(paths_frame, textvariable=app.config.training.model_save_dir)
+    model_dir_entry.grid(row=1, column=1, sticky=tk.EW, padx=5, pady=5)
+    model_dir_btn = ttk.Button(paths_frame, text="Browse...", command=lambda: app._select_directory(app.config.training.model_save_dir, "Select Model Save Directory"))
+    model_dir_btn.grid(row=1, column=2, padx=5, pady=5)
+    CreateToolTip(model_dir_entry, "Directory where the training runs (models, logs) will be saved.")
 
-    ttk.Label(basic_cfg_frame, text="Dataset Config YAML:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-    ttk.Entry(basic_cfg_frame, textvariable=app.dataset_yaml_path_train, width=50).grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-    ttk.Button(basic_cfg_frame, text="Browse...", command=lambda: app._select_file(app.dataset_yaml_path_train, "Select Dataset YAML", (("YAML files", "*.yaml *.yml"),))).grid(row=0, column=2, padx=5, pady=5)
+    # --- 2. Model & Run Configuration ---
+    config_frame.columnconfigure(1, weight=1)
+    config_frame.columnconfigure(3, weight=1)
 
-    ttk.Label(basic_cfg_frame, text="Model Save Directory (Project Root):").grid(row=1, column=0, padx=5, pady=5, sticky="w")
-    ttk.Entry(basic_cfg_frame, textvariable=app.model_save_dir, width=50).grid(row=1, column=1, padx=5, pady=5, sticky="ew")
-    ttk.Button(basic_cfg_frame, text="Browse...", command=lambda: app._select_directory(app.model_save_dir, "Select Model Save Directory (Project)")).grid(row=1, column=2, padx=5, pady=5)
+    model_variant_label = ttk.Label(config_frame, text="Model Variant:")
+    model_variant_label.grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+    model_variant_combo = ttk.Combobox(config_frame, textvariable=app.config.training.model_variant_var, values=["yolo11n-pose.pt", "yolo11s-pose.pt", "yolo11m-pose.pt", "yolo11l-pose.pt", "yolo11x-pose.pt"])
+    model_variant_combo.grid(row=0, column=1, sticky=tk.EW, padx=5, pady=5)
+    CreateToolTip(model_variant_combo, "The base YOLO11 pose model to use for training.")
 
-    ttk.Label(basic_cfg_frame, text="Pretrained Weights (.pt):").grid(row=2, column=0, padx=5, pady=2, sticky="w")
-    ttk.Entry(basic_cfg_frame, textvariable=app.model_variant_var, width=40).grid(row=2, column=1, padx=5, pady=2, sticky="ew")
-    ttk.Button(basic_cfg_frame, text="Browse PT...", command=lambda: app._select_file(app.model_variant_var, "Select Pretrained Model Weights", (("PyTorch Models", "*.pt"),))).grid(row=2, column=2, padx=5, pady=2)
+    run_name_label = ttk.Label(config_frame, text="Run Name:")
+    run_name_label.grid(row=0, column=2, sticky=tk.W, padx=5, pady=5)
+    run_name_entry = ttk.Entry(config_frame, textvariable=app.config.training.run_name_var)
+    run_name_entry.grid(row=0, column=3, sticky=tk.EW, padx=5, pady=5)
+    CreateToolTip(run_name_entry, "A specific name for this training run.")
+    
+    # --- 3. Hyperparameters ---
+    # Using sub-frames for better alignment
+    basic_hp_frame = ttk.Frame(hyperparam_frame)
+    basic_hp_frame.pack(fill=tk.X, expand=True)
+    for i in range(8): basic_hp_frame.columnconfigure(i, weight=1)
 
-    ttk.Label(basic_cfg_frame, text="Experiment Run Name:").grid(row=3, column=0, padx=5, pady=2, sticky="w")
-    ttk.Entry(basic_cfg_frame, textvariable=app.run_name_var, width=40).grid(row=3, column=1, padx=5, pady=2, sticky="ew")
+    adv_hp_frame = ttk.Frame(hyperparam_frame)
+    adv_hp_frame.pack(fill=tk.X, expand=True, pady=(5,0))
+    for i in range(8): adv_hp_frame.columnconfigure(i, weight=1)
 
-    # --- General Training Hyperparameters ---
-    train_hparams_frame = ttk.LabelFrame(scrollable_frame, text="General Training Hyperparameters", padding="10")
-    train_hparams_frame.grid(row=current_row, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
-    current_row += 1
+    # Basic Hyperparameters
+    epochs_label = ttk.Label(basic_hp_frame, text="Epochs:"); epochs_label.grid(row=0, column=0, sticky=tk.W, padx=5)
+    epochs_entry = ttk.Entry(basic_hp_frame, textvariable=app.config.training.epochs_var, width=8); epochs_entry.grid(row=0, column=1, sticky=tk.EW)
+    
+    lr_label = ttk.Label(basic_hp_frame, text="Learning Rate:"); lr_label.grid(row=0, column=2, sticky=tk.W, padx=5)
+    lr_entry = ttk.Entry(basic_hp_frame, textvariable=app.config.training.lr_var, width=8); lr_entry.grid(row=0, column=3, sticky=tk.EW)
 
-    col1_idx, col2_idx, col3_idx, col4_idx = 0, 1, 2, 3
-    for i in range(4): train_hparams_frame.columnconfigure(i, weight=1)
+    batch_label = ttk.Label(basic_hp_frame, text="Batch Size:"); batch_label.grid(row=0, column=4, sticky=tk.W, padx=5)
+    batch_entry = ttk.Entry(basic_hp_frame, textvariable=app.config.training.batch_var, width=8); batch_entry.grid(row=0, column=5, sticky=tk.EW)
+    
+    imgsz_label = ttk.Label(basic_hp_frame, text="Image Size:"); imgsz_label.grid(row=0, column=6, sticky=tk.W, padx=5)
+    imgsz_entry = ttk.Entry(basic_hp_frame, textvariable=app.config.training.imgsz_var, width=8); imgsz_entry.grid(row=0, column=7, sticky=tk.EW)
 
-    ttk.Label(train_hparams_frame, text="Epochs:").grid(row=0, column=col1_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(train_hparams_frame, textvariable=app.epochs_var, width=12).grid(row=0, column=col2_idx, padx=5, pady=2, sticky="ew")
+    # Advanced Hyperparameters
+    optimizer_label = ttk.Label(adv_hp_frame, text="Optimizer:"); optimizer_label.grid(row=1, column=0, sticky=tk.W, padx=5)
+    optimizer_combo = ttk.Combobox(adv_hp_frame, textvariable=app.config.training.optimizer_var, values=["SGD", "Adam", "AdamW", "NAdam", "RAdam", "RMSProp"], width=8); optimizer_combo.grid(row=1, column=1, sticky=tk.EW)
 
-    ttk.Label(train_hparams_frame, text="Initial LR (lr0):").grid(row=0, column=col3_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(train_hparams_frame, textvariable=app.lr_var, width=12).grid(row=0, column=col4_idx, padx=5, pady=2, sticky="ew")
+    wd_label = ttk.Label(adv_hp_frame, text="Weight Decay:"); wd_label.grid(row=1, column=2, sticky=tk.W, padx=5)
+    wd_entry = ttk.Entry(adv_hp_frame, textvariable=app.config.training.weight_decay_var, width=8); wd_entry.grid(row=1, column=3, sticky=tk.EW)
 
-    ttk.Label(train_hparams_frame, text="Batch Size:").grid(row=1, column=col1_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(train_hparams_frame, textvariable=app.batch_var, width=12).grid(row=1, column=col2_idx, padx=5, pady=2, sticky="ew")
+    ls_label = ttk.Label(adv_hp_frame, text="Label Smoothing:"); ls_label.grid(row=1, column=4, sticky=tk.W, padx=5)
+    ls_entry = ttk.Entry(adv_hp_frame, textvariable=app.config.training.label_smoothing_var, width=8); ls_entry.grid(row=1, column=5, sticky=tk.EW)
+    
+    patience_label = ttk.Label(adv_hp_frame, text="Patience:"); patience_label.grid(row=1, column=6, sticky=tk.W, padx=5)
+    patience_entry = ttk.Entry(adv_hp_frame, textvariable=app.config.training.patience_var, width=8); patience_entry.grid(row=1, column=7, sticky=tk.EW)
 
-    ttk.Label(train_hparams_frame, text="Image Size (imgsz):").grid(row=1, column=col3_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(train_hparams_frame, textvariable=app.imgsz_var, width=12).grid(row=1, column=col4_idx, padx=5, pady=2, sticky="ew")
+    device_label = ttk.Label(adv_hp_frame, text="Device:"); device_label.grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+    device_entry = ttk.Entry(adv_hp_frame, textvariable=app.config.training.device_var, width=8); device_entry.grid(row=2, column=1, sticky=tk.EW, pady=5)
+    CreateToolTip(device_entry, "Device to run on, e.g., 'cpu', '0', or '0,1,2,3'.")
 
-    ttk.Label(train_hparams_frame, text="Optimizer:").grid(row=2, column=col1_idx, padx=5, pady=2, sticky="w")
-    optimizer_combo = ttk.Combobox(train_hparams_frame, textvariable=app.optimizer_var, values=['AdamW', 'Adam', 'SGD'], width=10)
-    optimizer_combo.grid(row=2, column=col2_idx, padx=5, pady=2, sticky="ew")
+    # --- 4. Augmentation Settings ---
+    aug_frame_1 = ttk.Frame(augmentation_frame)
+    aug_frame_1.pack(fill=tk.X, expand=True)
+    for i in range(12): aug_frame_1.columnconfigure(i, weight=1)
 
-    ttk.Label(train_hparams_frame, text="Weight Decay:").grid(row=2, column=col3_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(train_hparams_frame, textvariable=app.weight_decay_var, width=12).grid(row=2, column=col4_idx, padx=5, pady=2, sticky="ew")
+    aug_frame_2 = ttk.Frame(augmentation_frame)
+    aug_frame_2.pack(fill=tk.X, expand=True, pady=(5,0))
+    for i in range(12): aug_frame_2.columnconfigure(i, weight=1)
 
-    ttk.Label(train_hparams_frame, text="Label Smoothing:").grid(row=3, column=col1_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(train_hparams_frame, textvariable=app.label_smoothing_var, width=12).grid(row=3, column=col2_idx, padx=5, pady=2, sticky="ew")
+    hsv_h_label = ttk.Label(aug_frame_1, text="HSV-Hue:"); hsv_h_label.grid(row=0, column=0); 
+    hsv_h_entry = ttk.Entry(aug_frame_1, textvariable=app.config.training.hsv_h_var, width=6); hsv_h_entry.grid(row=0, column=1)
+    hsv_s_label = ttk.Label(aug_frame_1, text="HSV-Sat:"); hsv_s_label.grid(row=0, column=2); 
+    hsv_s_entry = ttk.Entry(aug_frame_1, textvariable=app.config.training.hsv_s_var, width=6); hsv_s_entry.grid(row=0, column=3)
+    hsv_v_label = ttk.Label(aug_frame_1, text="HSV-Val:"); hsv_v_label.grid(row=0, column=4); 
+    hsv_v_entry = ttk.Entry(aug_frame_1, textvariable=app.config.training.hsv_v_var, width=6); hsv_v_entry.grid(row=0, column=5)
+    degrees_label = ttk.Label(aug_frame_1, text="Degrees:"); degrees_label.grid(row=0, column=6); 
+    degrees_entry = ttk.Entry(aug_frame_1, textvariable=app.config.training.degrees_var, width=6); degrees_entry.grid(row=0, column=7)
+    translate_label = ttk.Label(aug_frame_1, text="Translate:"); translate_label.grid(row=0, column=8); 
+    translate_entry = ttk.Entry(aug_frame_1, textvariable=app.config.training.translate_var, width=6); translate_entry.grid(row=0, column=9)
+    scale_label = ttk.Label(aug_frame_1, text="Scale:"); scale_label.grid(row=0, column=10); 
+    scale_entry = ttk.Entry(aug_frame_1, textvariable=app.config.training.scale_var, width=6); scale_entry.grid(row=0, column=11)
 
-    ttk.Label(train_hparams_frame, text="Patience (Early Stop):").grid(row=3, column=col3_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(train_hparams_frame, textvariable=app.patience_var, width=12).grid(row=3, column=col4_idx, padx=5, pady=2, sticky="ew")
+    shear_label = ttk.Label(aug_frame_2, text="Shear:"); shear_label.grid(row=1, column=0);
+    shear_entry = ttk.Entry(aug_frame_2, textvariable=app.config.training.shear_var, width=6); shear_entry.grid(row=1, column=1)
+    persp_label = ttk.Label(aug_frame_2, text="Perspective:"); persp_label.grid(row=1, column=2);
+    persp_entry = ttk.Entry(aug_frame_2, textvariable=app.config.training.perspective_var, width=6); persp_entry.grid(row=1, column=3)
+    flipud_label = ttk.Label(aug_frame_2, text="Flipud:"); flipud_label.grid(row=1, column=4);
+    flipud_entry = ttk.Entry(aug_frame_2, textvariable=app.config.training.flipud_var, width=6); flipud_entry.grid(row=1, column=5)
+    fliplr_label = ttk.Label(aug_frame_2, text="Fliplr:"); fliplr_label.grid(row=1, column=6);
+    fliplr_entry = ttk.Entry(aug_frame_2, textvariable=app.config.training.fliplr_var, width=6); fliplr_entry.grid(row=1, column=7)
+    mixup_label = ttk.Label(aug_frame_2, text="Mixup:"); mixup_label.grid(row=1, column=8);
+    mixup_entry = ttk.Entry(aug_frame_2, textvariable=app.config.training.mixup_var, width=6); mixup_entry.grid(row=1, column=9)
+    copypaste_label = ttk.Label(aug_frame_2, text="Copy-Paste:"); copypaste_label.grid(row=1, column=10);
+    copypaste_entry = ttk.Entry(aug_frame_2, textvariable=app.config.training.copy_paste_var, width=6); copypaste_entry.grid(row=1, column=11)
+    
+    mosaic_label = ttk.Label(aug_frame_2, text="Mosaic:"); mosaic_label.grid(row=2, column=0, pady=5);
+    mosaic_entry = ttk.Entry(aug_frame_2, textvariable=app.config.training.mosaic_var, width=6); mosaic_entry.grid(row=2, column=1, pady=5)
 
-    ttk.Label(train_hparams_frame, text="Device (cpu, 0, 0,1):").grid(row=4, column=col1_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(train_hparams_frame, textvariable=app.device_var, width=12).grid(row=4, column=col2_idx, padx=5, pady=2, sticky="ew")
 
-    # --- Augmentation Parameters ---
-    aug_frame = ttk.LabelFrame(scrollable_frame, text="Augmentation Parameters (Probabilities / Factors)", padding="10")
-    aug_frame.grid(row=current_row, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
-    current_row += 1
-    for i in range(4): aug_frame.columnconfigure(i, weight=1)
-
-    aug_row = 0
-    ttk.Label(aug_frame, text="HSV-Hue (hsv_h):").grid(row=aug_row, column=col1_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(aug_frame, textvariable=app.hsv_h_var, width=12).grid(row=aug_row, column=col2_idx, padx=5, pady=2, sticky="ew")
-    ttk.Label(aug_frame, text="HSV-Saturation (hsv_s):").grid(row=aug_row, column=col3_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(aug_frame, textvariable=app.hsv_s_var, width=12).grid(row=aug_row, column=col4_idx, padx=5, pady=2, sticky="ew")
-    aug_row += 1
-
-    ttk.Label(aug_frame, text="HSV-Value (hsv_v):").grid(row=aug_row, column=col1_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(aug_frame, textvariable=app.hsv_v_var, width=12).grid(row=aug_row, column=col2_idx, padx=5, pady=2, sticky="ew")
-    ttk.Label(aug_frame, text="Rotation (degrees):").grid(row=aug_row, column=col3_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(aug_frame, textvariable=app.degrees_var, width=12).grid(row=aug_row, column=col4_idx, padx=5, pady=2, sticky="ew")
-    aug_row += 1
-
-    ttk.Label(aug_frame, text="Translation (translate):").grid(row=aug_row, column=col1_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(aug_frame, textvariable=app.translate_var, width=12).grid(row=aug_row, column=col2_idx, padx=5, pady=2, sticky="ew")
-    ttk.Label(aug_frame, text="Scale (scale):").grid(row=aug_row, column=col3_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(aug_frame, textvariable=app.scale_var, width=12).grid(row=aug_row, column=col4_idx, padx=5, pady=2, sticky="ew")
-    aug_row += 1
-
-    ttk.Label(aug_frame, text="Shear (shear):").grid(row=aug_row, column=col1_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(aug_frame, textvariable=app.shear_var, width=12).grid(row=aug_row, column=col2_idx, padx=5, pady=2, sticky="ew")
-    ttk.Label(aug_frame, text="Perspective:").grid(row=aug_row, column=col3_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(aug_frame, textvariable=app.perspective_var, width=12).grid(row=aug_row, column=col4_idx, padx=5, pady=2, sticky="ew")
-    aug_row += 1
-
-    ttk.Label(aug_frame, text="Flip Up-Down (flipud):").grid(row=aug_row, column=col1_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(aug_frame, textvariable=app.flipud_var, width=12).grid(row=aug_row, column=col2_idx, padx=5, pady=2, sticky="ew")
-    ttk.Label(aug_frame, text="Flip Left-Right (fliplr):").grid(row=aug_row, column=col3_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(aug_frame, textvariable=app.fliplr_var, width=12).grid(row=aug_row, column=col4_idx, padx=5, pady=2, sticky="ew")
-    aug_row += 1
-
-    ttk.Label(aug_frame, text="MixUp (mixup):").grid(row=aug_row, column=col1_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(aug_frame, textvariable=app.mixup_var, width=12).grid(row=aug_row, column=col2_idx, padx=5, pady=2, sticky="ew")
-    ttk.Label(aug_frame, text="Copy-Paste:").grid(row=aug_row, column=col3_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(aug_frame, textvariable=app.copy_paste_var, width=12).grid(row=aug_row, column=col4_idx, padx=5, pady=2, sticky="ew")
-    aug_row += 1
-
-    ttk.Label(aug_frame, text="Mosaic:").grid(row=aug_row, column=col1_idx, padx=5, pady=2, sticky="w")
-    ttk.Entry(aug_frame, textvariable=app.mosaic_var, width=12).grid(row=aug_row, column=col2_idx, padx=5, pady=2, sticky="ew")
-
-    # --- Start Button ---
-    ttk.Button(scrollable_frame, text="Start Training", command=app._start_training, style="Accent.TButton").grid(row=current_row, column=0, columnspan=3, pady=20)
-    current_row += 1
+    # --- Start Training Button ---
+    start_btn = ttk.Button(app.training_tab, text="Start Training", command=app._start_training, style="Accent.TButton")
+    start_btn.pack(pady=15)

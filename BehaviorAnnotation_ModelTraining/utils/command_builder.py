@@ -1,120 +1,200 @@
-import sys
+# content of utils/command_builder.py
+
 import os
-import tkinter as tk
 
-def _add_common_inference_args(cmd, app):
-    """
-    A helper function to add common inference arguments (conf, iou, etc.) to a command.
-    It uses the widgets from the main file-based inference tab as the single source of truth.
-    """
-    def add_yolo_arg(param_name, tk_var):
-        value = tk_var.get()
-        if isinstance(tk_var, tk.BooleanVar):
-            if value:
-                cmd.append(f"{param_name}=True")
-        elif isinstance(tk_var, tk.StringVar):
-            str_value = value.strip()
-            if str_value:
-                cmd.append(f"{param_name}={str_value}")
+# --- Validation Helper Functions (No changes here) ---
 
-    # Note: I have removed max_det from this common function.
-    add_yolo_arg("conf", app.conf_thres_var)
-    add_yolo_arg("iou", app.iou_thres_var)
-    add_yolo_arg("imgsz", app.infer_imgsz_var)
-    add_yolo_arg("device", app.infer_device_var)
-    add_yolo_arg("augment", app.infer_augment_var)
-    add_yolo_arg("hide_labels", app.infer_hide_labels_var)
-    add_yolo_arg("hide_conf", app.infer_hide_conf_var)
+def _validate_path(path, check_exists=True, is_dir=False, desc=""):
+    """Validates a given path."""
+    if not path:
+        return f"{desc} path cannot be empty."
+    if check_exists and not os.path.exists(path):
+        return f"{desc} path does not exist: {path}"
+    
+    if os.path.exists(path):
+        if is_dir and not os.path.isdir(path):
+            return f"{desc} path must be a directory: {path}"
+        if not is_dir and os.path.isdir(path):
+            return f"{desc} path must be a file, not a directory: {path}"
+    return None
+
+def _validate_float(value, name, min_val=None, max_val=None):
+    """Validates if a string can be converted to a float and is within a range."""
+    try:
+        f_val = float(value)
+        if min_val is not None and f_val < min_val:
+            return f"{name} must be greater than or equal to {min_val}."
+        if max_val is not None and f_val > max_val:
+            return f"{name} must be less than or equal to {max_val}."
+        return None
+    except (ValueError, TypeError):
+        return f"{name} must be a valid number."
+
+def _validate_int(value, name, min_val=None, max_val=None):
+    """Validates if a string can be converted to an integer and is within a range."""
+    try:
+        i_val = int(value)
+        if min_val is not None and i_val < min_val:
+            return f"{name} must be greater than or equal to {min_val}."
+        if max_val is not None and i_val > max_val:
+            return f"{name} must be less than or equal to {max_val}."
+        return None
+    except (ValueError, TypeError):
+        return f"{name} must be a valid integer."
+
+# --- Corrected Command Builders ---
 
 def build_training_command(app):
-    """Builds the YOLO training command from the GUI's state."""
-    # This function remains the same.
-    yaml_p = app.dataset_yaml_path_train.get()
-    project_dir = app.model_save_dir.get()
-    run_name = app.run_name_var.get()
-    weights = app.model_variant_var.get()
+    """Builds the YOLO training command with validation."""
+    cfg = app.config.training
+    cmd = ["yolo", "pose", "train"]
+    errors = []
 
-    if not all([yaml_p, project_dir, run_name, weights]):
-        return None, "Dataset YAML, Model Save Dir, Run Name, and Pretrained Weights are all required."
+    # (Validation logic remains the same)
+    yaml_path = cfg.dataset_yaml_path_train.get()
+    err = _validate_path(yaml_path, desc="Dataset YAML", is_dir=False, check_exists=True)
+    if err: errors.append(err)
 
-    cmd = ["yolo", "mode=train", f"data={yaml_p}", f"model={weights}", f"project={project_dir}", f"name={run_name}"]
+    model_dir = cfg.model_save_dir.get()
+    err = _validate_path(model_dir, desc="Model Save Directory", is_dir=True, check_exists=False)
+    if err: errors.append(err)
+
+    hp_validations = [
+        _validate_int(cfg.epochs_var.get(), "Epochs", min_val=1),
+        _validate_float(cfg.lr_var.get(), "Learning Rate", min_val=0.0),
+        _validate_int(cfg.batch_var.get(), "Batch Size", min_val=1),
+    ]
+    errors.extend([e for e in hp_validations if e])
+
+    if errors:
+        return None, "\n".join(errors)
+
+    # --- CORRECTED COMMAND BUILDING: REMOVED MANUAL QUOTES FROM PATHS ---
+    cmd.append(f'data={cfg.dataset_yaml_path_train.get()}')
+    cmd.append(f'model={cfg.model_variant_var.get()}')
+    cmd.append(f'project={cfg.model_save_dir.get()}')
+    cmd.append(f'name={cfg.run_name_var.get()}')
     
-    def add_arg(param_name, var):
-        value = var.get().strip()
-        if value: cmd.append(f"{param_name}={value}")
-    add_arg("epochs", app.epochs_var); add_arg("lr0", app.lr_var); add_arg("batch", app.batch_var)
-    add_arg("imgsz", app.imgsz_var); add_arg("optimizer", app.optimizer_var); add_arg("weight_decay", app.weight_decay_var)
-    add_arg("label_smoothing", app.label_smoothing_var); add_arg("patience", app.patience_var); add_arg("device", app.device_var)
-    add_arg("hsv_h", app.hsv_h_var); add_arg("hsv_s", app.hsv_s_var); add_arg("hsv_v", app.hsv_v_var)
-    add_arg("degrees", app.degrees_var); add_arg("translate", app.translate_var); add_arg("scale", app.scale_var)
-    add_arg("shear", app.shear_var); add_arg("perspective", app.perspective_var); add_arg("flipud", app.flipud_var)
-    add_arg("fliplr", app.fliplr_var); add_arg("mixup", app.mixup_var); add_arg("copy_paste", app.copy_paste_var)
-    add_arg("mosaic", app.mosaic_var)
+    def add_arg(key, tk_var):
+        val = tk_var.get().strip()
+        if val: cmd.append(f'{key}={val}')
+
+    add_arg('epochs', cfg.epochs_var)
+    add_arg('lr0', cfg.lr_var)
+    add_arg('batch', cfg.batch_var)
+    add_arg('imgsz', cfg.imgsz_var)
+    add_arg('optimizer', cfg.optimizer_var)
+    add_arg('weight_decay', cfg.weight_decay_var)
+    add_arg('label_smoothing', cfg.label_smoothing_var)
+    add_arg('patience', cfg.patience_var)
+    add_arg('device', cfg.device_var)
+    add_arg('hsv_h', cfg.hsv_h_var)
+    add_arg('hsv_s', cfg.hsv_s_var)
+    add_arg('hsv_v', cfg.hsv_v_var)
+    add_arg('degrees', cfg.degrees_var)
+    add_arg('translate', cfg.translate_var)
+    add_arg('scale', cfg.scale_var)
+    add_arg('shear', cfg.shear_var)
+    add_arg('perspective', cfg.perspective_var)
+    add_arg('flipud', cfg.flipud_var)
+    add_arg('fliplr', cfg.fliplr_var)
+    add_arg('mixup', cfg.mixup_var)
+    add_arg('copy_paste', cfg.copy_paste_var)
+    add_arg('mosaic', cfg.mosaic_var)
 
     return cmd, None
 
 def build_inference_command(app):
-    """Builds the YOLO inference/tracking command for file-based sources."""
-    model_p = app.trained_model_path_infer.get()
-    source_p = app.video_infer_path.get()
+    """Builds the YOLO file inference command with validation."""
+    cfg = app.config.inference
+    cmd = ["yolo", "pose", "predict"]
+    errors = []
 
-    if not model_p or not os.path.exists(model_p):
-        return None, "A valid Trained Model Path is required."
-    if not source_p or not os.path.exists(source_p):
-        return None, "A valid Video/Image Source for Inference is required."
-
-    mode = "track" if app.use_tracker_var.get() else "predict"
-    cmd = ["yolo", f"mode={mode}", f"model={model_p}", f"source={source_p}"]
-
-    if mode == "track":
-        tracker_config = app.tracker_config_path.get().strip()
-        if tracker_config:
-            if not os.path.exists(tracker_config):
-                return None, f"Tracker config file not found: {tracker_config}"
-            cmd.append(f"tracker={tracker_config}")
-
-    # Add specific args for this mode
-    if app.infer_save_var.get(): cmd.append("save=True")
-    if app.infer_save_txt_var.get(): cmd.append("save_txt=True")
-    if app.infer_save_conf_var.get(): cmd.append("save_conf=True")
-    if app.infer_save_crop_var.get(): cmd.append("save_crop=True")
-    if app.show_infer_var.get(): cmd.append("show=True")
-    if app.infer_project_var.get(): cmd.append(f"project={app.infer_project_var.get()}")
-    if app.infer_name_var.get(): cmd.append(f"name={app.infer_name_var.get()}")
-    if app.infer_line_width_var.get(): cmd.append(f"line_thickness={app.infer_line_width_var.get()}")
+    err = _validate_path(cfg.trained_model_path_infer.get(), desc="Trained Model", is_dir=False)
+    if err: errors.append(err)
+    err = _validate_path(cfg.video_infer_path.get(), desc="Source Video/Folder")
+    if err: errors.append(err)
     
-    # I am now adding max_det specifically from the main inference tab's variable.
-    if app.infer_max_det_var.get():
-        cmd.append(f"max_det={app.infer_max_det_var.get()}")
+    if errors:
+        return None, "\n".join(errors)
+    
+    # --- CORRECTED COMMAND BUILDING: REMOVED MANUAL QUOTES FROM PATHS ---
+    cmd.append(f'model={cfg.trained_model_path_infer.get()}')
+    cmd.append(f'source={cfg.video_infer_path.get()}')
 
-    _add_common_inference_args(cmd, app)
+    def add_arg(key, tk_var, is_bool=False):
+        val = tk_var.get()
+        if is_bool:
+            if val: cmd.append(f'{key}=True')
+        else:
+            val_str = val.strip()
+            if val_str: cmd.append(f'{key}={val_str}')
+    
+    if cfg.use_tracker_var.get():
+        cmd.append("mode=track")
+        tracker_path = cfg.tracker_config_path.get()
+        if tracker_path:
+            err = _validate_path(tracker_path, desc="Tracker Config", is_dir=False)
+            if err: return None, err
+            cmd.append(f'tracker={tracker_path}')
 
+    add_arg('conf', cfg.conf_thres_var)
+    add_arg('iou', cfg.iou_thres_var)
+    add_arg('imgsz', cfg.infer_imgsz_var)
+    add_arg('device', cfg.infer_device_var)
+    add_arg('max_det', cfg.infer_max_det_var)
+    add_arg('line_width', cfg.infer_line_width_var)
+    add_arg('project', cfg.infer_project_var)
+    add_arg('name', cfg.infer_name_var)
+    
+    add_arg('show', cfg.show_infer_var, is_bool=True)
+    add_arg('save', cfg.infer_save_var, is_bool=True)
+    add_arg('save_txt', cfg.infer_save_txt_var, is_bool=True)
+    add_arg('save_conf', cfg.infer_save_conf_var, is_bool=True)
+    add_arg('save_crop', cfg.infer_save_crop_var, is_bool=True)
+    add_arg('hide_labels', cfg.infer_hide_labels_var, is_bool=True)
+    add_arg('hide_conf', cfg.infer_hide_conf_var, is_bool=True)
+    add_arg('augment', cfg.infer_augment_var, is_bool=True)
+    
     return cmd, None
 
 def build_webcam_command(app):
-    """Builds the YOLO command for webcam-based inference."""
-    model_p = app.webcam_model_path.get()
-    source_idx = app.webcam_index_var.get().strip()
+    """Builds the YOLO webcam command with validation."""
+    cfg = app.config.webcam
+    cmd = ["yolo", "pose", cfg.webcam_mode_var.get()]
+    errors = []
 
-    if not model_p or not os.path.exists(model_p):
-        return None, "A valid Trained Model Path is required for webcam inference."
-    if not source_idx.isdigit():
-        return None, "Webcam Index must be an integer (e.g., 0, 1)."
+    err = _validate_path(cfg.webcam_model_path.get(), desc="Trained Model", is_dir=False)
+    if err: errors.append(err)
+    err = _validate_int(cfg.webcam_index_var.get(), "Webcam Index", min_val=0)
+    if err: errors.append(err)
 
-    mode = app.webcam_mode_var.get()
-    cmd = ["yolo", f"mode={mode}", f"model={model_p}", f"source={source_idx}"]
+    if errors:
+        return None, "\n".join(errors)
 
-    if app.webcam_save_annotated_var.get():
-        cmd.append("save=True")
-    if app.webcam_save_txt_var.get():
-        cmd.append("save_txt=True")
+    # --- CORRECTED COMMAND BUILDING: REMOVED MANUAL QUOTES FROM PATHS ---
+    cmd.append(f'model={cfg.webcam_model_path.get()}')
+    cmd.append(f'source={cfg.webcam_index_var.get()}')
+
+    def add_arg(key, tk_var, is_bool=False):
+        val = tk_var.get()
+        if is_bool:
+            if val: cmd.append(f'{key}=True')
+        else:
+            val_str = str(val).strip()
+            if val_str: cmd.append(f'{key}={val_str}')
     
-    
-    if app.webcam_max_det_var.get():
-        cmd.append(f"max_det={app.webcam_max_det_var.get()}")
-
-    cmd.append("show=True")
-
-    _add_common_inference_args(cmd, app)
+    add_arg('conf', cfg.webcam_conf_thres_var)
+    add_arg('iou', cfg.webcam_iou_thres_var)
+    add_arg('imgsz', cfg.webcam_imgsz_var)
+    add_arg('device', cfg.webcam_device_var)
+    add_arg('max_det', cfg.webcam_max_det_var)
+    add_arg('project', cfg.webcam_project_var)
+    add_arg('name', cfg.webcam_name_var)
+    add_arg('save', cfg.webcam_save_annotated_var, is_bool=True)
+    add_arg('save_txt', cfg.webcam_save_txt_var, is_bool=True)
+    add_arg('hide_labels', cfg.webcam_hide_labels_var, is_bool=True)
+    add_arg('hide_conf', cfg.webcam_hide_conf_var, is_bool=True)
+    cmd.append('show=True')
 
     return cmd, None

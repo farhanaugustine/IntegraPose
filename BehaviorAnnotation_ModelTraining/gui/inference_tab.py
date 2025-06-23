@@ -1,110 +1,137 @@
-# BehaviorAnnotation_ModelTraining/gui/inference_tab.py
+# content of gui/inference_tab.py
 
 import tkinter as tk
 from tkinter import ttk
+from .tooltips import CreateToolTip
 
 def create_inference_tab(app):
     """
-    Creates and populates the 'Inference' tab with all its widgets,
-    including new tracking and process control features.
-
+    Creates the 'Inference' tab for processing video files.
+    
     Args:
         app: The main YoloApp instance.
     """
-    frame = app.inference_tab
-    frame.columnconfigure(1, weight=1)
+    # --- Main Frames ---
+    paths_frame = ttk.LabelFrame(app.inference_tab, text="1. Paths", padding=10)
+    paths_frame.pack(fill=tk.X, padx=5, pady=5)
 
-    current_row = 0
+    params_frame = ttk.LabelFrame(app.inference_tab, text="2. Inference Parameters", padding=10)
+    params_frame.pack(fill=tk.X, padx=5, pady=5)
 
-    # --- Source and Model Paths ---
-    path_frame = ttk.LabelFrame(frame, text="Input", padding="10")
-    path_frame.grid(row=current_row, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
-    path_frame.columnconfigure(1, weight=1)
-    current_row += 1
+    output_frame = ttk.LabelFrame(app.inference_tab, text="3. Output Options", padding=10)
+    output_frame.pack(fill=tk.X, padx=5, pady=5)
 
-    ttk.Label(path_frame, text="Trained Model Path (.pt):").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-    ttk.Entry(path_frame, textvariable=app.trained_model_path_infer, width=60).grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-    ttk.Button(path_frame, text="Browse...", command=lambda: app._select_file(app.trained_model_path_infer, "Select Trained Model", (("PyTorch Models", "*.pt"),))).grid(row=0, column=2, padx=5, pady=5)
+    # --- 1. Paths ---
+    paths_frame.columnconfigure(1, weight=1)
 
-    ttk.Label(path_frame, text="Video/Image Source:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
-    ttk.Entry(path_frame, textvariable=app.video_infer_path, width=60).grid(row=1, column=1, padx=5, pady=5, sticky="ew")
-    ttk.Button(path_frame, text="Browse...", command=lambda: app._select_file(app.video_infer_path, "Select Video/Image Source", (("Media files", "*.mp4 *.avi *.mov *.jpg *.jpeg *.png *.bmp *.tif *.tiff"),("All files", "*.*"),))).grid(row=1, column=2, padx=5, pady=5)
+    model_path_label = ttk.Label(paths_frame, text="Trained Model Path (.pt):")
+    model_path_label.grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+    model_path_entry = ttk.Entry(paths_frame, textvariable=app.config.inference.trained_model_path_infer)
+    model_path_entry.grid(row=0, column=1, sticky=tk.EW, padx=5, pady=5)
+    model_path_btn = ttk.Button(paths_frame, text="Browse...", command=lambda: app._select_file(app.config.inference.trained_model_path_infer, "Select Trained Model", (("PyTorch models", "*.pt"),)))
+    model_path_btn.grid(row=0, column=2, padx=5, pady=5)
+    CreateToolTip(model_path_entry, "Path to your trained .pt model file.")
 
-    # --- Tracking Options ---
-    tracker_frame = ttk.LabelFrame(frame, text="Tracking Options", padding="10")
-    tracker_frame.grid(row=current_row, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
-    tracker_frame.columnconfigure(1, weight=1)
-    current_row += 1
+    video_path_label = ttk.Label(paths_frame, text="Source Video/Folder:")
+    video_path_label.grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+    video_path_entry = ttk.Entry(paths_frame, textvariable=app.config.inference.video_infer_path)
+    video_path_entry.grid(row=1, column=1, sticky=tk.EW, padx=5, pady=5)
+    video_path_btn = ttk.Button(paths_frame, text="Browse...", command=lambda: app._select_file(app.config.inference.video_infer_path, "Select Video File or Folder"))
+    video_path_btn.grid(row=1, column=2, padx=5, pady=5)
+    CreateToolTip(video_path_entry, "Path to the source video file or a folder of images to process.")
 
-    ttk.Checkbutton(tracker_frame, text="Use Tracker (mode=track instead of predict)", variable=app.use_tracker_var).grid(row=0, column=0, columnspan=3, padx=5, pady=3, sticky="w")
+    tracker_label = ttk.Label(paths_frame, text="Tracker Config (optional):")
+    tracker_label.grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+    tracker_entry = ttk.Entry(paths_frame, textvariable=app.config.inference.tracker_config_path)
+    tracker_entry.grid(row=2, column=1, sticky=tk.EW, padx=5, pady=5)
+    tracker_btn = ttk.Button(paths_frame, text="Browse...", command=lambda: app._select_file(app.config.inference.tracker_config_path, "Select Tracker Config", (("YAML files", "*.yaml"),)))
+    tracker_btn.grid(row=2, column=2, padx=5, pady=5)
+    CreateToolTip(tracker_entry, "Optional. Path to a custom tracker configuration file (e.g., botsort.yaml).")
 
-    ttk.Label(tracker_frame, text="Tracker Config (.yaml):").grid(row=1, column=0, padx=5, pady=5, sticky="w")
-    ttk.Entry(tracker_frame, textvariable=app.tracker_config_path, width=60).grid(row=1, column=1, padx=5, pady=5, sticky="ew")
-    ttk.Button(tracker_frame, text="Browse...", command=lambda: app._select_file(app.tracker_config_path, "Select Tracker Config YAML", (("YAML files", "*.yaml *.yml"),))).grid(row=1, column=2, padx=5, pady=5)
+    # --- 2. Inference Parameters ---
+    params_frame.columnconfigure(1, weight=1)
+    params_frame.columnconfigure(3, weight=1)
+    params_frame.columnconfigure(5, weight=1)
 
-    # --- Inference Parameters ---
-    infer_params_frame = ttk.LabelFrame(frame, text="Inference Parameters", padding="10")
-    infer_params_frame.grid(row=current_row, column=0, columnspan=3, sticky="ew", padx=5, pady=10)
-    for i in range(4): infer_params_frame.columnconfigure(i, weight=1)
-    current_row += 1
+    conf_label = ttk.Label(params_frame, text="Confidence Threshold:")
+    conf_label.grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+    conf_entry = ttk.Entry(params_frame, textvariable=app.config.inference.conf_thres_var, width=10)
+    conf_entry.grid(row=0, column=1, sticky=tk.EW, padx=5, pady=5)
 
-    param_row = 0
-    # Row 0
-    ttk.Label(infer_params_frame, text="Conf Thresh:").grid(row=param_row, column=0, padx=5, pady=3, sticky="w")
-    ttk.Entry(infer_params_frame, textvariable=app.conf_thres_var, width=10).grid(row=param_row, column=1, padx=5, pady=3, sticky="ew")
-    ttk.Label(infer_params_frame, text="IOU Thresh:").grid(row=param_row, column=2, padx=5, pady=3, sticky="w")
-    ttk.Entry(infer_params_frame, textvariable=app.iou_thres_var, width=10).grid(row=param_row, column=3, padx=5, pady=3, sticky="ew")
-    param_row += 1
+    iou_label = ttk.Label(params_frame, text="IOU Threshold:")
+    iou_label.grid(row=0, column=2, sticky=tk.W, padx=5, pady=5)
+    iou_entry = ttk.Entry(params_frame, textvariable=app.config.inference.iou_thres_var, width=10)
+    iou_entry.grid(row=0, column=3, sticky=tk.EW, padx=5, pady=5)
+    
+    imgsz_label = ttk.Label(params_frame, text="Image Size:")
+    imgsz_label.grid(row=0, column=4, sticky=tk.W, padx=5, pady=5)
+    imgsz_entry = ttk.Entry(params_frame, textvariable=app.config.inference.infer_imgsz_var, width=10)
+    imgsz_entry.grid(row=0, column=5, sticky=tk.EW, padx=5, pady=5)
 
-    # Row 1
-    ttk.Label(infer_params_frame, text="Image Size (imgsz):").grid(row=param_row, column=0, padx=5, pady=3, sticky="w")
-    ttk.Entry(infer_params_frame, textvariable=app.infer_imgsz_var, width=10).grid(row=param_row, column=1, padx=5, pady=3, sticky="ew")
-    ttk.Label(infer_params_frame, text="Device (cpu,0):").grid(row=param_row, column=2, padx=5, pady=3, sticky="w")
-    ttk.Entry(infer_params_frame, textvariable=app.infer_device_var, width=10).grid(row=param_row, column=3, padx=5, pady=3, sticky="ew")
-    param_row += 1
+    device_label = ttk.Label(params_frame, text="Device:")
+    device_label.grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+    device_entry = ttk.Entry(params_frame, textvariable=app.config.inference.infer_device_var, width=10)
+    device_entry.grid(row=1, column=1, sticky=tk.EW, padx=5, pady=5)
+    CreateToolTip(device_entry, "Device to run on, e.g., 'cpu', '0'.")
 
-    # Row 2
-    ttk.Label(infer_params_frame, text="Number of Animals (max_det):").grid(row=param_row, column=0, padx=5, pady=3, sticky="w")
-    ttk.Entry(infer_params_frame, textvariable=app.infer_max_det_var, width=10).grid(row=param_row, column=1, padx=5, pady=3, sticky="ew")
-    ttk.Label(infer_params_frame, text="Line Width (px):").grid(row=param_row, column=2, padx=5, pady=3, sticky="w")
-    ttk.Entry(infer_params_frame, textvariable=app.infer_line_width_var, width=10).grid(row=param_row, column=3, padx=5, pady=3, sticky="ew")
-    param_row += 1
+    max_det_label = ttk.Label(params_frame, text="Max Detections:")
+    max_det_label.grid(row=1, column=2, sticky=tk.W, padx=5, pady=5)
+    max_det_entry = ttk.Entry(params_frame, textvariable=app.config.inference.infer_max_det_var, width=10)
+    max_det_entry.grid(row=1, column=3, sticky=tk.EW, padx=5, pady=5)
+    
+    line_width_label = ttk.Label(params_frame, text="Line Width (optional):")
+    line_width_label.grid(row=1, column=4, sticky=tk.W, padx=5, pady=5)
+    line_width_entry = ttk.Entry(params_frame, textvariable=app.config.inference.infer_line_width_var, width=10)
+    line_width_entry.grid(row=1, column=5, sticky=tk.EW, padx=5, pady=5)
+    
+    project_label = ttk.Label(params_frame, text="Project Folder (optional):")
+    project_label.grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+    project_entry = ttk.Entry(params_frame, textvariable=app.config.inference.infer_project_var)
+    project_entry.grid(row=2, column=1, sticky=tk.EW, padx=5, pady=5, columnspan=2)
+    CreateToolTip(project_entry, "Optional. Custom directory to save results to (e.g., 'runs/detect').")
 
-    # Row 3
-    ttk.Label(infer_params_frame, text="Output Project Dir:").grid(row=param_row, column=0, padx=5, pady=3, sticky="w")
-    ttk.Entry(infer_params_frame, textvariable=app.infer_project_var, width=15).grid(row=param_row, column=1, padx=5, pady=3, sticky="ew")
-    ttk.Label(infer_params_frame, text="Output Run Name:").grid(row=param_row, column=2, padx=5, pady=3, sticky="w")
-    ttk.Entry(infer_params_frame, textvariable=app.infer_name_var, width=15).grid(row=param_row, column=3, padx=5, pady=3, sticky="ew")
-    param_row += 1
+    name_label = ttk.Label(params_frame, text="Run Name (optional):")
+    name_label.grid(row=2, column=3, sticky=tk.W, padx=5, pady=5)
+    name_entry = ttk.Entry(params_frame, textvariable=app.config.inference.infer_name_var)
+    name_entry.grid(row=2, column=4, sticky=tk.EW, padx=5, pady=5, columnspan=2)
+    CreateToolTip(name_entry, "Optional. Custom name for the results folder (e.g., 'exp1_video').")
 
-    # --- Sub-frames for Checkbuttons ---
-    checkbox_main_frame = ttk.Frame(infer_params_frame)
-    checkbox_main_frame.grid(row=param_row, column=0, columnspan=4, sticky="ew", pady=5)
+    # --- 3. Output Options ---
+    # Using a grid for alignment
+    output_grid_frame = ttk.Frame(output_frame)
+    output_grid_frame.pack(anchor='w')
+    
+    col1 = 0
+    col2 = 1
+    col3 = 2
 
-    output_options_frame = ttk.LabelFrame(checkbox_main_frame, text="General Output", padding="5")
-    output_options_frame.pack(side="left", fill="x", expand=True, padx=2)
-    ttk.Checkbutton(output_options_frame, text="Show Inference Window", variable=app.show_infer_var).pack(anchor="w", padx=5, pady=1)
-    ttk.Checkbutton(output_options_frame, text="Save Annotated Media", variable=app.infer_save_var).pack(anchor="w", padx=5, pady=1)
-    ttk.Checkbutton(output_options_frame, text="Augmented Inference", variable=app.infer_augment_var).pack(anchor="w", padx=5, pady=1)
+    use_tracker_check = ttk.Checkbutton(output_grid_frame, text="Use Tracker", variable=app.config.inference.use_tracker_var)
+    use_tracker_check.grid(row=0, column=col1, sticky='w', padx=10, pady=2)
+    show_infer_check = ttk.Checkbutton(output_grid_frame, text="Show Video Stream", variable=app.config.inference.show_infer_var)
+    show_infer_check.grid(row=1, column=col1, sticky='w', padx=10, pady=2)
+    save_infer_check = ttk.Checkbutton(output_grid_frame, text="Save Annotated Video", variable=app.config.inference.infer_save_var)
+    save_infer_check.grid(row=2, column=col1, sticky='w', padx=10, pady=2)
+    
+    save_txt_check = ttk.Checkbutton(output_grid_frame, text="Save Results (.txt)", variable=app.config.inference.infer_save_txt_var)
+    save_txt_check.grid(row=0, column=col2, sticky='w', padx=10, pady=2)
+    save_conf_check = ttk.Checkbutton(output_grid_frame, text="Save Confidence Scores", variable=app.config.inference.infer_save_conf_var)
+    save_conf_check.grid(row=1, column=col2, sticky='w', padx=10, pady=2)
+    save_crop_check = ttk.Checkbutton(output_grid_frame, text="Save Cropped Detections", variable=app.config.inference.infer_save_crop_var)
+    save_crop_check.grid(row=2, column=col2, sticky='w', padx=10, pady=2)
 
-    save_options_frame = ttk.LabelFrame(checkbox_main_frame, text="Save Details", padding="5")
-    save_options_frame.pack(side="left", fill="x", expand=True, padx=2)
-    ttk.Checkbutton(save_options_frame, text="Save Results (.txt)", variable=app.infer_save_txt_var).pack(anchor="w", padx=5, pady=1)
-    ttk.Checkbutton(save_options_frame, text="Save Confidences in .txt", variable=app.infer_save_conf_var).pack(anchor="w", padx=5, pady=1)
-    ttk.Checkbutton(save_options_frame, text="Save Cropped Detections", variable=app.infer_save_crop_var).pack(anchor="w", padx=5, pady=1)
+    hide_labels_check = ttk.Checkbutton(output_grid_frame, text="Hide Labels", variable=app.config.inference.infer_hide_labels_var)
+    hide_labels_check.grid(row=0, column=col3, sticky='w', padx=10, pady=2)
+    hide_conf_check = ttk.Checkbutton(output_grid_frame, text="Hide Confidence", variable=app.config.inference.infer_hide_conf_var)
+    hide_conf_check.grid(row=1, column=col3, sticky='w', padx=10, pady=2)
+    augment_check = ttk.Checkbutton(output_grid_frame, text="Use Test-Time Augmentation", variable=app.config.inference.infer_augment_var)
+    augment_check.grid(row=2, column=col3, sticky='w', padx=10, pady=2)
 
-    display_options_frame = ttk.LabelFrame(checkbox_main_frame, text="Display Details", padding="5")
-    display_options_frame.pack(side="left", fill="x", expand=True, padx=2)
-    ttk.Checkbutton(display_options_frame, text="Hide Labels", variable=app.infer_hide_labels_var).pack(anchor="w", padx=5, pady=1)
-    ttk.Checkbutton(display_options_frame, text="Hide Confidences", variable=app.infer_hide_conf_var).pack(anchor="w", padx=5, pady=1)
-
-    # --- Run Button ---
-    action_button_frame = ttk.Frame(frame)
-    action_button_frame.grid(row=current_row, column=0, columnspan=3, pady=20)
-
-    app.run_inference_button = ttk.Button(action_button_frame, text="Run Inference", command=app._run_inference, style="Accent.TButton")
-    app.run_inference_button.pack(side="left", padx=10)
-
-    app.stop_inference_button = ttk.Button(action_button_frame, text="Stop Inference", command=app._stop_inference)
-    app.stop_inference_button.pack(side="left", padx=10)
-    app.stop_inference_button.config(state=tk.DISABLED)
+    # --- Action Buttons ---
+    action_frame = ttk.Frame(app.inference_tab)
+    action_frame.pack(pady=15)
+    
+    app.run_inference_button = ttk.Button(action_frame, text="Run File Inference", command=app._run_file_inference, style="Accent.TButton")
+    app.run_inference_button.pack(side=tk.LEFT, padx=10)
+    
+    app.stop_inference_button = ttk.Button(action_frame, text="Stop Inference", command=app._stop_file_inference, state=tk.DISABLED)
+    app.stop_inference_button.pack(side=tk.LEFT, padx=10)
