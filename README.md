@@ -36,7 +36,7 @@ conda activate IntegraPose
 # 🚀 Workflow & How to Use
 The IntegraPose workflow is managed through a single main GUI application.
 
-To get started, run `main_gui_app.py`:
+To get started, run `main_gui_app.py` located in BehaviorAnnotation_ModelTraining Folder:
 
 ```
 python main_gui_app.py
@@ -101,7 +101,7 @@ This tab allows for exploratory data analysis, including normalization, feature 
 The repository is organized as follows:
 
 ```
-IntegraPose/
+BehaviorAnnotation_ModelTraining/
 ├── main_gui_app.py
 ├── keypoint_annotator_module.py
 ├── gui/
