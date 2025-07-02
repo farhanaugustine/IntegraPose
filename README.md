@@ -1,4 +1,6 @@
 [![DOI](https://zenodo.org/badge/988759361.svg)](https://doi.org/10.5281/zenodo.15565090)
+* Preprint availabe: [➡️📑](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=5334465)
+
 # IntegraPose - Simultaneous Behavior Classification and Pose Estimation
 <div align="center">
 <img src="https://github.com/user-attachments/assets/2aec1a90-552d-42e6-8ae4-91ae322a6f1b" alt="IntegraPose" width="50%"/>
@@ -143,8 +145,8 @@ Here are some examples of IntegraPose in action, classifying distinct behaviors 
 |![Github_C57B_8](https://github.com/user-attachments/assets/bb9f0491-0d9f-4a97-80f9-6bc059b337d1)| Video Source: Self | Ambulatory/Walking, Nose-Poking, Wall-Rearing/Supported Rear |
 |![Github_CHKO_9](https://github.com/user-attachments/assets/17b4d4da-fc77-4dff-a04a-000bbfef96a8)| Video Source: Self | Ambulatory/Walking, Wall-Rearing/Supported Rear |
 
-
-
+# Citation Suggestions:
+Augustine, et al., (2025). Integrapose: A Unified Framework for Simultaneous Pose Estimation and Behavior Classification. Availabe on SSRN: https://ssrn.com/abstract=5334465
 
 Repo Underdevelopment 🚧🏗️👷🏼
 
