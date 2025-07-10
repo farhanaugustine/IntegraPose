@@ -673,7 +673,7 @@ class YoloApp:
             kp_names = [n.strip() for n in self.config.get_setting('setup.keypoint_names_str').split(',') if n.strip()]
             behaviors = self.config.get_setting('setup.behaviors_list')
             img_dir = self.config.get_setting('setup.image_dir_annot')
-            ann_dir = self.config.get_setting('setup.annotation_dir')
+            ann_dir = self.config.get_setting('setup.annot_output_dir')
             if not all([kp_names, behaviors, img_dir, ann_dir]):
                 self.log_message(f"Keypoint missing: {kp_names}, Behaviors: {behaviors}, Image Dir: {img_dir}, Annotation Dir: {ann_dir}", "ERROR")
                 raise ValueError("Keypoints, Behaviors, Image Directory, and Annotation Output Directory must all be set.")
@@ -708,8 +708,8 @@ class YoloApp:
                 keypoint_names=kp_names,
                 available_behaviors=available_behaviors,
                 dataset_root_path=self.config.get_setting('setup.dataset_root_yaml'),
-                train_images_path=self.config.get_setting('setup.train_image_yaml'),
-                val_images_path=self.config.get_setting('setup.val_image_yaml'),
+                train_images_path=self.config.get_setting('setup.train_image_dir_yaml'),
+            val_images_path=self.config.get_setting('setup.val_image_dir_yaml'),
                 dataset_name_suggestion=self.config.get_setting('setup.dataset_name_yaml')
             )
             if generated_path:
