@@ -45,9 +45,6 @@ dependencies:
       - pyyaml==6.0.2
       - six==1.17.0
       - sympy==1.13.1
-      - torch==2.6.0+cu124
-      - torchaudio==2.6.0+cu124
-      - torchvision==0.21.0+cu124
       - typing-extensions==4.14.0
       - ultralytics==8.3.158
       - ultralytics-thop==2.0.14
