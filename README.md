@@ -1,15 +1,27 @@
 [![DOI](https://zenodo.org/badge/988759361.svg)](https://doi.org/10.5281/zenodo.15565090)
 * Preprint availabe: [➡️📑](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=5334465)
 
-# IntegraPose - Simultaneous Behavior Classification and Pose Estimation
 <div align="center">
-<img src="https://github.com/user-attachments/assets/2aec1a90-552d-42e6-8ae4-91ae322a6f1b" alt="IntegraPose" width="50%"/>
+  <h2 align="center">
+  <em>Simultaneous 2D Pose-Estimation and Behavior Classification</em>
+  <img src="https://github.com/user-attachments/assets/5bef79e4-ef99-4ca3-928a-4af75707e1a0" width="500"/>
+  </h1>
+</div>
 </div>
 
 This repository demonstrates multi-task learning for combined object detection and pose-estimation using YOLO-Pose models. IntegraPose enables robust, simultaneous classification of complex behaviors and precise keypoint tracking from a single model. IntegraPose is a comprehensive suite of tools designed to streamline the entire workflow of behavioral analysis, from initial video annotation to advanced, post-hoc analysis of model outputs. It consists of a primary GUI-based application that integrates various functionalities into a single, cohesive workflow.
 
+</div>
+
+## There two User Guides to get you started:
+* 📖 Comprehensive [User Guide](https://farhanaugustine.github.io/IntegraPose/): Covers the graphical user interface (GUI), GIFs for workflow steps, advanced YOLO model customization, and example model backbone modules (for user wanting more control over the YOLO model).
+* 🚀 [Quick start guide](https://farhanaugustine.github.io/IntegraPose/Quick_Start_Guide.html): A streamlined tutorial to get you up and running in minutes. Includes screenshots for references. 
+</div>
+
 # 🚧 Project Status 🚧
-This repository is currently under active development. The tools are functional, but APIs may change, and new features will be added. Feedback and contributions are welcome!
+This repository is currently under active development. APIs may change, and new features will be added. Feedback and contributions are welcome!
+
+</div>
 
 # ✨ Key Features
 
@@ -19,6 +31,9 @@ This repository is currently under active development. The tools are functional,
 4. Advanced Bout Analytics: Tools for analyzing, confirming, and scoring behavioral bouts, including manual review and correction.
 5. Pose Clustering Analysis: A dedicated tab for exploratory data analysis, clustering, and visualization of pose data.
 6. Flexible ROI Management: Define regions of interest dynamically for various analysis modes.
+7. Advanced Gait Analysis Coming Soon. 
+   
+</div>
 
 # 🛠️ Prerequisites
 Before you begin, ensure you have the following installed:
@@ -34,6 +49,8 @@ pip install ultralytics opencv-python pandas numpy hdbscan umap-learn matplotlib
 conda env create -f environment.yml
 conda activate IntegraPose
 ```
+
+</div>
 
 # 🚀 Workflow & How to Use
 The IntegraPose workflow is managed through a single main GUI application.
@@ -99,6 +116,7 @@ This tab allows for exploratory data analysis, including normalization, feature 
 
 
 * Visualization: Visualize clusters and their relationship to the original data.
+</div>
 # Project Structure
 The repository is organized as follows:
 
@@ -130,6 +148,7 @@ BehaviorAnnotation_ModelTraining/
 ├── README.md
 └── bout_tool.log (example log file)
 ```
+</div>
 
 # Showcase 🖼️
 Here are some examples of IntegraPose in action, classifying distinct behaviors while simultaneously tracking keypoints.
@@ -145,10 +164,17 @@ Here are some examples of IntegraPose in action, classifying distinct behaviors 
 |![Github_C57B_8](https://github.com/user-attachments/assets/bb9f0491-0d9f-4a97-80f9-6bc059b337d1)| Video Source: Self | Ambulatory/Walking, Nose-Poking, Wall-Rearing/Supported Rear |
 |![Github_CHKO_9](https://github.com/user-attachments/assets/17b4d4da-fc77-4dff-a04a-000bbfef96a8)| Video Source: Self | Ambulatory/Walking, Wall-Rearing/Supported Rear |
 
+</div>
+
 # Citation Suggestions:
 Augustine, et al., (2025). Integrapose: A Unified Framework for Simultaneous Pose Estimation and Behavior Classification. Availabe on SSRN: https://ssrn.com/abstract=5334465
 
-Repo Underdevelopment 🚧🏗️👷🏼
+</div>
+
+# Acknowledgments:
+IntegraPose is built upon the powerful and flexible Ultralytics YOLOv8 framework. We extend our sincere gratitude to the [Ultralytics](https://www.ultralytics.com/) team for their significant contributions to the open-source community.
+
+### Repo Underdevelopment 🚧🏗️👷🏼
 
 
 
