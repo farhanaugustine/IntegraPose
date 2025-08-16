@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IntegraPose: Quick Start Tutorial</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f8fafc; /* slate-50 */
+        }
+        .section-card {
+            background-color: white;
+            border-radius: 0.75rem;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+        }
+        .step {
+            display: flex;
+            align-items: flex-start;
+        }
+        .step-number {
+            flex-shrink: 0;
+            background-color: #0284c7; /* sky-600 */
+            color: white;
+            width: 2rem;
+            height: 2rem;
+            border-radius: 9999px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 1.125rem;
+            margin-right: 1rem;
+        }
+        .admonition {
+            border-left-width: 4px;
+            padding: 1rem;
+            border-radius: 0.25rem;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+        }
+        .admonition-warning {
+            border-color: #f59e0b; /* amber-500 */
+            background-color: #fffbeb; /* amber-50 */
+            color: #b45309; /* amber-800 */
+        }
+        kbd {
+            font-family: monospace;
+            background-color: #e5e7eb; /* gray-200 */
+            color: #1f2937; /* gray-800 */
+            padding: 0.1rem 0.4rem;
+            border-radius: 0.25rem;
+            font-size: 0.875em;
+            border: 1px solid #d1d5db; /* gray-300 */
+        }
+        .screenshot {
+            width: 100%;
+            border-radius: 0.5rem;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+            border: 1px solid #e5e7eb; /* gray-200 */
+        }
+        details summary {
+            cursor: pointer;
+            font-weight: 600;
+            color: #0369a1; /* sky-800 */
+        }
+    </style>
+</head>
+<body class="text-slate-800">
+
+    <header class="bg-white/80 backdrop-blur-lg sticky top-0 z-50 border-b border-slate-200">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <div class="flex-shrink-0">
+                    <h1 class="text-xl font-bold text-slate-900">IntegraPose Quick Start Guide</h1>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
+
+        <section id="intro">
+            <div class="text-center mb-12">
+                <h2 class="text-3xl font-bold tracking-tight text-slate-900 sm:text-4xl">Your First Project in 15 Minutes</h2>
+                <p class="mt-4 text-lg leading-8 text-slate-600">Welcome to the IntegraPose Quick Start guide! This tutorial will walk you through an entire, simplified workflow using a small, provided sample dataset. The goal is to give you a complete overview of the process and a feeling of success, from loading data to generating your first analysis.</p>
+            </div>
+        </section>
+
+        <section id="tutorial-steps">
+            <div class="section-card p-6 md:p-8">
+                 <h3 class="text-xl font-semibold mb-6 text-slate-900">Step-by-Step Tutorial</h3>
+                 <div class="space-y-8">
+                    
+                    <div class="step">
+                        <div class="step-number">1</div>
+                        <div>
+                            <h4 class="font-semibold text-lg">Download the Sample Project</h4>
+                            <p class="text-slate-600 mb-2">The first step is to get the sample data. This folder contains everything you need: a short video, pre-annotated image and label folders, and a project configuration file.</p>
+                            <a href="https://drive.google.com/drive/folders/1JjxiEc-nflYSJaD9YTBtdv55HJxTO_BH?usp=sharing" target="_blank" class="inline-block bg-sky-600 text-white font-bold py-2 px-4 rounded hover:bg-sky-700 transition-colors">Download Sample Project Files</a>
+                            <p class="text-slate-600 mt-2">Download the entire <kbd>Quick_Start_Guide</kbd> folder from Google Drive and place it somewhere memorable on your computer (e.g., your Desktop or Documents folder).</p>
+                        </div>
+                    </div>
+
+                    <div class="step">
+                        <div class="step-number">2</div>
+                        <div>
+                            <h4 class="font-semibold text-lg">Load the Project into the GUI</h4>
+                            <p class="text-slate-600 mb-2">Launch the IntegraPose application by running <kbd>python main_gui_app.py</kbd> in your terminal.</p>
+                            <p class="text-slate-600 mb-2">In **Tab 1: Setup & Annotation**, click the **"Load Project Configs"** button and select the <kbd>Quick_Start_Tutorial.json</kbd> file from the downloaded sample project folder.</p>
+                            <p class="text-slate-600 mb-2">You will see the Keypoint names, Behavior names, and file paths automatically populate.</p>
+                             <img src="Quick_Start_Screenshots/step2_load_project.png" alt="GUI showing loaded project paths" class="screenshot">
+                            <div class="admonition admonition-warning">
+                                <p class="font-bold">🚨 Important: Update Your Paths!</p>
+                                <p>The loaded paths point to the original creator's computer. You **must** update the paths to match the location where **you** saved the sample project folder. Click the "Browse" button for each path in the "Configure Annotation Tool" section and select the corresponding folders (`images/train`, `labels/train`, and the main project root folder).</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="step">
+                        <div class="step-number">3</div>
+                        <div>
+                            <h4 class="font-semibold text-lg">Generate the Dataset YAML File</h4>
+                            <p class="text-slate-600 mb-2">Once your paths are correct, click the **"Save Dataset YAML"** button. This will create a `behavior_dataset.yaml` file in your project root. This critical file tells the training engine how your dataset is structured.</p>
+                            <details class="mt-4 p-4 bg-slate-50 rounded-lg">
+                                <summary>Click to see the structure of the `behavior_dataset.yaml` file</summary>
+                                <div class="bg-slate-900 text-white p-4 mt-2 rounded-lg font-mono text-sm overflow-x-auto">
+<pre><code># Defines the main project path
+path: C:\Your\Path\To\Quick_Start_Guide
+
+# Defines the subdirectories for training and validation images
+train: images/train
+val: images/val
+
+# Defines the number of keypoints and their dimensions (x, y, visibility)
+kpt_shape: [6, 3]
+
+# Defines the number of behavior classes
+nc: 4
+
+# Maps class IDs to human-readable names
+names: {0: Rearing, 1: Walking, 2: Wall-Rearing, 3: Nose-Poke}
+</code></pre>
+                                </div>
+                            </details>
+                        </div>
+                    </div>
+
+                     <div class="step">
+                        <div class="step-number">4</div>
+                        <div>
+                            <h4 class="font-semibold text-lg">Train a Quick Model</h4>
+                            <p class="text-slate-600 mb-2">Navigate to **Tab 2: Model Training**.</p>
+                            <ol class="list-decimal list-inside space-y-2 mt-2 text-slate-700">
+                                <li>Click "Browse" for the `Dataset YAML Path` field and select the <kbd>behavior_dataset.yaml</kbd> file you just created.</li>
+                                <li>For this tutorial, change **Epochs** to **"10"** to make the training very fast.</li>
+                                <li>As shown in the screenshot, the **Device** is set to `0`. If you have a compatible NVIDIA GPU, leave this as is. If not, select `cpu` from the dropdown menu.</li>
+                                <li>Click **"Start Training"**. You will see the progress in the Log tab. This should only take a few minutes.</li>
+                            </ol>
+                            <img src="Quick_Start_Screenshots/step4_training_settings.png" alt="GUI showing training settings" class="screenshot">
+                        </div>
+                    </div>
+
+                     <div class="step">
+                        <div class="step-number">5</div>
+                        <div>
+                            <h4 class="font-semibold text-lg">Run Inference on the Sample Video</h4>
+                            <p class="text-slate-600 mb-2">Navigate to **Tab 3: Inference**.</p>
+                             <ol class="list-decimal list-inside space-y-2 mt-2 text-slate-700">
+                                <li>For `Trained Model Path`, browse to the training output folder (e.g., `runs/pose/keypoint_behavior_run1/weights/`) and select <kbd>best.pt</kbd>.</li>
+                                <li>For `Source Video/Folder`, select the <kbd>Sample_Video.mp4</kbd> file from the project folder.</li>
+                                <li>Ensure the **"Use Tracker"** and **"Save Results (.txt)"** checkboxes are checked. You can optionally provide a tracker configuration file, like the `botsort.yaml` shown below.</li>
+                                <li>Click **"Run File Inference"**. A window will pop up showing the model tracking the animal in real-time.</li>
+                            </ol>
+                             <img src="Quick_Start_Screenshots/step5_inference_settings.png" alt="GUI showing inference settings" class="screenshot">
+                             <details class="mt-4 p-4 bg-slate-50 rounded-lg">
+                                <summary>Click to see the structure of the `botsort.yaml` tracker file</summary>
+                                <div class="bg-slate-900 text-white p-4 mt-2 rounded-lg font-mono text-sm overflow-x-auto">
+<pre><code># Tracker type: 'botsort' or 'bytetrack'
+tracker_type: botsort
+
+# Association thresholds
+track_high_thresh: 0.9
+track_low_thresh: 0.01
+new_track_thresh: 0.85
+
+# Match threshold and buffer size
+track_buffer: 100
+match_thresh: 0.8
+
+# BoT-SORT specific settings
+gmc_method: sparseOptFlow # Global Motion Compensation
+with_reid: True # Use Re-identification features
+</code></pre>
+                                </div>
+                            </details>
+                        </div>
+                    </div>
+
+                     <div class="step">
+                        <div class="step-number">6</div>
+                        <div>
+                            <h4 class="font-semibold text-lg">Analyze Behavioral Bouts</h4>
+                            <p class="text-slate-600 mb-2">Finally, navigate to **Tab 5: Bout Analytics**.</p>
+                             <ol class="list-decimal list-inside space-y-2 mt-2 text-slate-700">
+                                <li>For `YOLO Output Folder`, browse to the inference output folder (e.g., `runs/pose/predict/labels/`).</li>
+                                <li>For `Source Video`, select the same sample video again.</li>
+                                <li>The default bout parameters are fine for this tutorial.</li>
+                                <li>Click **"Process & Analyze Bouts"**. The table will populate with all the detected behaviors, their start times, end times, and durations.</li>
+                            </ol>
+                            <img src="Quick_Start_Screenshots/step6_bout_results.png" alt="GUI showing bout analysis results" class="screenshot">
+                        </div>
+                    </div>
+                    
+                    <div class="step">
+                        <div class="step-number">7</div>
+                        <div>
+                            <h4 class="font-semibold text-lg">Visually Confirm Bouts (Optional)</h4>
+                            <p class="text-slate-600 mb-2">After processing, you can visually verify the model's accuracy. Click the **"Review & Confirm Detected Bouts"** button at the bottom of Tab 5.</p>
+                            <p class="text-slate-600 mb-2">This opens the Bout Confirmation Tool. Here you can:</p>
+                             <ol class="list-decimal list-inside space-y-2 mt-2 text-slate-700">
+                                <li>Select any detected bout from the list on the left.</li>
+                                <li>Use the **"Play"** and **"Frame"** buttons to watch the video segment for that specific bout.</li>
+                                <li>Click **"✓ Confirm Bout"** or **"✗ Reject Bout"** based on your review.</li>
+                                <li>Once finished, you can click **"Export Reviewed Bouts Report..."** to save a CSV file of your verified results.</li>
+                            </ol>
+                            <img src="Quick_Start_Screenshots/step7_bout_confirmation.png" alt="Bout Confirmation Tool" class="screenshot">
+                        </div>
+                    </div>
+
+                 </div>
+            </div>
+        </section>
+
+        <section id="conclusion" class="mt-12">
+             <div class="section-card p-6 md:p-8 text-center">
+                <h3 class="text-2xl font-bold tracking-tight text-emerald-700">Congratulations!</h3>
+                <p class="mt-4 text-lg leading-8 text-slate-600">You have successfully completed the entire IntegraPose workflow, from loading a project and training a model to analyzing and verifying the results. You now have the foundational knowledge to start preparing and analyzing your own data. We encourage you to explore the main User Guide for more advanced features and in-depth explanations.</p>
+            </div>
+        </section>
+
+    </main>
+
+    <footer class="border-t border-slate-200 mt-12 py-8">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center text-slate-500">
+            <p>IntegraPose User Guide</p>
+        </div>
+    </footer>
+
+</body>
+</html>
