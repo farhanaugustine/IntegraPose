@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IntegraPose Post-hoc HMM & VAE Analysis User Guide</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f8fafc; /* slate-50 */
+        }
+        .section-card {
+            background-color: white;
+            border-radius: 0.75rem;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+        }
+        .step {
+            display: flex;
+            align-items: flex-start;
+            margin-bottom: 2.5rem;
+        }
+        .step-number {
+            flex-shrink: 0;
+            background-color: #0284c7; /* sky-600 */
+            color: white;
+            width: 2.5rem;
+            height: 2.5rem;
+            border-radius: 9999px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 1.25rem;
+            margin-right: 1.5rem;
+            margin-top: 0.25rem;
+        }
+        .admonition {
+            border-left-width: 4px;
+            padding: 1rem;
+            border-radius: 0.25rem;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+        }
+        .admonition-info {
+            border-color: #3b82f6; /* blue-500 */
+            background-color: #eff6ff; /* blue-50 */
+            color: #1e40af; /* blue-800 */
+        }
+        .admonition-warning {
+            border-color: #f59e0b; /* amber-500 */
+            background-color: #fffbeb; /* amber-50 */
+            color: #b45309; /* amber-800 */
+        }
+        kbd {
+            font-family: monospace;
+            background-color: #e5e7eb; /* gray-200 */
+            color: #1f2937; /* gray-800 */
+            padding: 0.1rem 0.4rem;
+            border-radius: 0.25rem;
+            font-size: 0.875em;
+            border: 1px solid #d1d5db; /* gray-300 */
+        }
+        .code-block {
+             background-color: #1f2937; /* gray-800 */
+             color: #d1d5db; /* gray-300 */
+             padding: 1rem;
+             border-radius: 0.5rem;
+             font-family: monospace;
+             font-size: 0.875rem;
+             overflow-x: auto;
+             white-space: pre;
+        }
+    </style>
+</head>
+<body class="text-slate-800">
+
+    <header class="bg-white/80 backdrop-blur-lg sticky top-0 z-50 border-b border-slate-200">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <div class="flex-shrink-0">
+                    <h1 class="text-xl font-bold text-slate-900">IntegraPose User Guide</h1>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
+
+        <section id="intro" class="mb-16">
+            <div class="text-center">
+                <h2 class="text-3xl font-bold tracking-tight text-slate-900 sm:text-4xl">Post-hoc HMM & VAE Analysis</h2>
+                <p class="mt-4 text-lg leading-8 text-slate-600">
+                    Welcome to the IntegraPose Analysis Toolkit. This guide provides a complete walkthrough for using the application to analyze, segment, and visualize animal behavior from pose-estimation data.
+                </p>
+            </div>
+        </section>
+
+        <section id="concepts" class="mb-16">
+             <div class="section-card p-6 md:p-8">
+                <h3 class="text-2xl font-semibold mb-6 text-slate-900 text-center">Core Analysis Pipelines</h3>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+                    
+                    <div class="p-6 rounded-lg bg-slate-50 border border-slate-200">
+                        <h4 class="text-lg font-semibold mb-2">1. HMM Analysis</h4>
+                        <p class="text-slate-600 text-sm">The Hidden Markov Model (HMM) pipeline is a powerful method for modeling stereotyped behaviors. It takes your pose data, clusters it into discrete postural "states" using UMAP and HDBSCAN, and then models the probability of transitioning between these states. It is ideal for quantifying known behaviors or segmenting data based on pre-defined event labels.</p>
+                    </div>
+
+                    <div class="p-6 rounded-lg bg-slate-50 border border-slate-200">
+                        <h4 class="text-lg font-semibold mt-4 mb-2 md:mt-0">2. VAE/LSTM & Hybrid Analysis</h4>
+                        <p class="text-slate-600 text-sm">This unsupervised pipeline is designed for discovering novel behavioral motifs without prior labels. A Variational Autoencoder (VAE) first learns a compressed, "essential" representation of each pose. An HMM is then trained on these representations to segment the data into behavioral "syllables." This approach excels at finding subtle, recurring patterns in complex behavioral streams.</p>
+                    </div>
+                </div>
+             </div>
+        </section>
+        
+        <section id="tutorial-steps">
+            <h2 class="text-3xl font-bold tracking-tight text-slate-900 sm:text-4xl text-center mb-12">Step-by-Step Guide</h2>
+            <div class="section-card p-6 md:p-8">
+                
+                <div class="step">
+                    <div class="step-number">1</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Project Setup & Data Input (Tab 1)</h4>
+                        <p class="text-slate-600 mb-4">This tab is for configuring your project and linking all necessary data files.</p>
+                        
+                        <h5 class="font-semibold text-lg mt-4 mb-2">Project Management</h5>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700">
+                            <li>Use the <kbd>File</kbd> menu to <kbd>Save Project...</kbd> or <kbd>Load Project...</kbd>. This saves all your settings in Tabs 1 and 2 to a <kbd>.json</kbd> file, allowing you to quickly reload your entire configuration.</li>
+                        </ul>
+
+                        <h5 class="font-semibold text-lg mt-4 mb-2">Input Configuration</h5>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700">
+                            <li><kbd>Keypoint Names</kbd>: Enter the names of your body parts, in the exact order they appear in your YOLO-pose output files, separated by commas. Example: <kbd>nose,leftear,rightear,thorax,tailbase</kbd>.</li>
+                            <li><kbd>Behavior Names</kbd>: (Optional) If your YOLO model was trained to classify behaviors, enter the class names here, separated by commas. The order must match the class IDs (ID 0 = first name, ID 1 = second name, etc.).</li>
+                            <li><kbd>Normalization Ref Points</kbd>: Select two keypoints that have a relatively stable distance (e.g., <kbd>leftear</kbd> to <kbd>rightear</kbd> or <kbd>nose</kbd> to <kbd>thorax</kbd>). This distance is used to normalize pose features, making the analysis robust to changes in animal size or distance from the camera.</li>
+                        </ul>
+                        
+                        <h5 class="font-semibold text-lg mt-4 mb-2">Skeleton Connections</h5>
+                        <p class="text-slate-600 mb-2">Define the connections between keypoints to visualize the animal's skeleton on output images and videos. Select a start and end point from the dropdowns and click <kbd>Add</kbd>.</p>
+
+                        <h5 class="font-semibold text-lg mt-4 mb-2">Data Groups</h5>
+                        <p class="text-slate-600 mb-4">Organize your data into experimental groups (e.g., "Control", "Treatment").</p>
+                        <ol class="list-decimal list-inside space-y-2 text-slate-700">
+                             <li>Click <kbd>Add Group</kbd> to create a new group. The first group added is considered the baseline for VAE training and group comparisons.</li>
+                             <li>Select the group you just created in the tree view.</li>
+                             <li>Click <kbd>Add Data Source</kbd>. You will be prompted to select:
+                                <ul class="list-disc list-inside ml-6 mt-1">
+                                    <li>A **POSE DIRECTORY**: The folder containing the <kbd>.txt</kbd> label files from YOLO-pose for one video.</li>
+                                    <li>A **VIDEO FILE**: The corresponding <kbd>.avi</kbd> or <kbd>.mp4</kbd> video file.</li>
+                                </ul>
+                             </li>
+                             <li>Repeat for all videos in your dataset.</li>
+                        </ol>
+                        <div class="admonition admonition-warning mt-4">
+                            <p class="font-bold">🚨 Important</p>
+                            <p>For the VAE/LSTM and Hybrid analysis modes, the VAE model will be trained exclusively on the data from the <strong>first group</strong> in the list. This group should be your control or baseline condition.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">2</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Configure Analysis Parameters (Tab 2)</h4>
+                        <p class="text-slate-600 mb-4">Fine-tune the algorithms for your specific dataset.</p>
+                        
+                        <h5 class="font-semibold text-lg mt-4 mb-2">General Parameters</h5>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700">
+                            <li><kbd>Analysis Type</kbd>: Choose <kbd>HMM</kbd> for classic state modeling or <kbd>VAE/LSTM</kbd> for unsupervised discovery.</li>
+                             <li><kbd>Hybrid HMM + VAE Mode</kbd>: Check this to use the VAE for feature extraction and then run the standard HMM analysis on the VAE's latent space. This combines the power of deep learning features with the interpretability of HMMs.</li>
+                            <li><kbd>Confidence Threshold</kbd>: Keypoints with a confidence score below this value will be treated as missing.</li>
+                            <li><kbd>Max Frame Gap</kbd>: If the gap between two detections of the same animal exceeds this many frames, the track will be split into two separate sequences.</li>
+                             <li><kbd>Enable Multi-Animal Interactions</kbd>: Check this if you have multiple animals and want to include social features like inter-animal distance.</li>
+                        </ul>
+
+                        <h5 class="font-semibold text-lg mt-4 mb-2">Location Analysis</h5>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700">
+                            <li><kbd>Unsupervised Grid</kbd>: Divides the video into a grid to analyze where behaviors occur without pre-defined zones.</li>
+                            <li><kbd>User-Defined ROIs</kbd>: Define specific Regions of Interest (ROIs) using JSON format. This allows you to analyze behavior in specific zones like corners, arms of a maze, or near an object.</li>
+                        </ul>
+                        <p class="mt-2">Example ROI JSON:</p>
+                        <div class="code-block mt-2">
+{
+  "center_zone": [200, 200, 300, 300],
+  "left_corner": [0, 0, 150, 150]
+}
+                        </div>
+                        <p class="text-xs text-slate-500 mt-1">Format: "name": [x, y, width, height]</p>
+
+                        <h5 class="font-semibold text-lg mt-4 mb-2">HMM & VAE/LSTM Parameters</h5>
+                        <p class="text-slate-600 mb-2">These sections control the machine learning models. Key parameters include:</p>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700">
+                             <li><kbd>HMM States (N)</kbd> / <kbd>Num Behavioral Clusters</kbd>: The number of distinct behaviors or states you expect the model to find. This is a critical parameter that defines the granularity of the analysis.</li>
+                            <li><kbd>HDBSCAN Min Cluster Size</kbd>: Controls the sensitivity of the posture clustering algorithm. Smaller values will result in more, smaller clusters.</li>
+                             <li><kbd>Latent Dimensions</kbd>: For VAE mode, this defines the complexity of the learned pose features. 8-16 is often a good range.</li>
+                        </ul>
+                        <div class="admonition admonition-info mt-4">
+                            <p class="font-bold">💡 Tip: Use "Suggest Parameters"</p>
+                            <p>After loading your data in Tab 1, click the <kbd>Suggest Parameters</kbd> button. The tool will analyze your dataset size and suggest reasonable starting values for clustering and VAE parameters.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">3</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Execute & Visualize (Tab 3)</h4>
+                        <p class="text-slate-600 mb-4">Run the analysis and view the results.</p>
+                         <ol class="list-decimal list-inside space-y-2 text-slate-700">
+                             <li>Select an <kbd>Output Folder</kbd> where all results will be saved.</li>
+                             <li>Click the <kbd>Run Analysis</kbd> button.</li>
+                             <li>Monitor the progress bar and status messages.</li>
+                             <li>Once complete, use the <kbd>Plot to Display</kbd> dropdown to explore different visualizations directly in the application.</li>
+                         </ol>
+                    </div>
+                </div>
+                
+                <div class="step">
+                    <div class="step-number">4</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Export Raw Data (Tab 4)</h4>
+                        <p class="text-slate-600 mb-4">This tab provides a utility for data consolidation. Click <kbd>Export Keypoints to CSV</kbd> to convert all individual <kbd>.txt</kbd> detection files from your data sources into a single, aggregated CSV file per video. This is useful for sharing data or for use in other software like R or MATLAB.</p>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">5</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Interpret the Outputs</h4>
+                        <p class="text-slate-600 mb-4">Your selected output folder will contain a wealth of information.</p>
+                        
+                        <h5 class="font-semibold text-lg mt-4 mb-2">Key Output Files</h5>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700">
+                            <li><kbd>*_transition_matrix.csv</kbd>: Shows the probability of switching from one behavioral state to another.</li>
+                            <li><kbd>*_transition_heatmap.png</kbd>: A visual representation of the transition matrix.</li>
+                            <li><kbd>pose_cluster_representatives/</kbd> (HMM Mode): A folder of images showing the most representative posture for each discovered pose cluster.</li>
+                            <li><kbd>behavior_cluster_*.mp4</kbd> (VAE/Hybrid Mode): Video montages compiling all instances of each discovered behavioral syllable. <strong>Watching these videos is the primary way to understand and assign a meaningful label (e.g., "rearing", "grooming") to each cluster.</strong></li>
+                            <li><kbd>location_behavior_report.csv</kbd>: A frame-by-frame log of which behavior occurred in which location.</li>
+                            <li><kbd>comparison_*.csv / .png</kbd>: Heatmaps and data comparing the behavioral models between your experimental groups.</li>
+                        </ul>
+                        
+                        <h5 class="font-semibold text-lg mt-6 mb-2">Interpreting Plots (in GUI)</h5>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700">
+                            <li><kbd>transition / emission</kbd>: Visualizes the HMM transition and emission probabilities for the first group.</li>
+                            <li><kbd>comparison / vae_comparison</kbd>: Shows the heatmap comparing groups. For HMM, this is based on model likelihoods. For VAE, it's based on the distance between group centroids in the latent space.</li>
+                            <li><kbd>latent_space</kbd>: A 2D map of all animal postures, showing the overall "postural landscape."</li>
+                            <li><kbd>behavioral_clusters</kbd>: The latent space colored by the final HMM behavioral states. This is the key plot for VAE/Hybrid analysis, showing how discovered temporal patterns map onto the posture space.</li>
+                            <li><kbd>dominant_cluster_map</kbd>: An overlay on the first frame of your video showing which behavior was most common in each ROI or grid cell.</li>
+                        </ul>
+                    </div>
+                </div>
+
+            </div>
+        </section>
+
+    </main>
+
+    <footer class="border-t border-slate-200 mt-12 py-8">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center text-slate-500">
+            <p>IntegraPose Post-hoc HMM & VAE Analysis User Guide</p>
+        </div>
+    </footer>
+
+</body>
+</html>

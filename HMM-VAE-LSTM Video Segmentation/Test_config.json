@@ -1,0 +1,83 @@
+{
+    "groups": {
+        "Test": {
+            "sources": [
+                {
+                    "pose_dir": "C:/Users/Aegis-MSI/Documents/IntegraPose/HMM_IntegraPose/HMM_VAE_LSTM_Beta-2.0/Updated_HMM_VAE_LSTM_TLCC_CCM/HMM_VAE_LSTM_dynamic_skeleton_TLCC_CCM/Test/track/labels",
+                    "video_path": "C:/Users/Aegis-MSI/Documents/IntegraPose/HMM_IntegraPose/HMM_VAE_LSTM_Beta-2.0/Updated_HMM_VAE_LSTM_TLCC_CCM/HMM_VAE_LSTM_dynamic_skeleton_TLCC_CCM/Test/track/demo6_video.avi"
+                }
+            ],
+            "video_path_map": {
+                "C:/Users/Aegis-MSI/Documents/IntegraPose/HMM_IntegraPose/HMM_VAE_LSTM_Beta-2.0/Updated_HMM_VAE_LSTM_TLCC_CCM/HMM_VAE_LSTM_dynamic_skeleton_TLCC_CCM/Test/track/labels": "C:/Users/Aegis-MSI/Documents/IntegraPose/HMM_IntegraPose/HMM_VAE_LSTM_Beta-2.0/Updated_HMM_VAE_LSTM_TLCC_CCM/HMM_VAE_LSTM_dynamic_skeleton_TLCC_CCM/Test/track/demo6_video.avi"
+            }
+        }
+    },
+    "output_folder": "C:/Users/Aegis-MSI/Documents/IntegraPose/HMM_IntegraPose/HMM_VAE_LSTM_Beta-2.0/Updated_HMM_VAE_LSTM_TLCC_CCM/HMM_VAE_LSTM_dynamic_skeleton_TLCC_CCM/Test",
+    "keypoints_entry_var": "nose,leftear,rightear,f_leftpaw,f_rightpaw,thorax,r_leftpaw,r_rightpaw,tailbase",
+    "behaviors_entry_var": "Walking,Wall-Rearing,Grooming,Obj_Exploration,Obj_Mounting",
+    "analysis_type": "HMM",
+    "use_bbox_var": true,
+    "location_mode": "unsupervised",
+    "location_grid_size": "50",
+    "generate_location_videos": false,
+    "model_type": "categorical",
+    "use_poses": false,
+    "n_states": "5",
+    "max_frame_gap": "15",
+    "min_bout_duration": "15",
+    "conf_threshold": "0.3",
+    "umap_neighbors": "30",
+    "umap_components": "5",
+    "min_cluster_size": "75",
+    "comparison_method": "log_likelihood",
+    "latent_dim": "8",
+    "intermediate_dim": "128",
+    "vae_epochs": "100",
+    "vae_dropout": "0.2",
+    "lstm_layers": "2",
+    "lstm_epochs": "50",
+    "lstm_dropout": "0.2",
+    "run_lstm": false,
+    "vae_num_behavioral_clusters": "8",
+    "vae_min_postural_cluster_size": "100",
+    "hybrid_mode": false,
+    "use_gpu": true,
+    "social_mode": false,
+    "skeleton_connections": [
+        [
+            "leftear",
+            "nose"
+        ],
+        [
+            "nose",
+            "rightear"
+        ],
+        [
+            "nose",
+            "thorax"
+        ],
+        [
+            "f_leftpaw",
+            "thorax"
+        ],
+        [
+            "f_rightpaw",
+            "thorax"
+        ],
+        [
+            "tailbase",
+            "thorax"
+        ],
+        [
+            "r_leftpaw",
+            "thorax"
+        ],
+        [
+            "r_rightpaw",
+            "thorax"
+        ]
+    ],
+    "normalization_left": "nose",
+    "normalization_right": "thorax",
+    "roi_definitions_text": "{\n  \"center\": [200, 200, 300, 300],\n  \"corner_A\": [0, 0, 150, 150]\n}\n\n\n"
+}

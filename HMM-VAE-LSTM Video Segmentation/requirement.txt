@@ -1,0 +1,13 @@
+pillow
+matplotlib
+pandas
+numpy
+hdbscan
+opencv-python
+umap-learn
+hmmlearn
+torch
+scipy
+seaborn
+skCCM
+statsmodels
