@@ -25,13 +25,16 @@ This repository is currently under active development. APIs may change, and new 
 
 # ✨ Key Features
 
-1. Simultaneous Tracking & Classification: A single model predicts bounding boxes, keypoint locations, and behavioral class.
-2. Modular GUI-Driven Workflow: Easy-to-use graphical interfaces for annotation, training, and analysis, minimizing the need for complex command-line interaction.
-3. Integrated Annotation Tool: Interactively label keypoints and assign behavioral classes to subjects in your images.
-4. Advanced Bout Analytics: Tools for analyzing, confirming, and scoring behavioral bouts, including manual review and correction.
-5. Pose Clustering Analysis: A dedicated tab for exploratory data analysis, clustering, and visualization of pose data.
-6. Flexible ROI Management: Define regions of interest dynamically for various analysis modes.
-7. Advanced Gait Analysis Coming Soon. 
+1.  **Simultaneous Tracking & Classification:** A single model predicts bounding boxes, keypoint locations, and behavioral class.
+2.  **Modular GUI-Driven Workflow:** Easy-to-use graphical interfaces for annotation, training, and analysis, minimizing the need for complex command-line interaction.
+3.  **Integrated Annotation Tool:** Interactively label keypoints and assign behavioral classes to subjects in your images.
+4.  **Advanced Bout Analytics:** Tools for analyzing, confirming, and scoring behavioral bouts, including manual review and correction.
+5.  **Pose Clustering Analysis:** A dedicated tab for exploratory data analysis, clustering, and visualization of pose data.
+6.  **Flexible ROI Management:** Define regions of interest dynamically for various analysis modes.
+7.  **[Advanced Gait & Kinematic Analysis](https://github.com/farhanaugustine/IntegraPose/tree/main/Advanced%20Gait%20%26%20Kinematic%20Analysis):** A dedicated pipeline offering distinct methods for detecting strides and performing in-depth analysis of movement from keypoint data.
+8.  **[HMM-VAE Video Segmentation](https://github.com/farhanaugustine/IntegraPose/tree/main/HMM-VAE-LSTM%20Video%20Segmentation):** An unsupervised workflow to automatically segment continuous pose data into discrete, meaningful behavioral motifs without prior labels.
+9.  **[Sub-Behavior Discovery](https://github.com/farhanaugustine/IntegraPose/tree/main/Sub-Behavior%20Discovery%20with%20LSTM%20Autoencoders):** Employs a Seq2Seq LSTM Autoencoder to discover subtle, stereotyped variations or "sub-behaviors" within a broader action.
+10. **[Tandem YOLO-LSTM Classifier](https://github.com/farhanaugustine/IntegraPose/tree/main/LSTM-Based%20Sequence%20Classifiers):** A powerful approach using YOLO for spatial pose data and an LSTM for robust, temporal behavior classification based on movement patterns. (Does require training two seperate models, but can be run in close to real-time speeds 15-18ms per frame)
    
 </div>
 
