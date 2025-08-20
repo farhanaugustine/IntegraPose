@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IntegraPose Post-hoc LSTM Autoencoder Segmentation</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f8fafc; /* slate-50 */
+        }
+        .section-card {
+            background-color: white;
+            border-radius: 0.75rem;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+        }
+        .step {
+            display: flex;
+            align-items: flex-start;
+            margin-bottom: 2.5rem;
+        }
+        .step-number {
+            flex-shrink: 0;
+            background-color: #0284c7; /* sky-600 */
+            color: white;
+            width: 2.5rem;
+            height: 2.5rem;
+            border-radius: 9999px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 1.25rem;
+            margin-right: 1.5rem;
+            margin-top: 0.25rem;
+        }
+        .admonition {
+            border-left-width: 4px;
+            padding: 1rem;
+            border-radius: 0.25rem;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+        }
+        .admonition-info {
+            border-color: #3b82f6; /* blue-500 */
+            background-color: #eff6ff; /* blue-50 */
+            color: #1e40af; /* blue-800 */
+        }
+        .admonition-warning {
+            border-color: #f59e0b; /* amber-500 */
+            background-color: #fffbeb; /* amber-50 */
+            color: #b45309; /* amber-800 */
+        }
+        kbd {
+            font-family: monospace;
+            background-color: #e5e7eb; /* gray-200 */
+            color: #1f2937; /* gray-800 */
+            padding: 0.1rem 0.4rem;
+            border-radius: 0.25rem;
+            font-size: 0.875em;
+            border: 1px solid #d1d5db; /* gray-300 */
+        }
+        .code-block {
+             background-color: #1f2937; /* gray-800 */
+             color: #d1d5db; /* gray-300 */
+             padding: 1rem;
+             border-radius: 0.5rem;
+             font-family: monospace;
+             font-size: 0.875rem;
+             overflow-x: auto;
+             white-space: pre;
+        }
+    </style>
+</head>
+<body class="text-slate-800">
+
+    <header class="bg-white/80 backdrop-blur-lg sticky top-0 z-50 border-b border-slate-200">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <div class="flex-shrink-0">
+                    <h1 class="text-xl font-bold text-slate-900">IntegraPose User Guide</h1>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
+
+        <section id="intro" class="mb-16">
+            <div class="text-center">
+                <h2 class="text-3xl font-bold tracking-tight text-slate-900 sm:text-4xl">Post-hoc LSTM Autoencoder Segmentation</h2>
+                <p class="mt-4 text-lg leading-8 text-slate-600">
+                    This guide details an advanced, unsupervised workflow to discover and segment behavioral sub-types from pose estimation data that has already been broadly classified.
+                </p>
+            </div>
+        </section>
+
+        <section id="concepts" class="mb-16">
+             <div class="section-card p-6 md:p-8">
+                <h3 class="text-2xl font-semibold mb-6 text-slate-900 text-center">The Analysis Pipeline</h3>
+                <p class="text-center text-slate-600 mb-8">This pipeline transforms sequences of body poses into distinct behavioral groups by learning the dynamics of motion.</p>
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-8 text-center">
+                    
+                    <div class="flex flex-col items-center">
+                        <div class="bg-sky-100 text-sky-700 rounded-full h-16 w-16 flex items-center justify-center text-3xl">📝</div>
+                        <h4 class="text-lg font-semibold mt-4 mb-2">1. Feature Extraction</h4>
+                        <p class="text-slate-600 text-sm">Raw keypoint coordinates are converted into a rich feature vector for each frame, including distances, angles, velocities, and accelerations.</p>
+                    </div>
+
+                    <div class="flex flex-col items-center">
+                        <div class="bg-sky-100 text-sky-700 rounded-full h-16 w-16 flex items-center justify-center text-3xl">🧬</div>
+                        <h4 class="text-lg font-semibold mt-4 mb-2">2. Frame Encoding (VAE)</h4>
+                        <p class="text-slate-600 text-sm">A Variational Autoencoder (VAE) compresses the high-dimensional feature vector of each frame into a simpler, low-dimensional latent representation, capturing the essence of the posture.</p>
+                    </div>
+                    
+                    <div class="flex flex-col items-center">
+                        <div class="bg-sky-100 text-sky-700 rounded-full h-16 w-16 flex items-center justify-center text-3xl">⏳</div>
+                        <h4 class="text-lg font-semibold mt-4 mb-2">3. Sequence Embedding (LSTM)</h4>
+                        <p class="text-slate-600 text-sm">A bidirectional LSTM Autoencoder processes sequences of the VAE-encoded frames. It learns the temporal dynamics and creates a single, fixed-size vector (embedding) that represents the entire motion sequence.</p>
+                    </div>
+
+                    <div class="flex flex-col items-center">
+                        <div class="bg-sky-100 text-sky-700 rounded-full h-16 w-16 flex items-center justify-center text-3xl">🧩</div>
+                        <h4 class="text-lg font-semibold mt-4 mb-2">4. Clustering (HDBSCAN)</h4>
+                        <p class="text-slate-600 text-sm">The final sequence embeddings are clustered using HDBSCAN to group similar motions together. These clusters represent the discovered behavioral sub-types.</p>
+                    </div>
+                </div>
+             </div>
+        </section>
+        
+        <section id="tutorial-steps">
+            <h2 class="text-3xl font-bold tracking-tight text-slate-900 sm:text-4xl text-center mb-12">Step-by-Step Guide</h2>
+            <div class="section-card p-6 md:p-8">
+                
+                <div class="step">
+                    <div class="step-number">1</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Installation & Setup</h4>
+                        <p class="text-slate-600 mb-4">Before running the analysis, ensure your environment is set up correctly.</p>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700">
+                            <li>Place all the Python scripts (<kbd>run_analysis.py</kbd>, <kbd>data_loader.py</kbd>, etc.) and the <kbd>config.json</kbd> file in the same directory.</li>
+                            <li>Install all required Python packages. If a <kbd>requirements.txt</kbd> file is provided, you can use the command:</li>
+                        </ul>
+                        <div class="code-block mt-2">
+pip install -r requirements.txt
+                        </div>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">2</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Configure the Analysis (`config.json`)</h4>
+                        <p class="text-slate-600 mb-4">The <kbd>config.json</kbd> file is the central control panel for the entire pipeline. You must edit this file to point to your data and tune the analysis parameters.</p>
+                        
+                        <h5 class="font-semibold text-lg mt-4 mb-2">Data and Feature Parameters</h5>
+                        <div class="code-block">
+"data": {
+  "pose_directory": "path/to/your/labels_folder",
+  "video_file": "path/to/your/video.avi",
+  "output_directory": "path/to/your/output_folder",
+  "keypoint_names": ["nose", "leftear", ...],
+  "save_model": true
+},
+"feature_params": {
+  "angles_to_compute": [
+    ["leftear", "nose", "rightear"]
+  ]
+}
+                        </div>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700 mt-2">
+                            <li><kbd>pose_directory</kbd>: Path to the folder containing YOLO-pose <kbd>.txt</kbd> label files.</li>
+                            <li><kbd>video_file</kbd>: Path to the corresponding video file.</li>
+                            <li><kbd>output_directory</kbd>: Where all results will be saved. The script will create this folder if it doesn't exist.</li>
+                            <li><kbd>keypoint_names</kbd>: A list of your body part names in the exact order they appear in the label files.</li>
+                            <li><kbd>angles_to_compute</kbd>: Define triplets of keypoints to calculate angles as features.</li>
+                        </ul>
+
+                        <h5 class="font-semibold text-lg mt-4 mb-2">Preprocessing and Model Parameters</h5>
+                        <div class="code-block">
+"preprocessing": {
+  "confidence_threshold": 0.3,
+  "max_frame_gap": 15,
+  "sequence_split_strategy": "dynamic"
+},
+"vae_params": { "latent_dim": 32, "epochs": 1000, ... },
+"lstm_autoencoder_params": { "hidden_dim": 256, "epochs": 500, ... },
+"clustering_params": { "min_cluster_size": 3 }
+                        </div>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700 mt-2">
+                            <li><kbd>confidence_threshold</kbd>: Keypoints below this confidence will be considered missing and imputed.</li>
+                            <li><kbd>max_frame_gap</kbd>: A track is split into a new sequence if the time between frames exceeds this value.</li>
+                            <li><kbd>sequence_split_strategy</kbd>: Set to <kbd>"dynamic"</kbd> to split a track into a new sequence not only on time gaps but also whenever the pre-labeled behavior <kbd>class_id</kbd> changes.</li>
+                            <li><kbd>vae_params</kbd> & <kbd>lstm_autoencoder_params</kbd>: Control the architecture and training of the neural networks. <kbd>epochs</kbd> determines training duration.</li>
+                            <li><kbd>clustering_params</kbd>: The <kbd>min_cluster_size</kbd> is the most important parameter here. It sets the minimum number of sequences required to form a distinct sub-cluster. Start with a slightly larger value (e.g., 5-10) and decrease it to find more granular behaviors.</li>
+                        </ul>
+                        <div class="admonition admonition-info mt-4">
+                            <p class="font-bold">💡 GPU Recommended</p>
+                            <p>Training the VAE and LSTM models can be computationally intensive. The script will automatically use a CUDA-enabled GPU if available, which is highly recommended for faster processing.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">3</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Run the Analysis</h4>
+                        <p class="text-slate-600 mb-4">Once your <kbd>config.json</kbd> is set up, run the analysis from your terminal.</p>
+                         <ol class="list-decimal list-inside space-y-2 text-slate-700">
+                             <li>Navigate to the directory containing the scripts in your terminal.</li>
+                             <li>Execute the main script:</li>
+                         </ol>
+                         <div class="code-block mt-2">
+python run_analysis.py
+                         </div>
+                         <p class="text-slate-600 mt-4">Monitor the terminal output for progress updates on data loading, model training, clustering, and video generation.</p>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">4</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Interpret the Outputs</h4>
+                        <p class="text-slate-600 mb-4">All results are saved in the folder specified by <kbd>output_directory</kbd> in your config file.</p>
+                        
+                        <h5 class="font-semibold text-lg mt-4 mb-2">Primary Outputs</h5>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700">
+                            <li><kbd>behavior_&lt;ID&gt;_subcluster_&lt;LABEL&gt;.mp4</kbd>: These are the most critical outputs. Each video is a montage of all sequences belonging to a discovered sub-cluster. <strong>Watch these videos to assign a human-interpretable name (e.g., "short groom," "long groom") to each automatically discovered sub-type.</strong></li>
+                            <li><kbd>behavior_clusters_full.csv</kbd>: A comprehensive CSV file containing all original detection data, computed features, and the final <kbd>cluster_label</kbd> assigned to each frame.</li>
+                            <li><kbd>umap_visualization_*.png</kbd>: A 2D plot of your sequence embeddings. Each point represents an entire behavioral sequence. Points that are close together are dynamically similar. This helps visualize the structure of your behavioral data.</li>
+                             <li><kbd>lstm_encoder_state.pt</kbd>: A saved file of the trained LSTM encoder model, which can be used for future analyses if <kbd>save_model</kbd> is set to `true` in the config.</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <footer class="border-t border-slate-200 mt-12 py-8">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center text-slate-500">
+            <p>IntegraPose Post-hoc LSTM Autoencoder Segmentation</p>
+        </div>
+    </footer>
+
+</body>
+</html>

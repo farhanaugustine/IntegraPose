@@ -1,0 +1,43 @@
+{
+  "data": {
+    "pose_directory": "C:/Users/Aegis-MSI/Documents/IntegraPose/HMM_IntegraPose/HMM_VAE_LSTM_Beta-2.0/Updated_HMM_VAE_LSTM_TLCC_CCM/LSTM_Autoencoder/track/labels",
+    "video_file": "C:/Users/Aegis-MSI/Documents/IntegraPose/HMM_IntegraPose/HMM_VAE_LSTM_Beta-2.0/Updated_H_VAE_LSTM_TLCC_CCM/LSTM_Autoencoder/track/demo6_video.avi",
+    "output_directory": "C:/Users/Aegis-MSI/Documents/IntegraPose/HMM_IntegraPose/HMM_VAE_LSTM_Beta-2.0/Updated_HMM_VAE_LSTM_TLCC_CCM/LSTM_Autoencoder/Demo_LinLab_Test",
+    "keypoint_names": [
+      "nose", "leftear", "rightear", "f_leftpaw", "f_rightpaw", "thorax", 
+      "r_leftpaw", "r_rightpaw", "tailbase"
+    ],
+    "save_model": true,
+    "model_save_filename": "lstm_encoder_state.pt"
+  },
+  "feature_params": {
+    "angles_to_compute": [
+      ["leftear", "nose", "rightear"],
+      ["f_leftpaw", "thorax", "f_rightpaw"],
+      ["nose", "thorax", "tailbase"]
+    ]
+  },
+  "preprocessing": {
+    "confidence_threshold": 0.3,
+    "max_frame_gap": 15,
+    "sequence_split_strategy": "dynamic"
+  },
+  "visualization": {
+    "generate_embedding_plot": true
+  },
+  "vae_params": {
+    "latent_dim": 32,
+    "intermediate_dim": 256,
+    "epochs": 1000,
+    "dropout_rate": 0.2
+  },
+  "lstm_autoencoder_params": {
+    "hidden_dim": 256,
+    "num_layers": 2,
+    "epochs": 500,
+    "dropout_rate": 0.2
+  },
+  "clustering_params": {
+    "min_cluster_size": 3
+  }
+}
