@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IntegraPose: HMM-VAE-LSTM Segmentation Guide</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f8fafc; /* slate-50 */
+        }
+        .section-card {
+            background-color: white;
+            border-radius: 0.75rem;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+        }
+        .step {
+            display: flex;
+            align-items: flex-start;
+            margin-bottom: 2.5rem;
+        }
+        .step-number {
+            flex-shrink: 0;
+            background-color: #0284c7; /* sky-600 */
+            color: white;
+            width: 2.5rem;
+            height: 2.5rem;
+            border-radius: 9999px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 1.25rem;
+            margin-right: 1.5rem;
+            margin-top: 0.25rem;
+        }
+        .admonition {
+            border-left-width: 4px;
+            padding: 1rem;
+            border-radius: 0.25rem;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+        }
+        .admonition-info {
+            border-color: #3b82f6; /* blue-500 */
+            background-color: #eff6ff; /* blue-50 */
+            color: #1e40af; /* blue-800 */
+        }
+        .admonition-warning {
+            border-color: #f59e0b; /* amber-500 */
+            background-color: #fffbeb; /* amber-50 */
+            color: #b45309; /* amber-800 */
+        }
+        kbd {
+            font-family: monospace;
+            background-color: #e5e7eb; /* gray-200 */
+            color: #1f2937; /* gray-800 */
+            padding: 0.1rem 0.4rem;
+            border-radius: 0.25rem;
+            font-size: 0.875em;
+            border: 1px solid #d1d5db; /* gray-300 */
+        }
+        .code-block {
+             background-color: #1f2937; /* gray-800 */
+             color: #d1d5db; /* gray-300 */
+             padding: 1rem;
+             border-radius: 0.5rem;
+             font-family: monospace;
+             font-size: 0.875rem;
+             overflow-x: auto;
+             white-space: pre;
+        }
+    </style>
+</head>
+<body class="text-slate-800">
+
+    <!-- Consistent Header -->
+    <header class="bg-white/80 backdrop-blur-lg sticky top-0 z-50 border-b border-slate-200">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <div class="flex-shrink-0">
+                    <a href="index.html" class="text-xl font-bold text-slate-900 hover:text-sky-600 transition-colors">IntegraPose User Guide</a>
+                </div>
+                <nav class="hidden md:flex md:space-x-2 lg:space-x-4">
+                    <a href="post_hoc_analysis.html" class="font-medium text-slate-600 px-3 py-2 rounded-md text-sm hover:bg-slate-100">Back to Analyses</a>
+                    <a href="index.html" class="font-medium text-slate-600 px-3 py-2 rounded-md text-sm hover:bg-slate-100">Main Guide</a>
+                </nav>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
+
+        <!-- Introduction Section -->
+        <section id="intro" class="mb-16">
+            <div class="text-center">
+                <h2 class="text-3xl font-bold tracking-tight text-slate-900 sm:text-4xl">Unsupervised Behavioral Segmentation</h2>
+                <p class="mt-4 text-lg leading-8 text-slate-600">
+                    Discover the hidden language of behavior. This guide details an advanced, unsupervised workflow that automatically segments continuous pose data into discrete, meaningful behavioral "syllables" or motifs without any prior labels.
+                </p>
+            </div>
+        </section>
+
+        <!-- Conceptual Overview Section -->
+        <section id="concepts" class="mb-16">
+             <div class="section-card p-6 md:p-8">
+                <h3 class="text-2xl font-semibold mb-6 text-slate-900 text-center">The Three-Stage Pipeline</h3>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-8 text-center">
+                    
+                    <!-- VAE Card -->
+                    <div class="flex flex-col items-center">
+                        <div class="bg-sky-100 text-sky-700 rounded-full h-16 w-16 flex items-center justify-center text-3xl">🧬</div>
+                        <h4 class="text-lg font-semibold mt-4 mb-2">1. VAE: Pose Simplifier</h4>
+                        <p class="text-slate-600 text-sm">The Variational Autoencoder (VAE) learns to compress high-dimensional pose features (angles, distances) into a simple, low-dimensional latent space. This captures the "essence" of each posture while removing noise.</p>
+                    </div>
+
+                    <!-- LSTM Card -->
+                    <div class="flex flex-col items-center">
+                        <div class="bg-sky-100 text-sky-700 rounded-full h-16 w-16 flex items-center justify-center text-3xl">⏳</div>
+                        <h4 class="text-lg font-semibold mt-4 mb-2">2. LSTM: Dynamics Modeler</h4>
+                        <p class="text-slate-600 text-sm">The Long Short-Term Memory (LSTM) network learns the rules of movement by predicting the next pose in a sequence. It models the temporal flow of behavior. (See note below).</p>
+                    </div>
+
+                    <!-- HMM Card -->
+                    <div class="flex flex-col items-center">
+                        <div class="bg-sky-100 text-sky-700 rounded-full h-16 w-16 flex items-center justify-center text-3xl">🧩</div>
+                        <h4 class="text-lg font-semibold mt-4 mb-2">3. HMM: Behavior Segmenter</h4>
+                        <p class="text-slate-600 text-sm">The Hidden Markov Model (HMM) takes the simplified pose sequences and groups them into a set of recurring, stereotyped hidden states. These states are the discovered behavioral syllables.</p>
+                    </div>
+                </div>
+                <div class="admonition admonition-warning mt-8">
+                    <p class="font-bold">🚨 Important Note on the LSTM's Role</p>
+                    <p>In this specific workflow, the LSTM is trained to model the temporal dynamics of behavior but is **not** a sequence-to-sequence (Seq2Seq) model and is **not directly used for the final segmentation**. The VAE provides its latent space output directly to the HMM, which performs the segmentation. The trained LSTM can be valuable for downstream tasks like anomaly detection but is an optional component in the primary discovery pipeline.</p>
+                </div>
+             </div>
+        </section>
+        
+        <!-- Step-by-Step Guide Section -->
+        <section id="tutorial-steps">
+            <h2 class="text-3xl font-bold tracking-tight text-slate-900 sm:text-4xl text-center mb-12">Step-by-Step Guide</h2>
+            <div class="section-card p-6 md:p-8">
+                
+                <div class="step">
+                    <div class="step-number">1</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Setup Project and Data</h4>
+                        <p class="text-slate-600 mb-4">Begin by setting up your project in **Tab 1: Setup & Input**. This process is identical to the standard HMM setup.</p>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700">
+                            <li>Define your <kbd>Keypoint Names</kbd> and <kbd>Behavior Names</kbd>.</li>
+                            <li>Create at least one data group (e.g., "Control") and add your data sources (Pose Directory + Video File). The VAE will be trained on the data from the **first group** you add.</li>
+                            <li>Define your <kbd>Skeleton Connections</kbd> and <kbd>Normalization Reference Points</kbd> for accurate feature calculation.</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">2</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Configure VAE/LSTM Parameters</h4>
+                        <p class="text-slate-600 mb-4">Navigate to **Tab 2: Analysis Parameters** and configure the settings for the unsupervised pipeline.</p>
+                        <ol class="list-decimal list-inside space-y-3 text-slate-700">
+                            <li>Set the **Analysis Type** to <kbd>VAE/LSTM</kbd>.</li>
+                            <li>In the "VAE/LSTM Parameters" section, define the core architecture:
+                                <ul class="list-disc list-inside ml-6 mt-2 space-y-1">
+                                    <li><kbd>Latent Dimensions</kbd>: The size of the compressed pose representation. A value between 8 and 16 is a good starting point.</li>
+                                    <li><kbd>VAE Epochs</kbd>: Number of training iterations for the VAE. 100-200 is typical.</li>
+                                    <li><kbd>Num Behavioral Clusters (HMM)</kbd>: This sets the number of hidden states for the HMM to discover. It's the most important parameter for defining the granularity of your behavioral syllables.</li>
+                                    <li><kbd>Min Postural Cluster Size (HDBSCAN)</kbd>: Used for an optional, separate clustering of static poses. Does not affect the main HMM segmentation.</li>
+                                </ul>
+                            </li>
+                             <li>(Optional) Check <kbd>Run Bidirectional LSTM after VAE</kbd> if you wish to train the dynamics model.</li>
+                        </ol>
+                         <div class="admonition admonition-info mt-4">
+                            <p class="font-bold">💡 Tip: Use "Suggest Parameters"</p>
+                            <p>If you are unsure where to start, load your data in Tab 1 and then click the "Suggest Parameters" button. The tool will analyze your dataset size and suggest reasonable starting values for UMAP, HDBSCAN, and the VAE latent dimensions.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">3</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Execute the Analysis</h4>
+                        <p class="text-slate-600 mb-4">Go to **Tab 3: Execute & Visualize**.</p>
+                         <ol class="list-decimal list-inside space-y-2 text-slate-700">
+                             <li>Select your <kbd>Output Folder</kbd>.</li>
+                             <li>Click the **"Run Analysis"** button.</li>
+                             <li>Monitor the progress bar and status updates. The process will involve:
+                                <ul class="list-disc list-inside ml-6 mt-2 space-y-1">
+                                    <li>Computing high-dimensional feature vectors.</li>
+                                    <li>Training the VAE on your baseline group.</li>
+                                    <li>Encoding all pose data into the VAE's latent space.</li>
+                                    <li>Training the HMM on the latent sequences to discover behavioral states.</li>
+                                    <li>Generating reports, plots, and videos.</li>
+                                </ul>
+                             </li>
+                         </ol>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">4</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Interpret the Outputs</h4>
+                        <p class="text-slate-600 mb-4">Once the analysis is complete, several key outputs will be generated in your specified output folder and can be previewed in the GUI.</p>
+                        
+                        <h5 class="font-semibold text-lg mt-4 mb-2">Visualizations (Tab 3)</h5>
+                        <p class="text-slate-600 mb-2">Use the "Plot to Display" dropdown to view:</p>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700">
+                            <li><kbd>latent_space</kbd>: A 2D UMAP projection of the VAE's latent space. It shows the overall structure of all postures in your dataset.</li>
+                            <li><kbd>postural_clusters</kbd>: The latent space colored by the HDBSCAN postural clusters. This shows groups of statically similar poses.</li>
+                            <li><kbd>behavioral_clusters</kbd>: The latent space colored by the HMM behavioral states. This is the key plot, showing how the discovered temporal syllables map onto the posture space.</li>
+                            <li><kbd>vae_comparison</kbd>: If you have multiple groups, this heatmap shows the distance between group centroids in the latent space, quantifying overall behavioral differences.</li>
+                        </ul>
+
+                        <h5 class="font-semibold text-lg mt-6 mb-2">Generated Videos</h5>
+                        <p class="text-slate-600 mb-2">In your output folder, you will find a video for each discovered behavioral cluster (e.g., <kbd>behavior_cluster_0.mp4</kbd>, <kbd>behavior_cluster_1.mp4</kbd>, etc.).</p>
+                        <p class="text-slate-600">These videos are montages of all instances where the animal was in that specific HMM state. **Watching these videos is the most important step for assigning a human-interpretable name (e.g., "sniffing," "turning") to each automatically discovered syllable.**</p>
+                    </div>
+                </div>
+
+            </div>
+        </section>
+
+    </main>
+
+    <!-- Consistent Footer -->
+    <footer class="border-t border-slate-200 mt-12 py-8">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center text-slate-500">
+            <p>IntegraPose User Guide</p>
+        </div>
+    </footer>
+
+</body>
+</html>

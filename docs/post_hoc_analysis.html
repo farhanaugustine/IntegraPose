@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IntegraPose: Post-Hoc Analysis Guide</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f8fafc; /* slate-50 */
+        }
+        .section-card {
+            background-color: white;
+            border-radius: 0.75rem;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+            transition: all 0.3s ease-in-out;
+        }
+        .analysis-card {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+        }
+        .analysis-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -2px rgb(0 0 0 / 0.1);
+        }
+        .card-content {
+            flex-grow: 1;
+        }
+    </style>
+</head>
+<body class="text-slate-800">
+
+    <!-- Consistent Header -->
+    <header class="bg-white/80 backdrop-blur-lg sticky top-0 z-50 border-b border-slate-200">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <div class="flex-shrink-0">
+                    <a href="index.html" class="text-xl font-bold text-slate-900 hover:text-sky-600 transition-colors">IntegraPose User Guide</a>
+                </div>
+                <!-- Optional: Add nav links back to main guide if needed -->
+                 <nav class="hidden md:flex md:space-x-2 lg:space-x-4">
+                    <a href="index.html" class="nav-link font-medium text-slate-600 px-3 py-2 rounded-md text-sm">Main Guide</a>
+                    <a href="Quick_Start_Guide.html" class="nav-link font-medium text-slate-600 px-3 py-2 rounded-md text-sm">Quick Start</a>
+                </nav>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
+
+        <!-- Introduction Section -->
+        <section id="intro" class="mb-16">
+            <div class="text-center">
+                <h2 class="text-3xl font-bold tracking-tight text-slate-900 sm:text-4xl">Post-Hoc Analysis Guide</h2>
+                <p class="mt-4 text-lg leading-8 text-slate-600">
+                    You've trained a model and run inference to get keypoint and behavior data. Now what? This guide introduces advanced post-hoc analyses to help you extract deeper scientific insights from your raw tracking data and uncover subtle behavioral phenotypes.
+                </p>
+            </div>
+        </section>
+
+        <!-- Analysis Methods Section -->
+        <section id="analysis-methods">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+
+                <!-- Card 1: HMM_VAE_LSTM -->
+                <div class="section-card analysis-card">
+                    <div class="p-6 md:p-8 card-content">
+                        <h3 class="text-xl font-semibold mb-3 text-sky-700">HMM-VAE-LSTM Video Segmentation</h3>
+                        <p class="text-slate-600 mb-4">
+                            This unsupervised approach discovers the underlying structure of behavior without pre-defined labels. It learns a compressed representation of postures (VAE), models their temporal dynamics (LSTM), and segments them into discrete, stereotyped behavioral syllables (HMM).
+                        </p>
+                        <p class="text-slate-700 font-medium">Use this for:</p>
+                        <ul class="list-disc list-inside mt-2 space-y-1 text-slate-600">
+                            <li>Unsupervised discovery of behavioral motifs.</li>
+                            <li>Analyzing the syntax and sequencing of actions.</li>
+                            <li>Identifying novel behavioral states affected by your experiment.</li>
+                        </ul>
+                    </div>
+                    <div class="bg-slate-50 p-4 rounded-b-lg">
+                        <a href="hmm_vae_lstm_segmentation_guide.html" class="inline-block bg-sky-600 text-white font-bold py-2 px-4 rounded hover:bg-sky-700 transition-colors w-full text-center">View Segmentation Guide</a>
+                    </div>
+                </div>
+
+                <!-- Card 2: LSTM_Autoencoder (Corrected) -->
+                <div class="section-card analysis-card">
+                    <div class="p-6 md:p-8 card-content">
+                        <h3 class="text-xl font-semibold mb-3 text-sky-700">Sub-Behavior Discovery with LSTM Autoencoders</h3>
+                        <p class="text-slate-600 mb-4">
+                           This Seq2Seq model learns a compressed "signature" for entire behavioral sequences. By clustering these signatures, it automatically discovers stereotyped, repeatable variations within a single behavior class (e.g., fast vs. slow grooming).
+                        </p>
+                         <p class="text-slate-700 font-medium">Use this for:</p>
+                        <ul class="list-disc list-inside mt-2 space-y-1 text-slate-600">
+                            <li>Finding fine-grained motor patterns within a broad behavior.</li>
+                            <li>Quantifying an animal's repertoire of specific actions.</li>
+                            <li>Identifying subtle motor phenotypes that differ between groups.</li>
+                        </ul>
+                    </div>
+                     <div class="bg-slate-50 p-4 rounded-b-lg">
+                        <a href="lstm_autoencoder_guide.html" class="inline-block bg-sky-600 text-white font-bold py-2 px-4 rounded hover:bg-sky-700 transition-colors w-full text-center">View Sub-Behavior Guide</a>
+                    </div>
+                </div>
+
+                <!-- Card 3: LSTM_Classifiers -->
+                <div class="section-card analysis-card">
+                    <div class="p-6 md:p-8 card-content">
+                        <h3 class="text-xl font-semibold mb-3 text-sky-700">LSTM-Based Sequence Classifiers</h3>
+                        <p class="text-slate-600 mb-4">
+                           Go beyond single-frame classification. An LSTM classifier considers a sequence of keypoints over time to make a prediction. This allows it to learn dynamic patterns that are invisible to a standard frame-by-frame model, capturing the *how* of a movement, not just the *what*.
+                        </p>
+                         <p class="text-slate-700 font-medium">Use this for:</p>
+                        <ul class="list-disc list-inside mt-2 space-y-1 text-slate-600">
+                            <li>Classifying behaviors defined by their dynamics (e.g., hesitant vs. confident walk).</li>
+                            <li>Distinguishing between similar postures with different meanings.</li>
+                            <li>Improving classification accuracy in noisy conditions.</li>
+                        </ul>
+                    </div>
+                     <div class="bg-slate-50 p-4 rounded-b-lg">
+                        <a href="lstm_sequence_classifier.html" class="inline-block bg-sky-600 text-white font-bold py-2 px-4 rounded hover:bg-sky-700 transition-colors w-full text-center">View Sequence Classifier Guide</a>
+                    </div>
+                </div>
+
+                <!-- Card 4: Advanced Gait Analysis -->
+                <div class="section-card analysis-card">
+                    <div class="p-6 md:p-8 card-content">
+                        <h3 class="text-xl font-semibold mb-3 text-sky-700">Advanced Gait & Kinematic Analysis</h3>
+                        <p class="text-slate-600 mb-4">
+                            Move beyond simple speed calculations. This involves extracting detailed kinematic variables from limb keypoints during locomotion to build a comprehensive profile of an animal's gait. Analyze stride parameters, inter-limb coordination, and postural dynamics.
+                        </p>
+                         <p class="text-slate-700 font-medium">Use this for:</p>
+                        <ul class="list-disc list-inside mt-2 space-y-1 text-slate-600">
+                            <li>Detailed analysis of locomotor deficits in disease models.</li>
+                            <li>Quantifying changes in balance and coordination.</li>
+                            <li>Comparing gait signatures between different experimental groups.</li>
+                        </ul>
+                    </div>
+                     <div class="bg-slate-50 p-4 rounded-b-lg">
+                        <a href="gait_analysis_methods.html" class="inline-block bg-sky-600 text-white font-bold py-2 px-4 rounded hover:bg-sky-700 transition-colors w-full text-center">View Gait Analysis Guide</a>
+                    </div>
+                </div>
+
+            </div>
+        </section>
+
+    </main>
+
+    <!-- Consistent Footer -->
+    <footer class="border-t border-slate-200 mt-16 py-8">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center text-slate-500">
+            <p>IntegraPose User Guide</p>
+             <p class="text-sm">For questions, bug reports, or feature requests, please visit the <a href="https://github.com/farhanaugustine/IntegraPose" target="_blank" class="text-sky-600 hover:underline">GitHub Repository</a>.</p>
+        </div>
+    </footer>
+
+</body>
+</html>

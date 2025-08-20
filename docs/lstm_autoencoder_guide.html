@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IntegraPose: LSTM Autoencoder Guide</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f8fafc; /* slate-50 */
+        }
+        .section-card {
+            background-color: white;
+            border-radius: 0.75rem;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+        }
+        .step {
+            display: flex;
+            align-items: flex-start;
+            margin-bottom: 2.5rem;
+        }
+        .step-number {
+            flex-shrink: 0;
+            background-color: #0284c7; /* sky-600 */
+            color: white;
+            width: 2.5rem;
+            height: 2.5rem;
+            border-radius: 9999px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 1.25rem;
+            margin-right: 1.5rem;
+            margin-top: 0.25rem;
+        }
+        .admonition {
+            border-left-width: 4px;
+            padding: 1rem;
+            border-radius: 0.25rem;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+        }
+        .admonition-info {
+            border-color: #3b82f6; /* blue-500 */
+            background-color: #eff6ff; /* blue-50 */
+            color: #1e40af; /* blue-800 */
+        }
+        kbd {
+            font-family: monospace;
+            background-color: #e5e7eb; /* gray-200 */
+            color: #1f2937; /* gray-800 */
+            padding: 0.1rem 0.4rem;
+            border-radius: 0.25rem;
+            font-size: 0.875em;
+            border: 1px solid #d1d5db; /* gray-300 */
+        }
+        .code-block {
+             background-color: #1f2937; /* gray-800 */
+             color: #d1d5db; /* gray-300 */
+             padding: 1rem;
+             border-radius: 0.5rem;
+             font-family: monospace;
+             font-size: 0.875rem;
+             overflow-x: auto;
+             white-space: pre;
+        }
+    </style>
+</head>
+<body class="text-slate-800">
+
+    <!-- Consistent Header -->
+    <header class="bg-white/80 backdrop-blur-lg sticky top-0 z-50 border-b border-slate-200">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <div class="flex-shrink-0">
+                    <a href="index.html" class="text-xl font-bold text-slate-900 hover:text-sky-600 transition-colors">IntegraPose User Guide</a>
+                </div>
+                <nav class="hidden md:flex md:space-x-2 lg:space-x-4">
+                    <a href="post_hoc_analysis.html" class="font-medium text-slate-600 px-3 py-2 rounded-md text-sm hover:bg-slate-100">Back to Analyses</a>
+                    <a href="index.html" class="font-medium text-slate-600 px-3 py-2 rounded-md text-sm hover:bg-slate-100">Main Guide</a>
+                </nav>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
+
+        <!-- Introduction Section -->
+        <section id="intro" class="mb-16">
+            <div class="text-center">
+                <h2 class="text-3xl font-bold tracking-tight text-slate-900 sm:text-4xl">Sub-Behavioral Analysis with LSTM Autoencoders</h2>
+                <p class="mt-4 text-lg leading-8 text-slate-600">
+                    Go beyond broad behavioral labels. This guide explains how to use a Sequence-to-Sequence (Seq2Seq) LSTM Autoencoder to discover subtle, stereotyped variations—or "sub-behaviors"—within the same general action, like different types of walking or grooming.
+                </p>
+            </div>
+        </section>
+
+        <!-- Conceptual Overview Section -->
+        <section id="concepts" class="mb-16">
+             <div class="section-card p-6 md:p-8">
+                <h3 class="text-2xl font-semibold mb-6 text-slate-900 text-center">How It Works: Learning Behavioral Signatures</h3>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-8 text-center">
+                    
+                    <!-- VAE Card -->
+                    <div class="flex flex-col items-center">
+                        <div class="bg-sky-100 text-sky-700 rounded-full h-16 w-16 flex items-center justify-center text-3xl">📜</div>
+                        <h4 class="text-lg font-semibold mt-4 mb-2">1. VAE Pre-training</h4>
+                        <p class="text-slate-600 text-sm">First, a Variational Autoencoder (VAE) is trained on all individual poses. Its job is to learn a compressed, "latent" representation for every single frame, simplifying the postural information before analyzing sequences.</p>
+                    </div>
+
+                    <!-- LSTM Autoencoder Card -->
+                    <div class="flex flex-col items-center">
+                        <div class="bg-sky-100 text-sky-700 rounded-full h-16 w-16 flex items-center justify-center text-3xl">🧠</div>
+                        <h4 class="text-lg font-semibold mt-4 mb-2">2. LSTM Seq2Seq Autoencoder</h4>
+                        <p class="text-slate-600 text-sm">The core of the method. An LSTM Encoder reads a sequence of VAE-encoded poses and compresses the entire dynamic movement into a single thought vector—its "embedding." An LSTM Decoder then tries to reconstruct the original sequence from this vector. By learning to do this, the encoder becomes an expert at creating embeddings that represent behavioral signatures.</p>
+                    </div>
+
+                    <!-- HDBSCAN Card -->
+                    <div class="flex flex-col items-center">
+                        <div class="bg-sky-100 text-sky-700 rounded-full h-16 w-16 flex items-center justify-center text-3xl">📊</div>
+                        <h4 class="text-lg font-semibold mt-4 mb-2">3. HDBSCAN Clustering</h4>
+                        <p class="text-slate-600 text-sm">Finally, all the sequence embeddings are collected. HDBSCAN, a powerful clustering algorithm, groups these embeddings based on their similarity. Each resulting cluster represents a distinct, stereotyped sub-behavior.</p>
+                    </div>
+                </div>
+             </div>
+        </section>
+        
+        <!-- Step-by-Step Guide Section -->
+        <section id="tutorial-steps">
+            <h2 class="text-3xl font-bold tracking-tight text-slate-900 sm:text-4xl text-center mb-12">Step-by-Step Guide</h2>
+            <div class="section-card p-6 md:p-8">
+                
+                <div class="step">
+                    <div class="step-number">1</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Prepare the Configuration File</h4>
+                        <p class="text-slate-600 mb-4">This entire analysis is controlled by a single <kbd>config.json</kbd> file. You must edit this file to point to your data and set the analysis parameters. Below is a breakdown of the key sections.</p>
+                        
+                        <h5 class="font-semibold text-lg mt-4 mb-2">Data and Feature Parameters</h5>
+                        <div class="code-block">
+{
+  "data": {
+    "pose_directory": "path/to/your/yolo/labels",
+    "video_file": "path/to/your/source_video.mp4",
+    "output_directory": "path/to/your/analysis_results",
+    "keypoint_names": ["nose", "leftear", ...],
+    "save_model": true
+  },
+  "feature_params": {
+    "angles_to_compute": [
+      ["leftear", "nose", "rightear"],
+      ["f_leftpaw", "thorax", "f_rightpaw"]
+    ]
+  }
+}
+                        </div>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700 mt-4">
+                            <li><kbd>pose_directory</kbd>: Path to the folder containing YOLO .txt output files.</li>
+                            <li><kbd>video_file</kbd>: Path to the corresponding video file, used for un-normalizing coordinates and generating videos.</li>
+                            <li><kbd>output_directory</kbd>: Where all results (videos, plots, CSVs) will be saved.</li>
+                            <li><kbd>keypoint_names</kbd>: An ordered list of your keypoint names, matching the model's output.</li>
+                            <li><kbd>angles_to_compute</kbd>: Define triplets of keypoints to calculate angles as features.</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">2</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Set Model Hyperparameters</h4>
+                        <p class="text-slate-600 mb-4">In the same <kbd>config.json</kbd> file, you define the architecture and training settings for the VAE and LSTM models.</p>
+                        <div class="code-block">
+{
+  "vae_params": {
+    "latent_dim": 32,
+    "intermediate_dim": 256,
+    "epochs": 1000,
+    "dropout_rate": 0.2
+  },
+  "lstm_autoencoder_params": {
+    "hidden_dim": 256,
+    "num_layers": 2,
+    "epochs": 500,
+    "dropout_rate": 0.2
+  },
+  "clustering_params": {
+    "min_cluster_size": 3
+  }
+}
+                        </div>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700 mt-4">
+                            <li><kbd>vae_params</kbd>: Controls the VAE that pre-processes the poses. <kbd>latent_dim</kbd> is the most important parameter here.</li>
+                            <li><kbd>lstm_autoencoder_params</kbd>: Controls the main Seq2Seq model. <kbd>hidden_dim</kbd> defines the size of the sequence embedding.</li>
+                            <li><kbd>clustering_params</kbd>: <kbd>min_cluster_size</kbd> tells HDBSCAN the minimum number of sequences required to form a distinct sub-behavior cluster.</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">3</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Run the Analysis Script</h4>
+                        <p class="text-slate-600 mb-4">Once your <kbd>config.json</kbd> is saved, open a terminal, activate your Python environment, and run the main analysis script.</p>
+                        <div class="code-block">
+python run_analysis.py
+                        </div>
+                        <p class="text-slate-600 mt-4">The script will execute the full pipeline automatically: loading data, training models, clustering, and generating outputs. Monitor the terminal for progress updates and any potential warnings.</p>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">4</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Interpret the Outputs</h4>
+                        <p class="text-slate-600 mb-4">The most important results will be in your specified output directory.</p>
+                        
+                        <h5 class="font-semibold text-lg mt-4 mb-2">Sub-Behavior Videos</h5>
+                        <p class="text-slate-600 mb-2">The script generates a video for each discovered sub-cluster, named according to the original behavior and the new sub-cluster label (e.g., <kbd>behavior_0_subcluster_0.mp4</kbd>, <kbd>behavior_0_subcluster_1.mp4</kbd>).</p>
+                        <p class="text-slate-600">By watching these videos, you can assign meaningful names to the clusters. For example, you might find that "Walking" (Behavior 0) was automatically segmented into "fast walking" (Sub-cluster 0) and "hesitant walking" (Sub-cluster 1).</p>
+
+                        <h5 class="font-semibold text-lg mt-6 mb-2">UMAP Visualization</h5>
+                        <p class="text-slate-600 mb-2">A plot named <kbd>umap_visualization_behavior_class_ids.png</kbd> will be saved. This plot shows the final sequence embeddings projected into 2D space, colored by their original broad behavior label. It helps you visualize how different behaviors are represented and whether the discovered sub-clusters are distinct.</p>
+                        
+                        <h5 class="font-semibold text-lg mt-6 mb-2">Data Report</h5>
+                        <p class="text-slate-600 mb-2">A detailed CSV file, <kbd>behavior_clusters_full.csv</kbd>, contains the original detection data along with the final assigned sub-cluster label for each frame, allowing for further quantitative analysis.</p>
+                    </div>
+                </div>
+
+            </div>
+        </section>
+
+    </main>
+
+    <!-- Consistent Footer -->
+    <footer class="border-t border-slate-200 mt-12 py-8">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center text-slate-500">
+            <p>IntegraPose User Guide</p>
+        </div>
+    </footer>
+
+</body>
+</html>

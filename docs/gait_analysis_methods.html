@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IntegraPose: Gait Analysis Methods Guide</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f8fafc; /* slate-50 */
+        }
+        .section-card {
+            background-color: white;
+            border-radius: 0.75rem;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+        }
+        .step {
+            display: flex;
+            align-items: flex-start;
+            margin-bottom: 2.5rem;
+        }
+        .step-number {
+            flex-shrink: 0;
+            background-color: #0284c7; /* sky-600 */
+            color: white;
+            width: 2.5rem;
+            height: 2.5rem;
+            border-radius: 9999px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 1.25rem;
+            margin-right: 1.5rem;
+            margin-top: 0.25rem;
+        }
+        .admonition {
+            border-left-width: 4px;
+            padding: 1rem;
+            border-radius: 0.25rem;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+        }
+        .admonition-info {
+            border-color: #3b82f6; /* blue-500 */
+            background-color: #eff6ff; /* blue-50 */
+            color: #1e40af; /* blue-800 */
+        }
+        kbd {
+            font-family: monospace;
+            background-color: #e5e7eb; /* gray-200 */
+            color: #1f2937; /* gray-800 */
+            padding: 0.1rem 0.4rem;
+            border-radius: 0.25rem;
+            font-size: 0.875em;
+            border: 1px solid #d1d5db; /* gray-300 */
+        }
+    </style>
+</head>
+<body class="text-slate-800">
+
+    <header class="bg-white/80 backdrop-blur-lg sticky top-0 z-50 border-b border-slate-200">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:Lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <div class="flex-shrink-0">
+                    <a href="index.html" class="text-xl font-bold text-slate-900 hover:text-sky-600 transition-colors">IntegraPose User Guide</a>
+                </div>
+                <nav class="hidden md:flex md:space-x-2 Lg:space-x-4">
+                    <a href="post_hoc_analysis.html" class="font-medium text-slate-600 px-3 py-2 rounded-md text-sm hover:bg-slate-100">Back to Analyses</a>
+                    <a href="index.html" class="font-medium text-slate-600 px-3 py-2 rounded-md text-sm hover:bg-slate-100">Main Guide</a>
+                </nav>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 Lg:px-8 py-12">
+
+        <section id="intro" class="mb-16">
+            <div class="text-center">
+                <h2 class="text-3xl font-bold tracking-tight text-slate-900 sm:text-4xl">Guide to Gait Detection Methods</h2>
+                <p class="mt-4 text-Lg leading-8 text-slate-600">
+                    The pipeline offers two distinct methods for detecting strides from keypoint data. Understanding their principles will help you choose the best approach for your specific dataset and research question.
+                </p>
+            </div>
+        </section>
+
+        <section id="methods" class="mb-16">
+             <div class="section-card p-6 md:p-8">
+                <h3 class="text-2xl font-semibold mb-8 text-slate-900 text-center">Choosing Your Detection Method</h3>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-8 md:gap-12">
+                    
+                    <div class="flex flex-col">
+                        <div class="flex items-center mb-4">
+                            <div class="bg-sky-100 text-sky-700 rounded-full h-16 w-16 flex items-center justify-center text-3xl mr-4">📉</div>
+                            <h4 class="text-xl font-semibold text-slate-800">Threshold-Based Method</h4>
+                        </div>
+                        <p class="text-slate-600 mb-4 text-sm">
+                            This method uses a simple speed cutoff to distinguish between a paw that is on the ground ('stance') and one that is moving through the air ('swing').
+                        </p>
+                        <h5 class="font-semibold text-slate-700 mb-2">How It Works:</h5>
+                        <ol class="list-decimal list-inside space-y-2 text-slate-600 text-sm">
+                            <li>Calculates the instantaneous speed of each paw.</li>
+                            <li>If paw speed is below a set <kbd>threshold</kbd>, it's labeled 'stance'.</li>
+                            <li>If paw speed is above the threshold, it's labeled 'swing'.</li>
+                            <li>A stride is defined as the time between two consecutive 'foot strike' events (swing → stance transitions).</li>
+                        </ol>
+                        <div class="mt-4 bg-slate-50 p-3 rounded-Lg border border-slate-200 text-sm">
+                            <p><strong class="text-slate-700">Best For:</strong> Clean data with a clear distinction between walking and stopping. It's fast and easy to interpret.</p>
+                            <p class="mt-2"><strong class="text-slate-700">Consideration:</strong> Can be sensitive to the chosen speed threshold and may misclassify minor, stationary movements.</p>
+                        </div>
+                    </div>
+
+                    <div class="flex flex-col">
+                        <div class="flex items-center mb-4">
+                            <div class="bg-sky-100 text-sky-700 rounded-full h-16 w-16 flex items-center justify-center text-3xl mr-4">📈</div>
+                             <h4 class="text-xl font-semibold text-slate-800">Peak-Based Method</h4>
+                        </div>
+                        <p class="text-slate-600 mb-4 text-sm">
+                            This advanced method analyzes the full velocity profile of a paw to identify the kinematic signature of a true step, making it more robust.
+                        </p>
+                        <h5 class="font-semibold text-slate-700 mb-2">How It Works:</h5>
+                         <ol class="list-decimal list-inside space-y-2 text-slate-600 text-sm">
+                            <li>First identifies periods of actual locomotion based on body speed.</li>
+                            <li>Analyzes the paw's speed profile within these periods.</li>
+                            <li>Uses a peak-finding algorithm to locate the moment of maximum swing speed (peak) and minimum speed (troughs).</li>
+                            <li>A stride is defined between consecutive foot-strikes (troughs) that bracket a valid speed peak.</li>
+                        </ol>
+                        <div class="mt-4 bg-slate-50 p-3 rounded-Lg border border-slate-200 text-sm">
+                            <p><strong class="text-slate-700">Best For:</strong> Datasets with noisy tracking or animals that make subtle, non-locomotory movements. More accurately isolates true walking/running strides.</p>
+                             <p class="mt-2"><strong class="text-slate-700">Consideration:</strong> More computationally intensive and may miss extremely slow or atypical strides that lack a clear velocity peak.</p>
+                        </div>
+                    </div>
+                </div>
+             </div>
+        </section>
+        
+        <section id="tutorial-steps">
+            <h2 class="text-3xl font-bold tracking-tight text-slate-900 sm:text-4xl text-center mb-12">How to Configure Gait Analysis</h2>
+            <div class="section-card p-6 md:p-8">
+                
+                <div class="step">
+                    <div class="step-number">1</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Setup Project and Keypoints</h4>
+                        <p class="text-slate-600">
+                           In **Tab 1: Project Setup**, define your source and results directories. You can also save or load a project configuration file here. Ensure your <kbd>Keypoint Order</kbd> in Tab 2 correctly lists the names for all paws you intend to analyze.
+                        </p>
+                        <img src="Gait_Analysis/Tab1.png" 
+                             alt="Screenshot of Tab 1 in the GUI showing project setup and directory configuration." 
+                             class="rounded-lg shadow-md border border-slate-200 my-4 w-full max-w-lg">
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">2</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Configure Gait Parameters</h4>
+                        <p class="text-slate-600 mb-4">Navigate to **Tab 2: Analysis Configuration** and find the "Gait Analysis Parameters" section. This is where you will choose your analysis method and define key parameters.</p>
+                        
+                        <img src="Gait_Analysis/Tab2.png" 
+                             alt="Screenshot of Tab 2 in the GUI highlighting the Gait Analysis Parameters section." 
+                             class="rounded-lg shadow-md border border-slate-200 my-4 w-full max-w-lg">
+
+                        <ol class="list-decimal list-inside space-y-3 text-slate-700 mt-4">
+                            <li>
+                                <strong>Select the Method:</strong> Use the <kbd>Gait Detection Method</kbd> dropdown menu to choose between <kbd>Threshold-Based</kbd> and <kbd>Peak-Based</kbd>.
+                            </li>
+                            <li>
+                                <strong>Assign Paws:</strong> In the <kbd>Paws for Gait Analysis</kbd> field, enter the names of the keypoints corresponding to the paws you want to analyze, separated by commas.
+                            </li>
+                            <li>
+                                <strong>Set Reference Paw:</strong> Specify one paw in the <kbd>Stride Reference Paw</kbd> field. The pipeline will define full strides based on the footfalls of this paw.
+                            </li>
+                        </ol>
+                         <div class="admonition admonition-info mt-4">
+                            <p class="font-bold">💡 Parameter Tip</p>
+                            <p>The <kbd>Paw Speed Threshold</kbd> parameter is primarily used by the <strong>Threshold-Based</strong> method. Its main role is to define the stance/swing cutoff for that method.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">3</div>
+                    <div>
+                        <h4 class="font-semibold text-xl mb-2">Execute and Interpret</h4>
+                        <p class="text-slate-600 mb-4">Go to **Tab 3: Group & Run Pipeline** to assign videos to experimental groups and execute the analysis. Once the analysis starts, you can monitor its real-time progress in **Tab 4: Live Log**.</p>
+                        <img src="Gait_Analysis/Tab3.png" 
+                             alt="Screenshot of Tab 3 in the GUI for assigning video groups and running the pipeline." 
+                             class="rounded-lg shadow-md border border-slate-200 my-4 w-full max-w-lg">
+                        <img src="Gait_Analysis/Tab4.png" 
+                             alt="Screenshot of Tab 4 in the GUI showing the live log output during an analysis." 
+                             class="rounded-lg shadow-md border border-slate-200 my-4 w-full max-w-lg">
+                        <h5 class="font-semibold text-lg mt-6 mb-2">Expected Outputs</h5>
+                        <p class="text-slate-600 mb-2">Regardless of the method chosen, the outputs will be consistent:</p>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700">
+                            <li>A <kbd>gait_analysis_summary.csv</kbd> file for each video, detailing every stride detected.</li>
+                            <li>Comparison plots in your main results folder, such as <kbd>comparison_stride_length.png</kbd>, which allow you to statistically compare gait metrics between your experimental groups.</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <footer class="border-t border-slate-200 mt-12 py-8">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 Lg:px-8 text-center text-slate-500">
+            <p>IntegraPose User Guide</p>
+        </div>
+    </footer>
+
+</body>
+</html>
