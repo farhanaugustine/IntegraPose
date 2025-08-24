@@ -1,0 +1,66 @@
+{
+  "dataset_preparation": {
+    "source_directory": "clips_for_labeling",
+    "key_mapping": {
+      "w": "Walking",
+      "g": "Grooming",
+      "f": "Wall-Rearing",
+      "h": "Hesitation"
+    },
+    "class_mapping": {
+      "Walking": 0,
+      "Wall-Rearing": 1,
+      "Grooming": 2,
+      "Hesitation": 3
+    }
+  },
+  "data": {
+    "pose_directory": "final_labeled_pose_data",
+    "output_directory": "output_folder",
+    "keypoint_names": [
+      "Nose", "Left Ear", "Right Ear", "Base of Neck", "Left Front Paw", 
+      "Right Front Paw", "Center Spine", "Left Rear Paw", "Right Rear Paw", 
+      "Base of Tail", "Mid Tail", "Tail Tip"
+    ],
+    "model_save_filename": "lstm_classifier.pt"
+  },
+  "process": {
+    "source_directory": "clips_for_labeling",
+    "yolo_model_path": "A2C2f_C3k2_C2PSA_Backbone_L-Model.pt",
+    "confidence_threshold": 0.5,
+    "device": 0
+  },
+  "feature_params": {
+    "angles_to_compute": [
+      ["Left Ear", "Nose", "Right Ear"],
+      ["Left Front Paw", "Base of Neck", "Right Front Paw"],
+      ["Base of Neck", "Center Spine", "Base of Tail"]
+    ]
+  },
+  "sequence_params": {
+    "sequence_length": 15
+  },
+  "lstm_classifier_params": {
+    "model_type": "attention",
+    "hidden_dim": 128,
+    "num_layers": 2,
+    "dropout_rate": 0.5
+  },
+  "training_params": {
+    "epochs": 50,
+    "batch_size": 32,
+    "learning_rate": 0.001,
+    "test_split_ratio": 0.2,
+    "use_smote": false
+  },
+  "inference_params": {
+    "video_source": "C:\\Users\\Aegis-MSI\\Documents\\IntegraPose\\BenchMarking_DLC_YOLO\\dataverse_files\\LL1-B2B\\Aggregated_Videos\\BlackMice\\Trimmed Videos\\trimmed-LL1-3_BLKS_F.mp4",
+    "output_directory": "inference_output",
+    "save_annotated_video": true,
+    "draw_ skeleton": true,
+    "yolo_model_path": "A2C2f_C3k2_C2PSA_Backbone_L-Model.pt",
+    "yolo_confidence_threshold": 0.5,
+    "lstm_classifier_path": "output_folder/lstm_classifier.pt",
+    "device": 0
+  }
+}
