@@ -70,6 +70,68 @@
         th {
             background-color: #f9fafb; /* gray-50 */
         }
+        
+        /* --- GitHub Dropdown Styles --- */
+        .github-dropdown-container {
+            position: relative;
+            display: inline-block;
+            margin-left: 1rem;
+        }
+        .github-icon-button {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0.5rem;
+            border-radius: 9999px;
+            background-color: transparent;
+            border: none;
+            cursor: pointer;
+            transition: background-color 0.2s ease-in-out;
+        }
+        .github-icon-button:hover {
+            background-color: #e2e8f0; /* slate-200 */
+        }
+        .github-icon-button img {
+            width: 24px;
+            height: 24px;
+        }
+        .dropdown-content {
+            display: none;
+            position: absolute;
+            top: 100%;
+            right: 0;
+            background-color: #ffffff; /* dark slate */
+            min-width: 200px;
+            box-shadow: 0px 8px 16px 0px rgba(0, 0, 0, 0.2);
+            z-index: 10;
+            border-radius: 0.5rem;
+            padding: 0.5rem;
+            transform: translateY(0.5rem);
+            transition: opacity 0.2s ease-in-out;
+            opacity: 0;
+        }
+        .dropdown-content.show {
+            display: block;
+            opacity: 1;
+        }
+        .dropdown-content a {
+            color: #d1d5db; /* gray-300 */
+            padding: 0.75rem 1rem;
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            border-radius: 0.375rem;
+            transition: background-color 0.2s ease-in-out;
+        }
+        .dropdown-content a:hover {
+            background-color: #374151; /* dark gray hover */
+        }
+        .dropdown-content a img {
+            width: 18px;
+            height: 18px;
+            margin-right: 0.5rem;
+        }
+        /* --- End of GitHub Dropdown Styles --- */
     </style>
 </head>
 <body class="text-slate-800">
@@ -80,11 +142,29 @@
                 <div class="flex-shrink-0">
                     <a href="index.html" class="text-xl font-bold text-slate-900 hover:text-sky-600 transition-colors">IntegraPose User Guide</a>
                 </div>
-                <nav class="hidden md:flex md:space-x-2 lg:space-x-4">
-                    <a href="index.html" class="font-medium text-slate-600 px-3 py-2 rounded-md text-sm hover:bg-slate-100">Main Guide</a>
-                    <a href="Quick_Start_Guide.html" class="font-medium text-slate-600 px-3 py-2 rounded-md text-sm hover:bg-slate-100">Quick Start</a>
-                    <a href="post_hoc_analysis.html" class="font-medium text-slate-600 px-3 py-2 rounded-md text-sm hover:bg-slate-100">Post-Hoc Analyses</a>
-                </nav>
+                <div class="flex items-center space-x-2 lg:space-x-4">
+                    <nav class="hidden md:flex md:space-x-2 lg:space-x-4">
+                        <a href="index.html" class="font-medium text-slate-600 px-3 py-2 rounded-md text-sm hover:bg-slate-100">Main Guide</a>
+                        <a href="Quick_Start_Guide.html" class="font-medium text-slate-600 px-3 py-2 rounded-md text-sm hover:bg-slate-100">Quick Start</a>
+                        <a href="post_hoc_analysis.html" class="font-medium text-slate-600 px-3 py-2 rounded-md text-sm hover:bg-slate-100">Post-Hoc Analyses</a>
+                    </nav>
+                    
+                    <div class="github-dropdown-container">
+                        <button class="github-icon-button" onclick="toggleDropdown()">
+                            <img src="https://upload.wikimedia.org/wikipedia/commons/9/91/Octicons-mark-github.svg" alt="GitHub icon">
+                        </button>
+                        <div id="githubDropdown" class="dropdown-content">
+                            <a href="https://github.com/farhanaugustine/IntegraPose">
+                                <img src="https://upload.wikimedia.org/wikipedia/commons/2/27/Iconoir_github.svg" alt="GitHub icon">
+                                Repository
+                            </a>
+                            <a href="https://github.com/farhanaugustine/IntegraPose/issues">
+                                <img src="https://upload.wikimedia.org/wikipedia/commons/6/64/Simple_light_bulb_graphic.png" alt="Open issue icon">
+                                Open issue
+                            </a>
+                        </div>
+                    </div>
+                    </div>
             </div>
         </div>
     </header>
@@ -141,10 +221,10 @@
                         <li><strong>Coordination Hypotheses:</strong> Is the step width or the coordination pattern (stance phase percentage) different between the two groups?</li>
                     </ul>
                 </div>
-                 <div class="section-card p-6 md:p-8">
+                <div class="section-card p-6 md:p-8">
                     <h3 class="text-xl font-semibold mb-2 text-slate-900">2. Kinematic Signature Analysis</h3>
                     <p class="text-slate-600 mb-4">This analysis goes deeper by asking *how* two groups perform the *same* behavior differently. Instead of just knowing an animal is "walking," you can quantify the unique postural or dynamic signature of that walk.</p>
-                     <ul class="list-disc list-inside space-y-2 text-slate-700">
+                    <ul class="list-disc list-inside space-y-2 text-slate-700">
                         <li><strong>Qualitative Differences:</strong> When both groups are rearing, is the average body elongation significantly different between them, suggesting a different posture?</li>
                         <li><strong>Motor Deficits:</strong> Does one group of mice exhibit a lower average turning speed during a specific exploratory behavior, suggesting a difference in motor control?</li>
                     </ul>
@@ -152,7 +232,7 @@
                 <div class="section-card p-6 md:p-8">
                     <h3 class="text-xl font-semibold mb-2 text-slate-900">3. Behavioral Transition & Preparatory Posture Analysis</h3>
                     <p class="text-slate-600 mb-4">Behavior is not static. This analysis focuses on the brief, information-rich windows of time immediately *before* and *after* an animal switches from one behavior to another.</p>
-                     <ul class="list-disc list-inside space-y-2 text-slate-700">
+                    <ul class="list-disc list-inside space-y-2 text-slate-700">
                         <li><strong>Motor Planning:</strong> Do animals consistently slow down or adopt a specific posture in the 30 frames *before* initiating a grooming bout? Is this preparatory pattern different between groups?</li>
                         <li><strong>Transition Mechanics:</strong> Is the change in body speed more abrupt (a steeper slope) for one group when transitioning from "Walking" to "Wall-Rearing"?</li>
                     </ul>
@@ -160,7 +240,7 @@
                 <div class="section-card p-6 md:p-8">
                     <h3 class="text-xl font-semibold mb-2 text-slate-900">4. Causal Network Analysis</h3>
                     <p class="text-slate-600 mb-4">This advanced analysis moves beyond correlation to infer causation. Using methods like Convergent Cross-Mapping (CCM), it tests for causal relationships between pairs of dynamic variables to build a network of influence.</p>
-                     <ul class="list-disc list-inside space-y-2 text-slate-700">
+                    <ul class="list-disc list-inside space-y-2 text-slate-700">
                         <li><strong>Balance Control:</strong> Does tail base speed *causally influence* turning speed, or are they just correlated? Is this causal link stronger in one group?</li>
                         <li><strong>Gait Coordination:</strong> Is there a stronger causal link from hindlimb speed to overall body speed in one group, suggesting a different primary source of propulsion?</li>
                     </ul>
@@ -174,51 +254,51 @@
                 <p class="mt-4 text-lg leading-8 text-slate-600">Follow these steps to set up the IntegraPose environment. Using Conda is highly recommended.</p>
             </div>
             <div class="section-card p-6 md:p-8">
-                 <h3 class="text-xl font-semibold mb-4 text-slate-900">Installation Steps</h3>
-                 <ol class="space-y-6">
+                <h3 class="text-xl font-semibold mb-4 text-slate-900">Installation Steps</h3>
+                <ol class="space-y-6">
+                    <li class="flex items-start">
+                        <div class="flex-shrink-0 bg-sky-600 text-white w-8 h-8 rounded-full flex items-center justify-center font-bold text-lg mr-4">1</div>
+                        <div>
+                            <h4 class="font-semibold text-lg">Prerequisites</h4>
+                            <p class="text-slate-600">Ensure you have <a href="https://docs.conda.io/en/latest/miniconda.html" target="_blank" class="text-sky-600 hover:underline">Anaconda/Miniconda</a> and <a href="https://git-scm.com/downloads" target="_blank" class="text-sky-600 hover:underline">Git</a> installed. An NVIDIA GPU with CUDA is highly recommended for performance.</p>
+                        </div>
+                    </li>
+                    <li class="flex items-start">
+                        <div class="flex-shrink-0 bg-sky-600 text-white w-8 h-8 rounded-full flex items-center justify-center font-bold text-lg mr-4">2</div>
+                        <div>
+                            <h4 class="font-semibold text-lg">Clone the Repository</h4>
+                            <p class="text-slate-600 mb-2">Open a terminal and run the following commands:</p>
+                            <div class="bg-slate-900 text-white p-4 rounded-lg font-mono text-sm">
+                                <div><span class="text-sky-400">git</span> clone https://github.com/farhanaugustine/IntegraPose.git</div>
+                                <div><span class="text-sky-400">cd</span> IntegraPose</div>
+                            </div>
+                        </div>
+                    </li>
                      <li class="flex items-start">
-                         <div class="flex-shrink-0 bg-sky-600 text-white w-8 h-8 rounded-full flex items-center justify-center font-bold text-lg mr-4">1</div>
-                         <div>
-                             <h4 class="font-semibold text-lg">Prerequisites</h4>
-                             <p class="text-slate-600">Ensure you have <a href="https://docs.conda.io/en/latest/miniconda.html" target="_blank" class="text-sky-600 hover:underline">Anaconda/Miniconda</a> and <a href="https://git-scm.com/downloads" target="_blank" class="text-sky-600 hover:underline">Git</a> installed. An NVIDIA GPU with CUDA is highly recommended for performance.</p>
-                         </div>
-                     </li>
-                     <li class="flex items-start">
-                         <div class="flex-shrink-0 bg-sky-600 text-white w-8 h-8 rounded-full flex items-center justify-center font-bold text-lg mr-4">2</div>
-                         <div>
-                             <h4 class="font-semibold text-lg">Clone the Repository</h4>
-                             <p class="text-slate-600 mb-2">Open a terminal and run the following commands:</p>
-                             <div class="bg-slate-900 text-white p-4 rounded-lg font-mono text-sm">
-                                 <div><span class="text-sky-400">git</span> clone https://github.com/farhanaugustine/IntegraPose.git</div>
-                                 <div><span class="text-sky-400">cd</span> IntegraPose</div>
-                             </div>
-                         </div>
-                     </li>
-                      <li class="flex items-start">
-                         <div class="flex-shrink-0 bg-sky-600 text-white w-8 h-8 rounded-full flex items-center justify-center font-bold text-lg mr-4">3</div>
-                         <div>
-                             <h4 class="font-semibold text-lg">Create & Activate Conda Environment</h4>
-                             <p class="text-slate-600 mb-2">Use the provided file to create an environment with all dependencies. The file is configured for CUDA 12.4 by default. For CPU-only, you must edit the <code>environment.yml</code> file first.</p>
-                              <div class="bg-slate-900 text-white p-4 rounded-lg font-mono text-sm">
-                                 <div><span class="text-gray-400"># This creates the 'IntegraPose' environment</span></div>
-                                 <div><span class="text-sky-400">conda</span> env create -f environment.yml</div>
-                                 <br>
-                                 <div><span class="text-gray-400"># Activate the new environment</span></div>
-                                 <div><span class="text-sky-400">conda</span> activate IntegraPose</div>
-                             </div>
-                         </div>
-                     </li>
-                     <li class="flex items-start">
-                         <div class="flex-shrink-0 bg-emerald-600 text-white w-8 h-8 rounded-full flex items-center justify-center font-bold text-lg mr-4">4</div>
-                         <div>
-                             <h4 class="font-semibold text-lg">Launch the Application</h4>
-                             <p class="text-slate-600 mb-2">Once the environment is active, you can start the GUI.</p>
-                             <div class="bg-slate-900 text-white p-4 rounded-lg font-mono text-sm">
-                                 <span class="text-sky-400">python</span> main_gui_app.py
-                             </div>
-                         </div>
-                     </li>
-                 </ol>
+                        <div class="flex-shrink-0 bg-sky-600 text-white w-8 h-8 rounded-full flex items-center justify-center font-bold text-lg mr-4">3</div>
+                        <div>
+                            <h4 class="font-semibold text-lg">Create & Activate Conda Environment</h4>
+                            <p class="text-slate-600 mb-2">Use the provided file to create an environment with all dependencies. The file is configured for CUDA 12.4 by default. For CPU-only, you must edit the <code>environment.yml</code> file first.</p>
+                            <div class="bg-slate-900 text-white p-4 rounded-lg font-mono text-sm">
+                                <div><span class="text-gray-400"># This creates the 'IntegraPose' environment</span></div>
+                                <div><span class="text-sky-400">conda</span> env create -f environment.yml</div>
+                                <br>
+                                <div><span class="text-gray-400"># Activate the new environment</span></div>
+                                <div><span class="text-sky-400">conda</span> activate IntegraPose</div>
+                            </div>
+                        </div>
+                    </li>
+                    <li class="flex items-start">
+                        <div class="flex-shrink-0 bg-emerald-600 text-white w-8 h-8 rounded-full flex items-center justify-center font-bold text-lg mr-4">4</div>
+                        <div>
+                            <h4 class="font-semibold text-lg">Launch the Application</h4>
+                            <p class="text-slate-600 mb-2">Once the environment is active, you can start the GUI.</p>
+                            <div class="bg-slate-900 text-white p-4 rounded-lg font-mono text-sm">
+                                <span class="text-sky-400">python</span> main_gui_app.py
+                            </div>
+                        </div>
+                    </li>
+                </ol>
             </div>
         </section>
         
@@ -237,7 +317,7 @@
                     <div class="bg-slate-900 text-white p-4 rounded-lg font-mono text-sm">
                         <span class="text-sky-400">ffmpeg</span> -i video.mp4 -q:v 2 frames/frame_%05d.png
                     </div>
-        
+    
                     <h4 class="font-semibold mt-6 mb-2 text-slate-800">Option 2: Using Frame Extractor (GUI)</h4>
                     <p class="text-slate-600 mb-2">For a user-friendly alternative, use the included Python-based tool. Launch it from your terminal (with the Conda environment activated) by running:</p>
                     <div class="bg-slate-900 text-white p-4 rounded-lg font-mono text-sm">
@@ -300,7 +380,7 @@ python split_data.py ^
 
                     <h4 class="font-semibold mt-6 mb-2 text-slate-800">Advanced: Extraction Mode</h4>
                     <p class="text-slate-600 mb-2">The script can also create a new, smaller dataset containing only images where specific classes (behaviors) appear. This is useful for targeted analysis or improving model performance on rare behaviors. Use the `--extract_classes` flag and provide the class IDs you want to isolate.</p>
-                     <div class="bg-slate-900 text-white p-4 rounded-lg font-mono text-sm overflow-x-auto">
+                    <div class="bg-slate-900 text-white p-4 rounded-lg font-mono text-sm overflow-x-auto">
 <pre><code class="language-bash"># Example to extract only frames with class 0 and 2:
 python split_data.py ^
   --source_images_dir "path/to/all_frames" ^
@@ -348,7 +428,7 @@ python split_data.py ^
                     </button>
                     <div id="training-content" class="p-6 border-t border-slate-200 hidden">
                         <p class="text-slate-600 mb-4">This tab provides a comprehensive interface for training your YOLO-Pose model on the data you prepared.</p>
-                         <ul class="list-disc list-inside space-y-2 text-slate-700">
+                        <ul class="list-disc list-inside space-y-2 text-slate-700">
                             <li><strong>Configuration:</strong> Select your <code>dataset.yaml</code> file, choose a model variant (e.g., <code>yolov8n-pose.pt</code>), and give your training run a unique name.</li>
                             <li><strong>Hyperparameters:</strong> Control essential settings like epochs, batch size, learning rate, and optimizer.</li>
                             <li><strong>Augmentation:</strong> Configure a wide variety of image augmentations (rotation, scaling, color shifts) to make your model more robust and prevent overfitting.</li>
@@ -366,7 +446,7 @@ python split_data.py ^
                     </button>
                     <div id="inference-content" class="p-6 border-t border-slate-200 hidden">
                         <p class="text-slate-600 mb-4">Use your trained model to analyze new videos or a live webcam feed. This is where you generate the raw data for analysis.</p>
-                         <ul class="list-disc list-inside space-y-2 text-slate-700">
+                        <ul class="list-disc list-inside space-y-2 text-slate-700">
                             <li><strong>Select Model & Source:</strong> Choose your trained <code>best.pt</code> file and the video/folder you want to analyze.</li>
                             <li><strong>Set Parameters:</strong> Adjust the confidence threshold, IOU, and other inference settings.</li>
                             <li><strong>Enable Tracking:</strong> Crucially, enable the object tracker to assign unique IDs to animals across frames. This is essential for bout analysis.</li>
@@ -399,14 +479,14 @@ python split_data.py ^
                             <div class="bg-slate-900 text-white p-3 mt-2 rounded-lg font-mono text-xs">
                                 python Label_Organizer.py
                             </div>
-                             <p class="text-sm mt-2">This creates a new <code>organized_labels</code> folder. Inside, you will find a subfolder for each video, containing only the relevant <code>.txt</code> files. You can then point the Bout Analytics tools to one of these specific subfolders.</p>
+                            <p class="text-sm mt-2">This creates a new <code>organized_labels</code> folder. Inside, you will find a subfolder for each video, containing only the relevant <code>.txt</code> files. You can then point the Bout Analytics tools to one of these specific subfolders.</p>
                         </div>
 
-                         <ul class="list-disc list-inside space-y-2 text-slate-700">
-                              <li><strong>ROI Management:</strong> Draw, name, and manage polygonal Regions of Interest (ROIs) to restrict analysis to specific zones (e.g., an arena corner).</li>
-                              <li><strong>Analysis Parameters:</strong> Define what constitutes a "bout" by setting the max frame gap allowed within a single bout and the minimum duration a bout must last to be counted. Set the video FPS for accurate time calculations.</li>
-                              <li><strong>Process Bouts:</strong> Run the analysis to generate a detailed table of all detected behavioral bouts, including animal ID, behavior, start/end frames, and duration.</li>
-                              <li><strong>Advanced Tools:</strong> Double-click any bout in the results table to open the <strong>Advanced Bout Scorer</strong> for fine-grained verification and correction. A separate <strong>Bout Confirmation Tool</strong> allows for rapid review of all detected bouts.</li>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700">
+                                <li><strong>ROI Management:</strong> Draw, name, and manage polygonal Regions of Interest (ROIs) to restrict analysis to specific zones (e.g., an arena corner).</li>
+                                <li><strong>Analysis Parameters:</strong> Define what constitutes a "bout" by setting the max frame gap allowed within a single bout and the minimum duration a bout must last to be counted. Set the video FPS for accurate time calculations.</li>
+                                <li><strong>Process Bouts:</strong> Run the analysis to generate a detailed table of all detected behavioral bouts, including animal ID, behavior, start/end frames, and duration.</li>
+                                <li><strong>Advanced Tools:</strong> Double-click any bout in the results table to open the <strong>Advanced Bout Scorer</strong> for fine-grained verification and correction. A separate <strong>Bout Confirmation Tool</strong> allows for rapid review of all detected bouts.</li>
                         </ul>
                         <img src="Video_Tutorial/Step_14_DrawROI_On_Videos.gif" alt="GIF demonstrating drawing ROIs on videos" class="tutorial-gif rounded-lg shadow-md my-4 border border-slate-200">
                         <img src="Video_Tutorial/Step_15_Run_Rule_Based_Bout_Analysis.gif" alt="GIF demonstrating running bout analysis" class="tutorial-gif rounded-lg shadow-md my-4 border border-slate-200">
@@ -422,11 +502,11 @@ python split_data.py ^
                     </button>
                     <div id="clustering-content" class="p-6 border-t border-slate-200 hidden">
                         <p class="text-slate-600 mb-4">Perform unsupervised clustering on pose data to discover distinct postures within your behavioral categories. This uses UMAP for dimensionality reduction and HDBSCAN for clustering.</p>
-                         <ul class="list-disc list-inside space-y-2 text-slate-700">
-                              <li><strong>Define Skeleton:</strong> Specify the connections between keypoints to visualize the animal's skeleton correctly.</li>
-                              <li><strong>Clustering Parameters:</strong> Adjust UMAP and HDBSCAN parameters (e.g., minimum cluster size) to fine-tune the clustering algorithm.</li>
-                              <li><strong>Select Data:</strong> Choose which behaviors and/or animal tracks you want to include in the clustering analysis.</li>
-                              <li><strong>Run & Visualize:</strong> Execute the clustering process and view the results as a UMAP scatter plot. You can select individual clusters to see the average pose associated with that cluster, potentially revealing subtle behavioral phenotypes.</li>
+                        <ul class="list-disc list-inside space-y-2 text-slate-700">
+                            <li><strong>Define Skeleton:</strong> Specify the connections between keypoints to visualize the animal's skeleton correctly.</li>
+                            <li><strong>Clustering Parameters:</strong> Adjust UMAP and HDBSCAN parameters (e.g., minimum cluster size) to fine-tune the clustering algorithm.</li>
+                            <li><strong>Select Data:</strong> Choose which behaviors and/or animal tracks you want to include in the clustering analysis.</li>
+                            <li><strong>Run & Visualize:</strong> Execute the clustering process and view the results as a UMAP scatter plot. You can select individual clusters to see the average pose associated with that cluster, potentially revealing subtle behavioral phenotypes.</li>
                         </ul>
                         <img src="Video_Tutorial/Step_17_Run_Pose_Clustering.gif" alt="GIF demonstrating pose clustering analysis" class="tutorial-gif rounded-lg shadow-md my-4 border border-slate-200">
                     </div>
@@ -481,7 +561,7 @@ python split_data.py ^
                                     <td class="font-mono">GhostConv / GhostBottleneck</td>
                                     <td>Creates "cheap" features with less computation. Perfect for lightweight models on edge devices like a Jetson Nano or Raspberry Pi mounted on a behavioral rig.</td>
                                 </tr>
-                                 <tr>
+                                <tr>
                                     <td class="font-mono">C2PSA / C3TR</td>
                                     <td>Adds attention/transformer layers. <strong>C2PSA</strong> focuses computation on behaviorally relevant regions (e.g., snout during sniffing), while <strong>C3TR</strong> adds global context to better understand social interactions.</td>
                                 </tr>
@@ -490,7 +570,7 @@ python split_data.py ^
                     </div>
                     
                     <h4 class="text-lg font-semibold mt-8 mb-3 text-slate-800">Neck Modules (Feature Fusion)</h4>
-                     <div class="overflow-x-auto">
+                    <div class="overflow-x-auto">
                         <table class="min-w-full text-sm">
                             <thead>
                                 <tr>
@@ -517,9 +597,9 @@ python split_data.py ^
                 </div>
 
                 <div class="section-card p-6 md:p-8">
-                     <h3 class="text-xl font-semibold mb-4 text-slate-900">Putting It Together: Example YAML</h3>
-                     <p class="text-slate-600 mb-4">Below is a sample YAML file showing how to construct a model. To use a custom model, you will need to use Command Line Interface to construct your custom model and train it. Instructions are in subsequent sections.</p>
-                     <div class="bg-slate-900 text-white p-4 rounded-lg font-mono text-sm overflow-x-auto">
+                    <h3 class="text-xl font-semibold mb-4 text-slate-900">Putting It Together: Example YAML</h3>
+                    <p class="text-slate-600 mb-4">Below is a sample YAML file showing how to construct a model. To use a custom model, you will need to use Command Line Interface to construct your custom model and train it. Instructions are in subsequent sections.</p>
+                    <div class="bg-slate-900 text-white p-4 rounded-lg font-mono text-sm overflow-x-auto">
 <pre><code class="language-yaml"># =======================================================================================
 # IntegraPose-YOLO Examples
 # =======================================================================================
@@ -528,7 +608,7 @@ python split_data.py ^
 nc: 4 <span class="text-green-400"># Number of BEHAVIOR classes</span>
 kpt_shape: [12, 3] <span class="text-green-400"># 12 keypoints, 3 dimensions (x, y, visibility)</span>
 scales:
- <span class="text-green-400"># [depth, width, max_channels]</span>
+  <span class="text-green-400"># [depth, width, max_channels]</span>
   l: [1.00, 1.00, 512]
   x: [1.00, 1.50, 512]
   s: [0.50, 0.50, 1024]
@@ -540,31 +620,31 @@ scales:
 # for recognizing complex social interactions.
 # ---------------------------------------------------------------------------------------
 # backbone:
-   # [from, repeats, module, args]
-   - [-1, 1, Conv, [80, 3, 2]]      <span class="text-green-400"># 0-P1/2</span>
-   - [-1, 1, Conv, [160, 3, 2]]     <span class="text-green-400"># 1-P2/4</span>
-   - [-1, 3, C3k2, [160, True]]     <span class="text-green-400"># 2</span>
-   - [-1, 1, Conv, [320, 3, 2]]     <span class="text-green-400"># 3-P3/8</span>
-   - [-1, 6, C3k2, [320, True]]     <span class="text-green-400"># 4</span>
-   - [-1, 1, Conv, [640, 3, 2]]     <span class="text-green-400"># 5-P4/16</span>
-   - [-1, 6, C3k2, [640, True]]     <span class="text-green-400"># 6</span>
-   - [-1, 1, C2PSA, [640]]          <span class="text-green-400"># 7 - Attention block</span>
-   - [-1, 1, Conv, [960, 3, 2]]     <span class="text-green-400"># 8-P5/32</span>
-   - [-1, 1, SPPF, [960, 5]]        <span class="text-green-400"># 9 - Multi-scale pooling</span>
-   - [-1, 3, C3TR, [960]]           <span class="text-green-400"># 10 - Transformer block</span>
+    # [from, repeats, module, args]
+    - [-1, 1, Conv, [80, 3, 2]]      <span class="text-green-400"># 0-P1/2</span>
+    - [-1, 1, Conv, [160, 3, 2]]      <span class="text-green-400"># 1-P2/4</span>
+    - [-1, 3, C3k2, [160, True]]      <span class="text-green-400"># 2</span>
+    - [-1, 1, Conv, [320, 3, 2]]      <span class="text-green-400"># 3-P3/8</span>
+    - [-1, 6, C3k2, [320, True]]      <span class="text-green-400"># 4</span>
+    - [-1, 1, Conv, [640, 3, 2]]      <span class="text-green-400"># 5-P4/16</span>
+    - [-1, 6, C3k2, [640, True]]      <span class="text-green-400"># 6</span>
+    - [-1, 1, C2PSA, [640]]          <span class="text-green-400"># 7 - Attention block</span>
+    - [-1, 1, Conv, [960, 3, 2]]      <span class="text-green-400"># 8-P5/32</span>
+    - [-1, 1, SPPF, [960, 5]]        <span class="text-green-400"># 9 - Multi-scale pooling</span>
+    - [-1, 3, C3TR, [960]]           <span class="text-green-400"># 10 - Transformer block</span>
 
 # ---------------------------------------------------------------------------------------
 # <span class="text-green-400">BACKBONE EXAMPLE 2: A different custom backbone using A2C2f and C2PSA blocks.</span>
 # This structure is currently active in this file.
 # ---------------------------------------------------------------------------------------
 backbone:
- <span class="text-green-400"># [depth, width, max_channels]</span>
+  <span class="text-green-400"># [depth, width, max_channels]</span>
   - [-1, 1, Conv, [64, 3, 2]]         <span class="text-green-400"># 0-P1/2</span>
-  - [-1, 1, Conv, [128, 3, 2]]        <span class="text-green-400"># 1-P2/4</span>
+  - [-1, 1, Conv, [128, 3, 2]]       <span class="text-green-400"># 1-P2/4</span>
   - [-1, 2, C3k2, [320, True, 0.25]]
-  - [-1, 1, Conv, [256, 3, 2]]        <span class="text-green-400"># 3-P3/8</span>
+  - [-1, 1, Conv, [256, 3, 2]]       <span class="text-green-400"># 3-P3/8</span>
   - [-1, 2, C3k2, [512, True, 0.25]]
-  - [-1, 1, Conv, [512, 3, 2]]        <span class="text-green-400"># 5-P4/16</span>
+  - [-1, 1, Conv, [512, 3, 2]]       <span class="text-green-400"># 5-P4/16</span>
   - [-1, 4, A2C2f, [640, True, 4]]
   - [-1, 1, Conv, [1024, 3, 2]]       <span class="text-green-400"># 7-P5/32</span>
   - [-1, 4, A2C2f, [1024, True, 1]]   <span class="text-green-400"># 8</span>
@@ -576,11 +656,11 @@ backbone:
 # ---------------------------------------------------------------------------------------
 head:
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 6], 1, Concat, [1]]  <span class="text-green-400"># cat backbone P4</span>
+  - [[-1, 6], 1, Concat, [1]]   <span class="text-green-400"># cat backbone P4</span>
   - [-1, 2, A2C2f, [512, False, -1]]
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 4], 1, Concat, [1]]  <span class="text-green-400"># cat backbone P3</span>
+  - [[-1, 4], 1, Concat, [1]]   <span class="text-green-400"># cat backbone P3</span>
   - [-1, 2, A2C2f, [256, False, -1]]
 
   - [-1, 1, Conv, [256, 3, 2]]
@@ -588,12 +668,12 @@ head:
   - [-1, 2, A2C2f, [512, False, -1]]
 
   - [-1, 1, Conv, [512, 3, 2]]
-  - [[-1, 8], 1, Concat, [1]]   <span class="text-green-400"># cat head P5</span>
+  - [[-1, 8], 1, Concat, [1]]    <span class="text-green-400"># cat head P5</span>
   - [-1, 2, C3k2, [1024, True]]
 
   - [[16, 19, 22], 1, Pose, [nc, kpt_shape]] <span class="text-green-400"># Pose head predicting on P3, P4, P5</span>
 </code></pre>
-                     </div>
+                    </div>
                 </div>
                 
                 <div class="section-card p-6 md:p-8">
@@ -620,23 +700,23 @@ head:
                                     <td class="font-mono">data</td>
                                     <td>Path to your dataset configuration file (e.g., <code>dataset.yaml</code>).</td>
                                 </tr>
-                                 <tr>
+                                <tr>
                                     <td class="font-mono">epochs</td>
                                     <td>Total number of training epochs (full passes over the dataset).</td>
                                 </tr>
-                                 <tr>
+                                <tr>
                                     <td class="font-mono">patience</td>
                                     <td>Number of epochs to wait for improvement before early stopping to prevent overfitting.</td>
                                 </tr>
-                                 <tr>
+                                <tr>
                                     <td class="font-mono">batch</td>
                                     <td>Number of images to process at once. Set to <code>-1</code> for auto-batch size to maximize GPU memory usage.</td>
                                 </tr>
-                                 <tr>
+                                <tr>
                                     <td class="font-mono">imgsz</td>
                                     <td>Target image size for training (e.g., 640). All images are resized to this dimension.</td>
                                 </tr>
-                                 <tr>
+                                <tr>
                                     <td class="font-mono">cache</td>
                                     <td>Set to <code>ram</code> or <code>disk</code> to cache the dataset and speed up training.</td>
                                 </tr>
@@ -663,14 +743,14 @@ conda activate IntegraPose
 yolo pose train ^
   model="path/to/your/custom_model.yaml" ^
   data="path/to/your/dataset.yaml" ^      <span class="text-green-400"># This file can be generated after data annotation from GUI "Tab 1: Setup & Annotation"</span>
-  epochs=200 ^                            <span class="text-green-400"># Change to match you desired number of epochs</span>
-  patience=75 ^                           <span class="text-green-400"># Early stopping, will terminate training if learning doesn't improve for this many epochs</span>
-  batch=-1 ^                              <span class="text-green-400"># -1 sets to auto (~60% GPU). Number defines how many images are shown to the model at once</span>
-  imgsz=640 ^                             <span class="text-green-400"># Image is compressed to this size for model training and inference</span>
-  project="IntegraPose_Custom_Runs" ^     <span class="text-green-400"># Assigns the project save directory path</span>
-  name="AttentionModel_v1_Run" ^          <span class="text-green-400"># Name of your experiment, if needed</span>
-  cache=disk ^                            <span class="text-green-400"># Caches the dataset images on disk. Better for reproducible training outcomes</span>
-  device=0                                <span class="text-green-400"># GPU (device=0), or CPU (device=cpu)</span>
+  epochs=200 ^                          <span class="text-green-400"># Change to match you desired number of epochs</span>
+  patience=75 ^                         <span class="text-green-400"># Early stopping, will terminate training if learning doesn't improve for this many epochs</span>
+  batch=-1 ^                            <span class="text-green-400"># -1 sets to auto (~60% GPU). Number defines how many images are shown to the model at once</span>
+  imgsz=640 ^                           <span class="text-green-400"># Image is compressed to this size for model training and inference</span>
+  project="IntegraPose_Custom_Runs" ^      <span class="text-green-400"># Assigns the project save directory path</span>
+  name="AttentionModel_v1_Run" ^         <span class="text-green-400"># Name of your experiment, if needed</span>
+  cache=disk ^                          <span class="text-green-400"># Caches the dataset images on disk. Better for reproducible training outcomes</span>
+  device=0                              <span class="text-green-400"># GPU (device=0), or CPU (device=cpu)</span>
 
   Putting it all together in CLI: yolo pose train model="custom.yaml" data="data.yaml" ... device=0
 </code></pre>
@@ -709,7 +789,7 @@ yolo pose train ^
                         <p class="font-mono text-sm leading-relaxed">Augustine, F., et al. (2024). IntegraPose: A Unified Framework for Integrated Pose Estimation and Behavior Classification. <i>SSRN Electronic Journal</i>. Available at: <a href="https://papers.ssrn.com/sol3/papers.cfm?abstract_id=5334465" target="_blank" class="text-sky-600 hover:underline">https://papers.ssrn.com/sol3/papers.cfm?abstract_id=5334465</a></p>
                     </div>
                 </div>
-                 <div>
+                <div>
                     <h3 class="text-xl font-semibold mb-2 text-slate-900">Acknowledgments</h3>
                     <p class="text-slate-600">IntegraPose is built upon the powerful and flexible <a href="https://ultralytics.com/" target="_blank" class="text-sky-600 hover:underline">Ultralytics YOLOv8</a> framework. We extend our sincere gratitude to the Ultralytics team for their significant contributions to the open-source community.</p>
                 </div>
@@ -776,6 +856,25 @@ yolo pose train ^
                 targetContent.classList.remove('hidden');
                 targetArrow.classList.add('rotate-180');
             }
+        }
+        
+        // New JavaScript for the GitHub dropdown
+        function toggleDropdown() {
+            const dropdown = document.getElementById("githubDropdown");
+            dropdown.classList.toggle("show");
+        }
+
+        // Close the dropdown if the user clicks outside of it
+        window.onclick = function(event) {
+          if (!event.target.closest('.github-dropdown-container')) {
+            var dropdowns = document.getElementsByClassName("dropdown-content");
+            for (var i = 0; i < dropdowns.length; i++) {
+              var openDropdown = dropdowns[i];
+              if (openDropdown.classList.contains('show')) {
+                openDropdown.classList.remove('show');
+              }
+            }
+          }
         }
     </script>
 
