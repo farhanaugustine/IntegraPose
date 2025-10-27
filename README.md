@@ -1,6 +1,6 @@
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/farhanaugustine/IntegraPose)
 [![DOI](https://zenodo.org/badge/988759361.svg)](https://doi.org/10.5281/zenodo.15565090)
-* Preprint availabe: [➡️📑](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=5334465)
+* Paper: [➡️📑](https://www.sciencedirect.com/science/article/abs/pii/S0306452225010097)
 
 <div align="center">
   <h2 align="center">
@@ -171,7 +171,7 @@ Here are some examples of IntegraPose in action, classifying distinct behaviors 
 </div>
 
 # Citation Suggestions:
-Augustine, et al., (2025). Integrapose: A Unified Framework for Simultaneous Pose Estimation and Behavior Classification. Availabe on SSRN: https://ssrn.com/abstract=5334465
+Augustine, et al., (2025). Integrapose: A Unified Framework for Simultaneous Pose Estimation and Behavior Classification. https://www.sciencedirect.com/science/article/abs/pii/S0306452225010097
 
 </div>
 
