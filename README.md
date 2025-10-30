@@ -175,6 +175,19 @@ Augustine, et al., (2025). Integrapose: A Unified Framework for Simultaneous Pos
 
 </div>
 
+  ## License
+
+  IntegraPose is provided under the GNU Affero General Public License v3.0 (AGPL-3.0).
+
+  ### What this means for you
+
+  - **Using the app (research, analysis, publications):** Totally fine. You can run IntegraPose internally and publish results/
+  licenses however you like; the AGPL doesn’t limit what you learn or publish.
+  - **Modifying or redistributing IntegraPose:** If you share the altered program or host it for others (e.g., a web service), you must provide your changes’ source code under AGPL too.
+  - **Integrating Ultralytics:** The AGPL choice keeps the alignment with Ultralytics’ AGPL license. If your group has a commercial exception from Ultralytics, you can apply that to IntegraPose as well.
+
+  Need more detail? See [GNU’s AGPL overview](https://www.gnu.org/licenses/agpl-3.0.en.html).
+
 # Acknowledgments:
 IntegraPose is built upon the powerful and flexible Ultralytics YOLOv8 framework. We extend our sincere gratitude to the [Ultralytics](https://www.ultralytics.com/) team for their significant contributions to the open-source community.
 
