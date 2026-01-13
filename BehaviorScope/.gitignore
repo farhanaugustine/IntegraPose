@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+.Python
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Outputs / artifacts
+qa_crops/
+sequence_npz/
+processed_sequences*/
+predictions/
+runs/
+behavior_lstm_runs*/
+
+# Model/checkpoint files
+*.pt
+*.pth
+*.onnx
+
+# Large arrays
+*.npz
+*.npy
+
+# Videos/images (typically not committed)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.jpg
+*.jpeg
+*.png
