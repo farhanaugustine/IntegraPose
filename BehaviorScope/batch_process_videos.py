@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import logging
 import argparse
 import sys
 import time
@@ -131,6 +131,28 @@ def parse_args() -> argparse.Namespace:
         help="If set, only CSV/JSON are generated (no MP4 review export).",
     )
     parser.add_argument(
+        "--no_draw_bbox",
+        dest="draw_bbox",
+        action="store_false",
+        help=(
+            "Disable drawing the YOLO bbox/keypoints overlay in review videos. "
+            "When disabled, review videos use a label-only overlay."
+        ),
+    )
+    parser.set_defaults(draw_bbox=True)
+    parser.add_argument(
+        "--font_scale",
+        type=float,
+        default=0.7,
+        help="OpenCV font scale for overlays in review videos.",
+    )
+    parser.add_argument(
+        "--thickness",
+        type=int,
+        default=2,
+        help="Text/border thickness for overlays in review videos.",
+    )
+    parser.add_argument(
         "--label_bg_alpha",
         type=float,
         default=1.0,
@@ -203,6 +225,10 @@ def generate_review_video(
     csv_path: Path,
     output_video_path: Path,
     metrics_xlsx: Path | None = None,
+    *,
+    draw_bbox: bool = True,
+    font_scale: float = 0.7,
+    thickness: int = 2,
     label_bg_alpha: float = 1.0,
 ) -> None:
     segments = []
@@ -264,17 +290,31 @@ def generate_review_video(
                     current_metric is not None
                     and int(current_metric["frame_idx"]) == frame_idx
                 ):
-                    annotated = review_annotations.annotate_frame_bbox(
-                        frame,
-                        current_metric.get("bbox_xyxy"),
-                        str(current_metric.get("label", "Unknown")),
-                        current_metric.get("confidence"),
-                        current_metric.get("yolo_status"),
-                        font_scale=0.7,
-                        thickness=2,
-                        keypoints=current_metric.get("keypoints"),
-                        label_bg_alpha=float(label_bg_alpha),
-                    )
+                    if draw_bbox:
+                        annotated = review_annotations.annotate_frame_bbox(
+                            frame,
+                            current_metric.get("bbox_xyxy"),
+                            str(current_metric.get("label", "Unknown")),
+                            current_metric.get("confidence"),
+                            current_metric.get("yolo_status"),
+                            font_scale=float(font_scale),
+                            thickness=int(thickness),
+                            keypoints=current_metric.get("keypoints"),
+                            label_bg_alpha=float(label_bg_alpha),
+                        )
+                    else:
+                        annotated = review_annotations.annotate_frame_bbox(
+                            frame,
+                            None,
+                            str(current_metric.get("label", "Unknown")),
+                            current_metric.get("confidence"),
+                            current_metric.get("yolo_status"),
+                            font_scale=float(font_scale),
+                            thickness=int(thickness),
+                            keypoints=None,
+                            draw_keypoints=False,
+                            label_bg_alpha=float(label_bg_alpha),
+                        )
                 else:
                     annotated = frame
             else:
@@ -290,16 +330,38 @@ def generate_review_video(
                     if seg.start_frame <= frame_idx <= seg.end_frame:
                         active_segment = seg
 
-                annotated = review_annotations.annotate_frame(
-                    frame,
-                    active_segment,
-                    frame_idx,
-                    fps,
-                    total_frames,
-                    font_scale=0.7,
-                    thickness=2,
-                    label_bg_alpha=float(label_bg_alpha),
-                )
+                if draw_bbox:
+                    annotated = review_annotations.annotate_frame(
+                        frame,
+                        active_segment,
+                        frame_idx,
+                        fps,
+                        total_frames,
+                        font_scale=float(font_scale),
+                        thickness=int(thickness),
+                        label_bg_alpha=float(label_bg_alpha),
+                    )
+                else:
+                    label = "No Annotation"
+                    conf = None
+                    if active_segment is not None:
+                        label = str(active_segment.label)
+                        try:
+                            conf = float(active_segment.confidence)
+                        except Exception:
+                            conf = None
+                    annotated = review_annotations.annotate_frame_bbox(
+                        frame,
+                        None,
+                        label,
+                        conf,
+                        None,
+                        font_scale=float(font_scale),
+                        thickness=int(thickness),
+                        keypoints=None,
+                        draw_keypoints=False,
+                        label_bg_alpha=float(label_bg_alpha),
+                    )
             writer.write(annotated)
             frame_idx += 1
     finally:
@@ -328,9 +390,14 @@ def main() -> None:
         device = torch.device(args.device)
     print(f"Running on device: {device}")
 
+    # 1. Setup the logger
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("BatchProcess")
+
     print("Loading behavior model...")
+    # 2. Pass the logger into the function (added as the 3rd argument)
     model, class_names, hparams = infer_behavior_lstm.load_checkpoint(
-        args.model_path, device
+        args.model_path, device, logger
     )
 
     print("Loading YOLO model...")
@@ -338,7 +405,12 @@ def main() -> None:
         yolo_device = f"cuda:{device.index}" if device.index is not None else "cuda"
     else:
         yolo_device = "cpu"
-    yolo_model = cropping.load_yolo_model(args.yolo_weights, device=yolo_device)
+    yolo_task = None
+    if args.yolo_mode == "pose":
+        yolo_task = "pose"
+    elif args.yolo_mode == "bbox":
+        yolo_task = "detect"
+    yolo_model = cropping.load_yolo_model(args.yolo_weights, device=yolo_device, task=yolo_task)
 
     default_num_frames = int(hparams.get("num_frames", 16))
     default_frame_size = int(hparams.get("frame_size", 160))
@@ -376,7 +448,9 @@ def main() -> None:
         output_csv = out_subdir / f"{base_name}.behavior.csv"
         output_json = out_subdir / f"{base_name}.behavior.windows.json"
         output_vid = out_subdir / f"{base_name}.review.mp4"
-        export_xlsx = bool(args.export_xlsx) or (not bool(args.skip_review_video))
+        export_xlsx = bool(args.export_xlsx) or (
+            (not bool(args.skip_review_video)) and bool(args.draw_bbox)
+        )
         output_xlsx = out_subdir / f"{base_name}.metrics.xlsx" if export_xlsx else None
 
         if args.skip_existing:
@@ -498,6 +572,9 @@ def main() -> None:
                     output_csv,
                     output_vid,
                     metrics_xlsx=output_xlsx,
+                    draw_bbox=bool(args.draw_bbox),
+                    font_scale=float(args.font_scale),
+                    thickness=int(args.thickness),
                     label_bg_alpha=float(args.label_bg_alpha),
                 )
             except Exception as exc:

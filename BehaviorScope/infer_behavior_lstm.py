@@ -4,14 +4,19 @@ import argparse
 import csv
 import json
 import time
+import warnings
 from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Sequence
 
+# [CHANGE 1] Filter out the PyTorch TypedStorage deprecation warning
+warnings.filterwarnings("ignore", message="TypedStorage is deprecated")
+
 import numpy as np
 import cv2
 import torch
+from torch import nn
 from torch.nn import functional as F
 
 if __package__ is None or __package__ == "":  # pragma: no cover - CLI entry
@@ -21,13 +26,19 @@ if __package__ is None or __package__ == "":  # pragma: no cover - CLI entry
         load_yolo_model,
     )
     import quantification
+    import review_annotations
     from data import build_frame_transform
     from model import BehaviorSequenceClassifier
+    from utils.logging_utils import setup_logger
+    from utils.pose_features import extract_rich_pose_features
 else:
     from .cropping import CropDetection, iterate_yolo_crops, load_yolo_model
     from . import quantification
+    from . import review_annotations
     from .data import build_frame_transform
     from .model import BehaviorSequenceClassifier
+    from .utils.logging_utils import setup_logger
+    from .utils.pose_features import extract_rich_pose_features
 
 
 @dataclass
@@ -201,6 +212,35 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Device to run inference on.",
     )
+    parser.add_argument(
+        "--cpu_threads",
+        type=int,
+        default=None,
+        help=(
+            "Optional: set torch intra-op thread count (CPU only). "
+            "Good starting point: physical core count."
+        ),
+    )
+    parser.add_argument(
+        "--cpu_interop_threads",
+        type=int,
+        default=None,
+        help=(
+            "Optional: set torch inter-op thread count (CPU only). "
+            "Good starting point: 1-2."
+        ),
+    )
+    parser.add_argument(
+        "--cpu_quantize",
+        type=str,
+        default="none",
+        choices=("none", "dynamic"),
+        help=(
+            "Optional: apply post-training quantization for CPU inference. "
+            "'dynamic' quantizes Linear/LSTM weights to int8 (no calibration "
+            "data required)."
+        ),
+    )
     parser.add_argument("--yolo_weights", type=Path, required=True)
     parser.add_argument(
         "--yolo_mode",
@@ -212,6 +252,14 @@ def parse_args() -> argparse.Namespace:
             "'auto' uses keypoints if present, "
             "'bbox' forces bbox-only (ignores keypoints), "
             "'pose' requires keypoints (errors if missing)."
+        ),
+    )
+    parser.add_argument(
+        "--require_pose",
+        action="store_true",
+        help=(
+            "If the loaded model expects pose features, require pose to be present for every "
+            "inference window. Errors if pose is missing (useful for strict pose-vs-RGB comparisons)."
         ),
     )
     parser.add_argument(
@@ -280,50 +328,229 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="Maximum gap (frames) to interpolate (if smoothing=interpolation).",
     )
+    parser.add_argument(
+        "--output_review_video",
+        type=Path,
+        default=None,
+        help="Optional path to export an annotated MP4 review video.",
+    )
+    parser.add_argument(
+        "--no_draw_bbox",
+        dest="draw_bbox",
+        action="store_false",
+        help=(
+            "Disable drawing the YOLO bbox/keypoints overlay in review videos. "
+            "When disabled, review videos use a label-only overlay."
+        ),
+    )
+    parser.set_defaults(draw_bbox=True)
+    parser.add_argument(
+        "--font_scale",
+        type=float,
+        default=0.7,
+        help="OpenCV font scale for overlays in review videos.",
+    )
+    parser.add_argument(
+        "--thickness",
+        type=int,
+        default=2,
+        help="Text/border thickness for overlays in review videos.",
+    )
+    parser.add_argument(
+        "--label_bg_alpha",
+        type=float,
+        default=1.0,
+        help=(
+            "Opacity (0-1) for the label background rectangles in review videos. "
+            "Lower values reduce occlusion during QA."
+        ),
+    )
     args = parser.parse_args()
     if args.yolo_max_det <= 0:
         raise SystemExit("--yolo_max_det must be >= 1.")
+    if args.label_bg_alpha < 0.0 or args.label_bg_alpha > 1.0:
+        raise SystemExit("--label_bg_alpha must be between 0 and 1.")
+    if args.thickness <= 0:
+        raise SystemExit("--thickness must be >= 1.")
+    if args.font_scale <= 0:
+        raise SystemExit("--font_scale must be > 0.")
     return args
 
 
-def load_checkpoint(model_path: Path, device: torch.device):
+def apply_cpu_optimizations(
+    model: BehaviorSequenceClassifier,
+    *,
+    quantize: str = "none",
+    num_threads: int | None = None,
+    num_interop_threads: int | None = None,
+) -> BehaviorSequenceClassifier:
+    if num_threads is not None and int(num_threads) > 0:
+        torch.set_num_threads(int(num_threads))
+    if num_interop_threads is not None and int(num_interop_threads) > 0:
+        torch.set_num_interop_threads(int(num_interop_threads))
+
+    quantize = str(quantize or "none").strip().lower()
+    if quantize == "none":
+        return model
+    if quantize != "dynamic":
+        raise ValueError(f"Unknown CPU quantization mode: {quantize!r}")
+
+    try:
+        torch.backends.quantized.engine = "fbgemm"
+    except Exception:
+        pass
+
+    try:
+        from torch.ao.quantization import quantize_dynamic
+    except Exception as exc:  # pragma: no cover - torch build dependent
+        raise RuntimeError(
+            "Dynamic quantization is not available in this PyTorch build."
+        ) from exc
+
+    model = quantize_dynamic(
+        model,
+        {nn.Linear, nn.LSTM},
+        dtype=torch.qint8,
+    )
+    return model
+
+
+# [FIX] Added logger=None default to fix GUI compatibility
+def load_checkpoint(model_path: Path, device: torch.device, logger=None):
+    # If called from GUI without a logger, create a simple print-based fallback
+    if logger is None:
+        class SimpleLogger:
+            def info(self, msg): print(f"[INFO] {msg}")
+            def warning(self, msg): print(f"[WARNING] {msg}")
+            def error(self, msg): print(f"[ERROR] {msg}")
+        logger = SimpleLogger()
+
+    logger.info(f"Loading model from {model_path}...")
+    
+    # 1. Attempt to load the file
     try:
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    except TypeError:  # pragma: no cover - torch<2.0 compatibility
+    except TypeError:
+        # Fallback for older PyTorch versions
         checkpoint = torch.load(model_path, map_location=device)
-    hparams = checkpoint.get("hparams", {})
-    idx_to_class = checkpoint.get("idx_to_class") or hparams.get("idx_to_class")
-    if idx_to_class is None:
-        raise ValueError("Checkpoint is missing idx_to_class metadata.")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load model file: {e}")
 
-    idx_to_class = {int(k): v for k, v in idx_to_class.items()}
-    class_names = [idx_to_class[idx] for idx in sorted(idx_to_class.keys())]
-    num_classes = len(class_names)
+    # 2. Check: Is it a Dictionary (Standard Checkpoint) or a Model Object (Quantized)?
+    if isinstance(checkpoint, dict):
+        # === OLD PATH: Dictionary Checkpoint ===
+        logger.info("Detected standard checkpoint dictionary.")
+        hparams = checkpoint.get("hparams", {})
+        idx_to_class = checkpoint.get("idx_to_class") or hparams.get("idx_to_class")
+        
+        if idx_to_class is None:
+            raise ValueError("Checkpoint is missing idx_to_class metadata.")
 
-    model = BehaviorSequenceClassifier(
-        num_classes=num_classes,
-        backbone=hparams.get("backbone", "mobilenet_v3_small"),
-        pretrained_backbone=False,
-        train_backbone=False,
-        hidden_dim=int(hparams.get("hidden_dim", 256)),
-        num_layers=int(hparams.get("num_layers", 1)),
-        dropout=float(hparams.get("dropout", 0.2)),
-        bidirectional=bool(hparams.get("bidirectional", False)),
-        sequence_model=hparams.get("sequence_model", "lstm"),
-        temporal_attention_layers=int(
-            hparams.get("temporal_attention_layers", 0)
-        ),
-        attention_heads=int(hparams.get("attention_heads", 4)),
-        use_attention_pooling=bool(hparams.get("attention_pool", False)),
-        use_feature_se=bool(hparams.get("feature_se", False)),
-        slowfast_alpha=int(hparams.get("slowfast_alpha", 4)),
-        slowfast_fusion_ratio=float(hparams.get("slowfast_fusion_ratio", 0.25)),
-        slowfast_base_channels=int(hparams.get("slowfast_base_channels", 48)),
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state"])
-    model.eval()
+        idx_to_class = {int(k): v for k, v in idx_to_class.items()}
+        class_names = [idx_to_class[idx] for idx in sorted(idx_to_class.keys())]
+        num_classes = len(class_names)
 
-    return model, class_names, hparams
+        # Detect pose params in state_dict if hparams missing them
+        state_dict = checkpoint["model_state"]
+        pose_input_dim = int(hparams.get("pose_input_dim", 0))
+        pose_fusion_dim = int(hparams.get("pose_fusion_dim", 128))
+        pose_fusion_strategy = hparams.get("pose_fusion_strategy", "gated_attention")
+
+        if pose_input_dim == 0 and "pose_encoder.0.weight" in state_dict:
+            logger.info("Auto-detected OLD pose_encoder in checkpoint weights. Migrating to PoseVisualFusion(concat).")
+            w_pose = state_dict["pose_encoder.0.weight"]
+            # Linear(in, out) -> weight shape is [out, in]
+            pose_fusion_dim = w_pose.shape[0]
+            pose_input_dim = w_pose.shape[1]
+            pose_fusion_strategy = "concat"
+            
+            # Remap keys to new module structure
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith("pose_encoder."):
+                    new_state_dict[f"pose_fusion.{k}"] = v
+                else:
+                    new_state_dict[k] = v
+            state_dict = new_state_dict
+            logger.info(f"Inferred pose config: input_dim={pose_input_dim}, fusion_dim={pose_fusion_dim} (legacy concat)")
+            
+        elif pose_input_dim == 0 and "pose_fusion.pose_encoder.0.weight" in state_dict:
+            logger.info("Auto-detected NEW pose_fusion in checkpoint weights.")
+            w_pose = state_dict["pose_fusion.pose_encoder.0.weight"]
+            pose_fusion_dim = w_pose.shape[0]
+            pose_input_dim = w_pose.shape[1]
+            logger.info(f"Inferred pose config: input_dim={pose_input_dim}, fusion_dim={pose_fusion_dim}")
+
+        # Rebuild the architecture
+        model = BehaviorSequenceClassifier(
+            num_classes=num_classes,
+            backbone=hparams.get("backbone", "mobilenet_v3_small"),
+            pretrained_backbone=False,
+            train_backbone=False,
+            hidden_dim=int(hparams.get("hidden_dim", 256)),
+            num_layers=int(hparams.get("num_layers", 1)),
+            dropout=float(hparams.get("dropout", 0.2)),
+            bidirectional=bool(hparams.get("bidirectional", False)),
+            sequence_model=hparams.get("sequence_model", "lstm"),
+            temporal_attention_layers=int(hparams.get("temporal_attention_layers", 0)),
+            attention_heads=int(hparams.get("attention_heads", 4)),
+            positional_encoding=hparams.get("positional_encoding", "none"),
+            positional_encoding_max_len=int(hparams.get("positional_encoding_max_len", 512)),
+            use_attention_pooling=bool(hparams.get("attention_pool", False)),
+            use_feature_se=bool(hparams.get("feature_se", False)),
+            slowfast_alpha=int(hparams.get("slowfast_alpha", 4)),
+            slowfast_fusion_ratio=float(hparams.get("slowfast_fusion_ratio", 0.25)),
+            slowfast_base_channels=int(hparams.get("slowfast_base_channels", 48)),
+            pose_input_dim=pose_input_dim,
+            pose_fusion_dim=pose_fusion_dim,
+            pose_fusion_strategy=pose_fusion_strategy,
+        ).to(device)
+        
+        # Load weights
+        model.load_state_dict(state_dict)
+        model.eval()
+        return model, class_names, hparams
+
+    else:
+        # === NEW PATH: Quantized Model Object ===
+        logger.info("Detected ready-to-use Model Object (likely Quantized).")
+        model = checkpoint
+        model.to(device)
+        model.eval()
+
+        # Attempt to recover class names (metadata is often lost in quantization)
+        num_classes = getattr(model, "num_classes", None)
+        
+        # Fallback if num_classes is missing
+        if num_classes is None:
+            try:
+                if hasattr(model, "head") and isinstance(model.head[-1], nn.Linear):
+                     num_classes = model.head[-1].out_features
+            except:
+                pass
+        
+        if num_classes is None:
+             raise ValueError("Could not determine number of classes from the quantized model. "
+                              "Ensure the model object has a 'num_classes' attribute.")
+
+        # Generate generic names if text mapping was lost
+        class_names = [f"Class_{i}" for i in range(num_classes)]
+        if hasattr(model, "idx_to_class") and model.idx_to_class:
+             try:
+                 class_names = [model.idx_to_class[i] for i in range(num_classes)]
+             except:
+                 pass
+        else:
+             logger.warning(f"[Warning] Class names not found in quantized model. Using generic: {class_names}")
+
+        # Create dummy hparams to satisfy the rest of the script
+        hparams = {
+            "num_frames": getattr(model, "window_size", 16), # Default assumption
+            "frame_size": 224, # Default assumption
+            "backbone": "quantized_model" 
+        }
+        
+        return model, class_names, hparams
 
 
 def probe_fps(video_path: Path) -> float:
@@ -342,6 +569,137 @@ def probe_frame_count(video_path: Path) -> int:
     if total is None or total <= 0:
         return 0
     return int(total)
+
+
+def _safe_release(resource) -> None:
+    try:
+        resource.release()
+    except Exception:
+        return
+
+
+def export_review_video(
+    video_path: Path,
+    annotations_csv: Path,
+    output_video_path: Path,
+    *,
+    frame_meta: list[dict] | None,
+    draw_bbox: bool,
+    font_scale: float,
+    thickness: int,
+    label_bg_alpha: float,
+) -> None:
+    if not annotations_csv.exists():
+        raise FileNotFoundError(f"Annotations CSV not found: {annotations_csv}")
+
+    segments = review_annotations.load_segments(annotations_csv)
+    if segments:
+        segments.sort(key=lambda seg: seg.start_frame)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        _safe_release(cap)
+        raise RuntimeError(f"Could not open source video: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    output_video_path.parent.mkdir(parents=True, exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(output_video_path), fourcc, fps, (width, height))
+    if not writer.isOpened():
+        _safe_release(cap)
+        _safe_release(writer)
+        raise RuntimeError(f"Could not create output video file: {output_video_path}")
+
+    frame_idx = 0
+    current_seg_idx = 0
+    meta_idx = 0
+
+    def _pack_keypoints(
+        xy: list[tuple[float, float]] | None,
+        conf: list[float] | None,
+    ) -> list[tuple[float, float, float | None]] | None:
+        if not xy:
+            return None
+        out: list[tuple[float, float, float | None]] = []
+        for k, (x, y) in enumerate(xy):
+            c_val: float | None = None
+            if conf is not None and k < len(conf):
+                try:
+                    c_val = float(conf[k])
+                except Exception:
+                    c_val = None
+            out.append((float(x), float(y), c_val))
+        return out
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            while (
+                current_seg_idx < len(segments)
+                and frame_idx > segments[current_seg_idx].end_frame
+            ):
+                current_seg_idx += 1
+            active_segment = None
+            if current_seg_idx < len(segments):
+                seg = segments[current_seg_idx]
+                if seg.start_frame <= frame_idx <= seg.end_frame:
+                    active_segment = seg
+
+            label = "Unknown"
+            conf = None
+            if active_segment is not None:
+                label = str(active_segment.label)
+                try:
+                    conf = float(active_segment.confidence)
+                except Exception:
+                    conf = None
+
+            meta = None
+            if frame_meta is not None:
+                while meta_idx < len(frame_meta) and int(
+                    frame_meta[meta_idx].get("frame_idx", -1)
+                ) < frame_idx:
+                    meta_idx += 1
+                if meta_idx < len(frame_meta) and int(
+                    frame_meta[meta_idx].get("frame_idx", -1)
+                ) == frame_idx:
+                    meta = frame_meta[meta_idx]
+
+            yolo_status = None
+            bbox_xyxy = None
+            keypoints = None
+            if meta is not None:
+                yolo_status = meta.get("yolo_status")
+                if draw_bbox:
+                    bbox_xyxy = meta.get("bbox_xyxy")
+                    keypoints = _pack_keypoints(
+                        meta.get("keypoints_xy"),
+                        meta.get("keypoints_conf"),
+                    )
+
+            annotated = review_annotations.annotate_frame_bbox(
+                frame,
+                bbox_xyxy if draw_bbox else None,
+                label,
+                conf,
+                yolo_status,
+                float(font_scale),
+                int(thickness),
+                keypoints=keypoints if draw_bbox else None,
+                draw_keypoints=bool(draw_bbox),
+                label_bg_alpha=float(label_bg_alpha),
+            )
+            writer.write(annotated)
+            frame_idx += 1
+    finally:
+        _safe_release(cap)
+        _safe_release(writer)
 
 
 def predict_windows(
@@ -369,6 +727,7 @@ def predict_windows(
     window_probs: list[np.ndarray] | None = None,
     timing: dict[str, float] | None = None,
     yolo_mode: str = "auto",
+    require_pose: bool = False,
 ) -> List[WindowPrediction]:
     transform = build_frame_transform(crop_size, augment=False)
     fps = probe_fps(video_path)
@@ -382,6 +741,15 @@ def predict_windows(
     if yolo_mode not in {"auto", "bbox", "pose"}:
         raise ValueError(f"Unknown yolo_mode: {yolo_mode!r}")
 
+    model_pose_dim = int(getattr(model, "pose_input_dim", 0) or 0)
+    model_uses_pose = bool(getattr(model, "pose_fusion", None) is not None) and model_pose_dim > 0
+    require_pose = bool(require_pose)
+    if require_pose and model_uses_pose and yolo_mode == "bbox":
+        raise ValueError(
+            "require_pose=True but yolo_mode='bbox' disables keypoints/pose. "
+            "Use --yolo_mode auto/pose and pose-capable YOLO weights."
+        )
+
     def flush_batch():
         if not batch_frames:
             return []
@@ -389,7 +757,23 @@ def predict_windows(
         if timing is not None and device.type == "cuda":
             torch.cuda.synchronize(device)
         to_device_started = time.perf_counter()
-        clips = torch.stack(batch_frames, dim=0).to(device)
+        
+        # batch_frames is list of (clip, pose) tuples
+        clips_list = [x[0] for x in batch_frames]
+        poses_list = [x[1] for x in batch_frames]
+        
+        clips = torch.stack(clips_list, dim=0).to(device)
+        pose_present = torch.tensor([p is not None for p in poses_list], dtype=torch.bool, device=device)
+        poses = None
+        if pose_present.any().item():
+            valid_sample = next(p for p in poses_list if p is not None)
+            padded = [p if p is not None else torch.zeros_like(valid_sample) for p in poses_list]
+            poses = torch.stack(padded, dim=0).to(device)
+        if timing is not None:
+            timing["windows_with_pose"] = timing.get("windows_with_pose", 0.0) + float(
+                pose_present.sum().item()
+            )
+        
         if timing is not None and device.type == "cuda":
             torch.cuda.synchronize(device)
         if timing is not None:
@@ -400,7 +784,13 @@ def predict_windows(
             if timing is not None and device.type == "cuda":
                 torch.cuda.synchronize(device)
             forward_started = time.perf_counter()
-            logits = model(clips)
+            
+            if poses is None and not pose_present.any().item():
+                inputs = clips
+            else:
+                inputs = (clips, poses, pose_present)
+            logits = model(inputs)
+            
             probs = F.softmax(logits, dim=1)
             if timing is not None and device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -479,13 +869,69 @@ def predict_windows(
         prep_started = time.perf_counter()
         processed = [transform(det.crop_rgb) for det in entries]
         clip_tensor = torch.stack(processed, dim=0)
+        
+        pose_tensor = None
+        if model_uses_pose and yolo_mode != "bbox" and entries:
+            # Only compute pose features when ALL frames in the window have pose.
+            # If any frame lacks pose, fall back to RGB-only for that window.
+            first_xy = entries[0].keypoints_xy
+            if first_xy is not None:
+                num_kpts = len(first_xy)
+                pose_all = True
+                for entry in entries:
+                    if entry.keypoints_xy is None or len(entry.keypoints_xy) != num_kpts:
+                        pose_all = False
+                        break
+                    if entry.crop_xyxy is None:
+                        pose_all = False
+                        break
+                if pose_all:
+                    # Build normalized keypoints array [T, K, 3] in crop coordinates.
+                    # (Normalization is invariant to the crop resize-to-square step.)
+                    kpts_arr = np.zeros((len(entries), num_kpts, 3), dtype=np.float32)
+                    for i, entry in enumerate(entries):
+                        xy = entry.keypoints_xy
+                        conf = entry.keypoints_conf
+                        crop_xyxy = entry.crop_xyxy
+                        assert xy is not None
+                        assert crop_xyxy is not None
+                        crop_x1, crop_y1, crop_x2, crop_y2 = crop_xyxy
+                        crop_w = max(int(crop_x2) - int(crop_x1), 1)
+                        crop_h = max(int(crop_y2) - int(crop_y1), 1)
+                        for k in range(num_kpts):
+                            x_raw, y_raw = xy[k]
+                            kpts_arr[i, k, 0] = (float(x_raw) - float(crop_x1)) / float(crop_w)
+                            kpts_arr[i, k, 1] = (float(y_raw) - float(crop_y1)) / float(crop_h)
+                            c = 1.0
+                            if conf is not None and k < len(conf):
+                                try:
+                                    c = float(conf[k])
+                                except Exception:
+                                    c = 1.0
+                            kpts_arr[i, k, 2] = c
+                    feats = extract_rich_pose_features(kpts_arr)
+                    pose_tensor = torch.from_numpy(feats).float()
+                    if pose_tensor.ndim != 2:
+                        raise ValueError(f"Pose feature tensor has unexpected shape: {pose_tensor.shape}")
+                    if pose_tensor.shape[1] != model_pose_dim:
+                        raise ValueError(
+                            "Pose feature dim mismatch: "
+                            f"model expects {model_pose_dim}, but extractor returned {pose_tensor.shape[1]}. "
+                            "This usually means the YOLO keypoint skeleton differs between training and inference."
+                        )
+        if require_pose and model_uses_pose and pose_tensor is None:
+            raise RuntimeError(
+                "Pose was required for inference, but pose keypoints/features were missing for at least one window. "
+                "Confirm you're using YOLO-pose weights and set --yolo_mode pose (or auto)."
+            )
+
         if timing is not None:
             timing["clip_prep_ms"] = timing.get("clip_prep_ms", 0.0) + (
                 (time.perf_counter() - prep_started) * 1000.0
             )
         start_frame = entries[0].frame_idx
         end_frame = entries[-1].frame_idx
-        batch_frames.append(clip_tensor)
+        batch_frames.append((clip_tensor, pose_tensor))
         batch_meta.append(
             {
                 "start_frame": start_frame,
@@ -523,15 +969,6 @@ def predict_windows(
     )
 
     for detection in crop_generator:
-        if (
-            yolo_mode == "pose"
-            and getattr(detection, "yolo_status", None) == "detected"
-            and not getattr(detection, "keypoints_xy", None)
-        ):
-            raise RuntimeError(
-                "yolo_mode='pose' requires keypoints, but none were found. "
-                "Did you pass YOLO-pose weights?"
-            )
         if frame_meta is not None:
             det_kpts_xy = getattr(detection, "keypoints_xy", None)
             det_kpts_conf = getattr(detection, "keypoints_conf", None)
@@ -1094,11 +1531,32 @@ def _export_metrics_xlsx(
 def main():
     args = parse_args()
     if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")   
     else:
         device = torch.device(args.device)
 
-    model, class_names, hparams = load_checkpoint(args.model_path, device)
+    log_path = args.video_path.with_suffix(".log")
+    logger = setup_logger(name="Inference", log_file=log_path)
+
+    model, class_names, hparams = load_checkpoint(args.model_path, device, logger)
+    model_pose_dim = int(getattr(model, "pose_input_dim", 0) or 0)
+    model_uses_pose = bool(getattr(model, "pose_fusion", None) is not None) and model_pose_dim > 0
+    logger.info(
+        f"[Inference] Model pose fusion: {'ENABLED' if model_uses_pose else 'disabled'} "
+        f"(pose_input_dim={model_pose_dim})"
+    )
+    if bool(getattr(args, "require_pose", False)) and not model_uses_pose:
+        logger.warning(
+            "[Inference] --require_pose is set, but the loaded model does not use pose features. "
+            "Continuing with RGB-only inference."
+        )
+    if device.type == "cpu":
+        model = apply_cpu_optimizations(
+            model,
+            quantize=args.cpu_quantize,
+            num_threads=args.cpu_threads,
+            num_interop_threads=args.cpu_interop_threads,
+        )
     default_num_frames = int(hparams.get("num_frames", 16))
     default_frame_size = int(hparams.get("frame_size", 160))
 
@@ -1118,7 +1576,12 @@ def main():
         if args.device != "auto"
         else ("cuda" if torch.cuda.is_available() else "cpu")
     )
-    yolo_model = load_yolo_model(args.yolo_weights, device=yolo_device)
+    yolo_task = None
+    if args.yolo_mode == "pose":
+        yolo_task = "pose"
+    elif args.yolo_mode == "bbox":
+        yolo_task = "detect"
+    yolo_model = load_yolo_model(args.yolo_weights, device=yolo_device, task=yolo_task)
 
     output_csv = (
         args.output_csv
@@ -1133,21 +1596,24 @@ def main():
     last_end_frame: int | None = None
     started = time.perf_counter()
 
-    frame_meta: list[dict] | None = [] if args.output_xlsx else None
+    want_review_video = args.output_review_video is not None
+    collect_frame_meta = bool(args.output_xlsx) or (
+        want_review_video and bool(args.draw_bbox)
+    )
+    frame_meta: list[dict] | None = [] if collect_frame_meta else None
     window_meta: list[dict] | None = [] if args.output_xlsx else None
     window_probs: list[np.ndarray] | None = None
     if args.output_xlsx and str(args.per_frame_mode).strip().lower() == "true":
         window_probs = []
+    timing: dict[str, float] = {}
 
     if args.yolo_max_det != 1:
-        print(
-            f"[Inference] Warning: forcing yolo_max_det=1 (got {args.yolo_max_det}).",
-            flush=True,
+        logger.warning(
+            f"[Inference] Warning: forcing yolo_max_det=1 (got {args.yolo_max_det})."
         )
     if args.no_yolo_nms:
-        print(
-            "[Inference] Warning: forcing yolo_nms=True (ignored --no_yolo_nms).",
-            flush=True,
+        logger.warning(
+            "[Inference] Warning: forcing yolo_nms=True (ignored --no_yolo_nms)."
         )
 
     try:
@@ -1174,7 +1640,9 @@ def main():
             frame_meta=frame_meta,
             window_meta=window_meta,
             window_probs=window_probs,
+            timing=timing,
             yolo_mode=args.yolo_mode,
+            require_pose=bool(getattr(args, "require_pose", False)),
         ):
             windows_processed += 1
             last_end_frame = prediction.end_frame
@@ -1200,21 +1668,35 @@ def main():
                     fps_effective = processed_frames / elapsed
                     windows_per_sec = windows_processed / elapsed
                     speed = f" speed={fps_effective:.2f}fps ({windows_per_sec:.2f} win/s)"
-                print(
-                    f"[Inference] windows={windows_processed} frame={frame_info}{speed}",
-                    flush=True,
+                logger.info(
+                    f"[Inference] windows={windows_processed} frame={frame_info}{speed}"
                 )
     finally:
         csv_stream.close()
         json_stream.close()
 
-    print(f"Merged annotations saved to: {output_csv}")
+    if model_uses_pose:
+        windows_with_pose = int(round(float(timing.get("windows_with_pose", 0.0))))
+        if windows_processed > 0:
+            pct = windows_with_pose / float(windows_processed) * 100.0
+        else:
+            pct = 0.0
+        logger.info(
+            f"[Inference] Pose features used in {windows_with_pose}/{windows_processed} windows ({pct:.1f}%)."
+        )
+        if windows_with_pose == 0:
+            logger.warning(
+                "[Inference] Pose fusion is enabled in the model, but no pose features were used. "
+                "This run effectively behaved like RGB-only. Check --yolo_mode and YOLO weights."
+            )
+
+    logger.info(f"Merged annotations saved to: {output_csv}")
     if args.output_json:
-        print(f"Per-window predictions saved to: {args.output_json}")
+        logger.info(f"Per-window predictions saved to: {args.output_json}")
     if args.output_xlsx:
         if frame_meta is None or window_meta is None:
             raise RuntimeError("Internal error: missing XLSX export collectors.")
-        print(f"[Inference] Exporting metrics workbook: {args.output_xlsx}", flush=True)
+        logger.info(f"[Inference] Exporting metrics workbook: {args.output_xlsx}")
         _export_metrics_xlsx(
             args.output_xlsx,
             video_path=args.video_path,
@@ -1241,13 +1723,26 @@ def main():
             yolo_weights=args.yolo_weights,
             yolo_mode=args.yolo_mode,
         )
-        print(f"Metrics workbook saved to: {args.output_xlsx}")
-    print(f"Total windows processed: {windows_processed}")
+        logger.info(f"Metrics workbook saved to: {args.output_xlsx}")
+    if args.output_review_video:
+        logger.info(f"[Inference] Exporting review video: {args.output_review_video}")
+        export_review_video(
+            video_path=args.video_path,
+            annotations_csv=output_csv,
+            output_video_path=args.output_review_video,
+            frame_meta=frame_meta if bool(args.draw_bbox) else None,
+            draw_bbox=bool(args.draw_bbox),
+            font_scale=float(args.font_scale),
+            thickness=int(args.thickness),
+            label_bg_alpha=float(args.label_bg_alpha),
+        )
+        logger.info(f"[Inference] Review video saved to: {args.output_review_video}")
+    logger.info(f"Total windows processed: {windows_processed}")
     elapsed_total = time.perf_counter() - started
     if last_end_frame is not None and elapsed_total > 1e-6:
         effective_fps = (last_end_frame + 1) / elapsed_total
         windows_per_sec = windows_processed / elapsed_total
-        print(
+        logger.info(
             f"[Inference] runtime={elapsed_total:.2f}s speed={effective_fps:.2f}fps ({windows_per_sec:.2f} win/s)"
         )
 

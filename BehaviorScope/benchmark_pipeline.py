@@ -28,6 +28,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_path", type=Path, required=True)
     parser.add_argument("--yolo_weights", type=Path, required=True)
     parser.add_argument(
+        "--yolo_mode",
+        type=str,
+        default="auto",
+        choices=("auto", "bbox", "pose"),
+        help=(
+            "How to interpret YOLO outputs: "
+            "'auto' uses keypoints if present, "
+            "'bbox' forces bbox-only (ignores keypoints), "
+            "'pose' requires keypoints (errors if missing)."
+        ),
+    )
+    parser.add_argument(
+        "--require_pose",
+        action="store_true",
+        help=(
+            "If the loaded model expects pose features, require pose to be present for every "
+            "inference window. Errors if pose is missing (strict pose-vs-RGB comparisons)."
+        ),
+    )
+    parser.add_argument(
         "--split",
         type=str,
         default="val",
@@ -36,6 +56,28 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument(
+        "--cpu_threads",
+        type=int,
+        default=None,
+        help="Optional: set torch intra-op thread count (CPU only).",
+    )
+    parser.add_argument(
+        "--cpu_interop_threads",
+        type=int,
+        default=None,
+        help="Optional: set torch inter-op thread count (CPU only).",
+    )
+    parser.add_argument(
+        "--cpu_quantize",
+        type=str,
+        default="none",
+        choices=("none", "dynamic"),
+        help=(
+            "Optional: apply post-training quantization for CPU inference. "
+            "'dynamic' quantizes Linear/LSTM weights to int8."
+        ),
+    )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--prob_threshold", type=float, default=0.5)
 
@@ -158,7 +200,27 @@ def main() -> None:
     else:
         device = torch.device(args.device)
 
-    model, class_names, hparams = infer_behavior_lstm.load_checkpoint(args.model_path, device)
+    model, class_names, hparams = infer_behavior_lstm.load_checkpoint(
+        args.model_path, device
+    )
+    model_pose_dim = int(getattr(model, "pose_input_dim", 0) or 0)
+    model_uses_pose = bool(getattr(model, "pose_fusion", None) is not None) and model_pose_dim > 0
+    print(
+        f"[Benchmark] Model pose fusion: {'ENABLED' if model_uses_pose else 'disabled'} (pose_input_dim={model_pose_dim})",
+        flush=True,
+    )
+    if bool(getattr(args, "require_pose", False)) and not model_uses_pose:
+        print(
+            "[Benchmark] Warning: --require_pose is set, but the loaded model does not use pose features.",
+            flush=True,
+        )
+    if device.type == "cpu":
+        model = infer_behavior_lstm.apply_cpu_optimizations(
+            model,
+            quantize=args.cpu_quantize,
+            num_threads=args.cpu_threads,
+            num_interop_threads=args.cpu_interop_threads,
+        )
 
     default_num_frames = int(hparams.get("num_frames", 16))
     default_frame_size = int(hparams.get("frame_size", 160))
@@ -182,7 +244,11 @@ def main() -> None:
     yolo_conf = float(args.yolo_conf if args.yolo_conf is not None else meta.get("yolo_conf", 0.25))
     yolo_iou = float(args.yolo_iou if args.yolo_iou is not None else meta.get("yolo_iou", 0.45))
     yolo_imgsz = int(args.yolo_imgsz if args.yolo_imgsz is not None else meta.get("yolo_imgsz", 640))
-    yolo_max_det = int(args.yolo_max_det)
+    
+    if args.yolo_max_det != 1:
+        print(f"[Benchmark] Warning: forcing yolo_max_det=1 (got {args.yolo_max_det}).", flush=True)
+    yolo_max_det = 1
+    
     yolo_nms = not bool(args.no_yolo_nms)
     keep_last_box = not bool(args.no_keep_last_box)
     skip_tail = not bool(args.include_tail)
@@ -192,7 +258,12 @@ def main() -> None:
     else:
         yolo_device = "cpu"
 
-    yolo_model = cropping.load_yolo_model(args.yolo_weights, device=yolo_device)
+    yolo_task = None
+    if args.yolo_mode == "pose":
+        yolo_task = "pose"
+    elif args.yolo_mode == "bbox":
+        yolo_task = "detect"
+    yolo_model = cropping.load_yolo_model(args.yolo_weights, device=yolo_device, task=yolo_task)
 
     idx_to_name = {int(i): name for i, name in enumerate(class_names)}
     mismatches = []
@@ -213,7 +284,7 @@ def main() -> None:
         flush=True,
     )
     print(
-        f"[Benchmark] YOLO conf={yolo_conf} iou={yolo_iou} imgsz={yolo_imgsz} max_det={yolo_max_det} nms={yolo_nms} keep_last_box={keep_last_box}",
+        f"[Benchmark] YOLO conf={yolo_conf} iou={yolo_iou} imgsz={yolo_imgsz} max_det={yolo_max_det} nms={yolo_nms} keep_last_box={keep_last_box} yolo_mode={args.yolo_mode}",
         flush=True,
     )
 
@@ -264,6 +335,8 @@ def main() -> None:
                 yolo_max_det=yolo_max_det,
                 yolo_nms=yolo_nms,
                 timing=timing,
+                yolo_mode=args.yolo_mode,
+                require_pose=bool(getattr(args, "require_pose", False)),
             ):
                 key = (prediction.start_frame, prediction.end_frame)
                 if key not in remaining:
@@ -349,6 +422,24 @@ def main() -> None:
         flush=True,
     )
     print(f"[Benchmark] YOLO-only throughput (from YOLO speed dict): {fps_yolo:.2f} FPS", flush=True)
+    if model_uses_pose:
+        windows_with_pose = int(round(float(timing_total.get("windows_with_pose", 0.0))))
+        windows_predicted = int(round(float(timing_total.get("windows_predicted", 0.0))))
+        pct = (
+            (windows_with_pose / float(windows_predicted) * 100.0)
+            if windows_predicted > 0
+            else 0.0
+        )
+        print(
+            f"[Benchmark] Pose features used in {windows_with_pose}/{windows_predicted} windows ({pct:.1f}%).",
+            flush=True,
+        )
+        if windows_with_pose == 0:
+            print(
+                "[Benchmark] Warning: pose fusion is enabled in the model, but no pose features were used. "
+                "This run effectively behaved like RGB-only. Check --yolo_mode and YOLO weights.",
+                flush=True,
+            )
     if missing_total:
         print(
             f"[Benchmark] Missing windows: {missing_total} across {missing_videos} videos (processed_videos={processed_videos})",
@@ -389,6 +480,12 @@ def main() -> None:
             "yolo_fps": fps_yolo,
             "windows_per_sec": win_per_s,
         },
+        "pose_usage": {
+            "model_uses_pose": bool(model_uses_pose),
+            "pose_input_dim": int(model_pose_dim),
+            "windows_with_pose": timing_total.get("windows_with_pose", 0.0),
+            "windows_predicted": timing_total.get("windows_predicted", 0.0),
+        },
         "config": {
             "device": str(device),
             "batch_size": args.batch_size,
@@ -402,6 +499,8 @@ def main() -> None:
             "yolo_imgsz": yolo_imgsz,
             "yolo_max_det": yolo_max_det,
             "yolo_nms": yolo_nms,
+            "yolo_mode": str(getattr(args, "yolo_mode", "auto")),
+            "require_pose": bool(getattr(args, "require_pose", False)),
             "keep_last_box": keep_last_box,
             "skip_tail": skip_tail,
         },
@@ -415,4 +514,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

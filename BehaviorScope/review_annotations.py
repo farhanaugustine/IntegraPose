@@ -235,6 +235,23 @@ def annotate_frame_bbox(
     h, w = overlay.shape[:2]
     bg_alpha = _clamp_alpha(float(label_bg_alpha), default=1.0)
     if bbox_xyxy is not None:
+        try:
+            x1, y1, x2, y2 = (int(round(float(v))) for v in bbox_xyxy)
+        except Exception:
+            x1 = y1 = x2 = y2 = 0
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if y2 < y1:
+            y1, y2 = y2, y1
+        x1 = int(max(0, min(w - 1, x1)))
+        y1 = int(max(0, min(h - 1, y1)))
+        x2 = int(max(0, min(w - 1, x2)))
+        y2 = int(max(0, min(h - 1, y2)))
+        if x2 <= x1 or y2 <= y1:
+            bbox_xyxy = None
+        else:
+            bbox_xyxy = (x1, y1, x2, y2)
+    if bbox_xyxy is not None:
         x1, y1, x2, y2 = bbox_xyxy
         cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), thickness)
         text = label
@@ -315,6 +332,8 @@ def annotate_frame_bbox(
                 py = int(round(float(y)))
             except Exception:
                 continue
+            if not (0 <= px < w and 0 <= py < h):
+                continue
             color = (255, 255, 0)
             if c is not None:
                 try:
@@ -385,7 +404,12 @@ def iter_metrics_per_frame(metrics_xlsx: Path):
             bbox = None
             if x1 is not None and y1 is not None and x2 is not None and y2 is not None:
                 try:
-                    bbox = (int(x1), int(y1), int(x2), int(y2))
+                    bbox = (
+                        int(round(float(x1))),
+                        int(round(float(y1))),
+                        int(round(float(x2))),
+                        int(round(float(y2))),
+                    )
                 except Exception:
                     bbox = None
 

@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple
 import cv2
 import numpy as np
 from PIL import Image
+from PIL import ImageDraw
 
 if __package__ is None or __package__ == "":  # pragma: no cover - CLI entry
     from cropping import CropDetection, iterate_yolo_crops, load_yolo_model
@@ -17,6 +18,8 @@ if __package__ is None or __package__ == "":  # pragma: no cover - CLI entry
         stratified_split,
         stratified_split_by_source_video,
     )
+    from config import ALLOWED_EXTENSIONS
+    from utils.logging_utils import setup_logger
 else:
     from .cropping import CropDetection, iterate_yolo_crops, load_yolo_model
     from .data import (
@@ -25,8 +28,8 @@ else:
         stratified_split,
         stratified_split_by_source_video,
     )
-
-ALLOWED_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv")
+    from .config import ALLOWED_EXTENSIONS
+    from .utils.logging_utils import setup_logger
 
 
 def parse_args():
@@ -62,7 +65,7 @@ def parse_args():
     parser.add_argument("--yolo_conf", type=float, default=0.25)
     parser.add_argument("--yolo_iou", type=float, default=0.45)
     parser.add_argument("--yolo_imgsz", type=int, default=640)
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--keep_last_box", action="store_true")
     parser.add_argument(
         "--save_frame_crops",
@@ -118,6 +121,12 @@ def parse_args():
         default=30.0,
         help="Fallback FPS when the video metadata is unavailable.",
     )
+    parser.add_argument(
+        "--yolo_task",
+        type=str,
+        default=None,
+        help="Optional explicit task for YOLO (detect, pose, etc.).",
+    )
     args = parser.parse_args()
     if args.window_size <= 0 or args.window_stride <= 0:
         raise SystemExit("window_size and window_stride must be positive.")
@@ -166,13 +175,59 @@ def ensure_output_dirs(
 def save_frame_crop(qa_dir: Path, detection: CropDetection) -> Path:
     path = qa_dir / f"{detection.frame_idx:06d}.jpg"
     if not path.exists():
-        Image.fromarray(detection.crop_rgb).save(path, quality=95)
+        img = Image.fromarray(detection.crop_rgb)
+        # Optional overlay: if keypoints exist, draw them in crop coordinates to
+        # visually validate pose->crop mapping.
+        if (
+            detection.keypoints_xy is not None
+            and detection.crop_xyxy is not None
+            and detection.crop_rgb is not None
+        ):
+            try:
+                draw = ImageDraw.Draw(img)
+                crop_x1, crop_y1, crop_x2, crop_y2 = detection.crop_xyxy
+                crop_w = max(int(crop_x2) - int(crop_x1), 1)
+                crop_h = max(int(crop_y2) - int(crop_y1), 1)
+                out_w, out_h = img.size
+                for idx, (x_raw, y_raw) in enumerate(detection.keypoints_xy):
+                    x_crop = (float(x_raw) - float(crop_x1)) / float(crop_w) * float(out_w)
+                    y_crop = (float(y_raw) - float(crop_y1)) / float(crop_h) * float(out_h)
+                    r = 2
+                    x0 = int(round(x_crop - r))
+                    y0 = int(round(y_crop - r))
+                    x1 = int(round(x_crop + r))
+                    y1 = int(round(y_crop + r))
+                    draw.ellipse((x0, y0, x1, y1), outline=(0, 255, 255), width=1)
+            except Exception:
+                pass
+        img.save(path, quality=95)
     return path
 
 
-def save_sequence_npz(seq_dir: Path, name: str, frames: np.ndarray) -> Path:
+def save_sequence_npz(
+    seq_dir: Path,
+    name: str,
+    frames: np.ndarray,
+    keypoints: np.ndarray | None = None,
+    *,
+    keypoints_xy_raw: np.ndarray | None = None,
+    keypoints_conf_raw: np.ndarray | None = None,
+    bbox_xyxy: np.ndarray | None = None,
+    crop_xyxy: np.ndarray | None = None,
+) -> Path:
     path = seq_dir / f"{name}.npz"
-    np.savez_compressed(path, frames=frames.astype(np.uint8))
+    data = {"frames": frames.astype(np.uint8)}
+    if keypoints is not None:
+        data["keypoints"] = keypoints.astype(np.float32)
+    if keypoints_xy_raw is not None:
+        data["keypoints_xy_raw"] = keypoints_xy_raw.astype(np.float32)
+    if keypoints_conf_raw is not None:
+        data["keypoints_conf_raw"] = keypoints_conf_raw.astype(np.float32)
+    if bbox_xyxy is not None:
+        data["bbox_xyxy"] = bbox_xyxy.astype(np.int32)
+    if crop_xyxy is not None:
+        data["crop_xyxy"] = crop_xyxy.astype(np.int32)
+    np.savez_compressed(path, **data)
     return path
 
 
@@ -192,7 +247,8 @@ def build_sequences_for_video(
     label: int,
     args,
     output_root: Path,
-) -> List[SequenceSample]:
+    logger: logging.Logger,
+) -> Tuple[List[SequenceSample], bool]:
     qa_dir, seq_dir = ensure_output_dirs(
         output_root,
         class_name,
@@ -204,10 +260,10 @@ def build_sequences_for_video(
         seq_pattern = seq_dir.glob(f"{video_path.stem}_*.npz") if seq_dir else []
         qa_pattern = qa_dir.glob("*.jpg") if qa_dir else []
         if seq_dir and any(seq_pattern):
-            print(f"Skipping {video_path} (sequence NPZ already exists).")
+            logger.info(f"Skipping {video_path} (sequence NPZ already exists).")
             return []
         if qa_dir and not seq_dir and any(qa_pattern):
-            print(f"Skipping {video_path} (QA crops already exist).")
+            logger.info(f"Skipping {video_path} (QA crops already exist).")
             return []
 
     fps = probe_fps(video_path, args.default_fps)
@@ -227,6 +283,7 @@ def build_sequences_for_video(
     buffer: deque[CropDetection] = deque()
     sequences: List[SequenceSample] = []
     seq_index = 0
+    saw_keypoints = False
 
     for detection in detections:
         if qa_dir:
@@ -241,6 +298,76 @@ def build_sequences_for_video(
                 [entry.crop_rgb for entry in window_entries], axis=0
             )
 
+            bbox_arr = np.array(
+                [entry.bbox_xyxy if entry.bbox_xyxy is not None else (0, 0, 0, 0) for entry in window_entries],
+                dtype=np.int32,
+            )
+            crop_arr = np.array(
+                [entry.crop_xyxy if entry.crop_xyxy is not None else (0, 0, 0, 0) for entry in window_entries],
+                dtype=np.int32,
+            )
+
+            # Extract keypoints only when ALL frames in the window have pose.
+            # If any frame is missing pose, we save RGB-only (model can fall back to RGB).
+            window_kpts = None
+            window_kpts_xy_raw = None
+            window_kpts_conf_raw = None
+
+            first_kpts = window_entries[0].keypoints_xy
+            if first_kpts is not None:
+                num_kpts = len(first_kpts)
+                pose_all = True
+                for entry in window_entries:
+                    if entry.keypoints_xy is None or len(entry.keypoints_xy) != num_kpts:
+                        pose_all = False
+                        break
+                    # crop_xyxy is required for consistent pose->crop mapping.
+                    if entry.crop_xyxy is None:
+                        pose_all = False
+                        break
+                if pose_all:
+                    saw_keypoints = True
+                    kpts_arr = np.zeros((len(window_entries), num_kpts, 3), dtype=np.float32)
+                    kpts_xy_raw = np.zeros((len(window_entries), num_kpts, 2), dtype=np.float32)
+                    kpts_conf_raw = np.zeros((len(window_entries), num_kpts), dtype=np.float32)
+
+                    for i, entry in enumerate(window_entries):
+                        xy = entry.keypoints_xy
+                        conf = entry.keypoints_conf
+                        crop_xyxy = entry.crop_xyxy
+                        assert xy is not None
+                        assert crop_xyxy is not None
+
+                        crop_x1, crop_y1, crop_x2, crop_y2 = crop_xyxy
+                        crop_w = max(int(crop_x2) - int(crop_x1), 1)
+                        crop_h = max(int(crop_y2) - int(crop_y1), 1)
+
+                        for k in range(num_kpts):
+                            x_raw, y_raw = xy[k]
+                            kpts_xy_raw[i, k, 0] = float(x_raw)
+                            kpts_xy_raw[i, k, 1] = float(y_raw)
+
+                            c = 1.0
+                            if conf is not None and k < len(conf):
+                                try:
+                                    c = float(conf[k])
+                                except Exception:
+                                    c = 1.0
+                            kpts_conf_raw[i, k] = c
+
+                            # Map original-frame keypoints into crop pixel coords (0..crop_size).
+                            kpts_arr[i, k, 0] = (
+                                (float(x_raw) - float(crop_x1)) / float(crop_w) * float(args.crop_size)
+                            )
+                            kpts_arr[i, k, 1] = (
+                                (float(y_raw) - float(crop_y1)) / float(crop_h) * float(args.crop_size)
+                            )
+                            kpts_arr[i, k, 2] = c
+
+                    window_kpts = kpts_arr
+                    window_kpts_xy_raw = kpts_xy_raw
+                    window_kpts_conf_raw = kpts_conf_raw
+
             seq_name = f"{video_path.stem}_f{start_frame:06d}_s{seq_index:04d}"
             frame_paths = []
             if qa_dir:
@@ -248,7 +375,18 @@ def build_sequences_for_video(
                     qa_dir / f"{entry.frame_idx:06d}.jpg" for entry in window_entries
                 ]
             seq_path = (
-                save_sequence_npz(seq_dir, seq_name, window_frames) if seq_dir else None
+                save_sequence_npz(
+                    seq_dir,
+                    seq_name,
+                    window_frames,
+                    window_kpts,
+                    keypoints_xy_raw=window_kpts_xy_raw,
+                    keypoints_conf_raw=window_kpts_conf_raw,
+                    bbox_xyxy=bbox_arr,
+                    crop_xyxy=crop_arr,
+                )
+                if seq_dir
+                else None
             )
 
             sequences.append(
@@ -271,9 +409,9 @@ def build_sequences_for_video(
                     buffer.popleft()
 
     if len(sequences) < args.min_sequence_count:
-        print(f"Skipping {video_path}: only {len(sequences)} sequences.")
-        return []
-    return sequences
+        logger.info(f"Skipping {video_path}: only {len(sequences)} sequences.")
+        return [], saw_keypoints
+    return sequences, saw_keypoints
 
 
 def main():
@@ -282,30 +420,38 @@ def main():
     output_root.mkdir(parents=True, exist_ok=True)
     manifest_path = args.manifest_path or (output_root / "sequence_manifest.json")
 
-    class_dirs, class_to_idx = find_class_dirs(args.dataset_root)
-    print(f"Found {len(class_dirs)} behavior folders.")
+    logger = setup_logger(
+        name="Preprocess",
+        log_file=output_root / "preprocess.log"
+    )
 
-    model = load_yolo_model(args.yolo_weights, device=args.device)
-    print(f"Loaded YOLO weights from {args.yolo_weights}.")
+    class_dirs, class_to_idx = find_class_dirs(args.dataset_root)
+    logger.info(f"Found {len(class_dirs)} behavior folders.")
+
+    model = load_yolo_model(args.yolo_weights, device=args.device, task=args.yolo_task)
+    logger.info(f"Loaded YOLO weights from {args.yolo_weights}.")
 
     all_samples: List[SequenceSample] = []
+    any_keypoints = False
     for class_dir in class_dirs:
         label = class_to_idx[class_dir.name]
         videos = list(iter_video_files(class_dir))
         if not videos:
-            print(f"Warning: no videos found under {class_dir}.")
+            logger.warning(f"Warning: no videos found under {class_dir}.")
             continue
         for video_path in videos:
-            print(f"Processing {video_path}...")
-            sequences = build_sequences_for_video(
+            logger.info(f"Processing {video_path}...")
+            sequences, video_has_keypoints = build_sequences_for_video(
                 model=model,
                 video_path=video_path,
                 class_name=class_dir.name,
                 label=label,
                 args=args,
                 output_root=output_root,
+                logger=logger,
             )
             all_samples.extend(sequences)
+            any_keypoints = any_keypoints or bool(video_has_keypoints)
 
     if not all_samples:
         raise RuntimeError("No sequences were generated. Check your inputs.")
@@ -335,6 +481,8 @@ def main():
         "yolo_conf": args.yolo_conf,
         "yolo_iou": args.yolo_iou,
         "yolo_imgsz": args.yolo_imgsz,
+        "yolo_task": args.yolo_task,
+        "has_keypoints": any_keypoints,
         "split_strategy": args.split_strategy,
         "save_frame_crops": args.save_frame_crops,
         "save_sequence_npz": args.save_sequence_npz,
@@ -347,11 +495,10 @@ def main():
         class_to_idx,
         metadata,
     )
-    print(f"Manifest saved to {manifest_path}")
-    print(
-        "Sequences per split:",
-        {split: len(entries) for split, entries in splits.items()},
-    )
+    logger.info(f"Manifest saved to {manifest_path}")
+    split_counts = {split: len(entries) for split, entries in splits.items()}
+    logger.info(f"Sequences per split: {split_counts}")
+
 
 
 if __name__ == "__main__":

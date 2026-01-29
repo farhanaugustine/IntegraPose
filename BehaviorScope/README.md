@@ -1,387 +1,360 @@
-# BehaviorScope (YOLO crops -> sequence classifier)
+# BehaviorScope (YOLO Crops + Optional Pose -> Sequence Classifier)
 
-This folder is a minimal, GitHub-ready copy of the working BehaviorScope v2 scripts (local imports; no extra project scaffolding).
+BehaviorScope is a research-oriented, end-to-end pipeline for rodent behavior analysis. It converts raw video into behavior predictions via a two-stage design:
+1. YOLO-based localization: detect the animal per frame, crop to a fixed-size square, and (optionally) extract keypoints if YOLO-Pose weights are used.
+2. Sequence classification: classify short temporal windows of the cropped frames using a learned visual encoder + temporal head, with optional pose fusion.
 
-BehaviorScope supports Ultralytics **YOLO detection** weights (bbox only) and **YOLO-pose** weights (bbox + keypoints). Keypoints are optional and only used for metrics/visualization (the behavior classifier still runs on cropped RGB clips).
+This repository intentionally supports two comparable experimental paths:
+- RGB-only: behavior classification uses only cropped RGB frames.
+- Pose+RGB (late fusion): pose is fused with visual features after the visual backbone, using either Gated Attention or a Cross-Modal Transformer.
 
-## Install
+**Important:** pose fusion in this repo is feature-level (vector-level). It does NOT apply a spatial keypoint heatmap mask over pixels or ViT patches. If you want spatial masking, treat it as a separate research variant and evaluate it explicitly for your use case.
 
-- Install PyTorch + torchvision for your CUDA/OS from https://pytorch.org
-- Then: `pip install -r requirements.txt`
+## Installation
 
-## GUI (recommended)
+1. Install PyTorch:
+   - Install PyTorch + torchvision compatible with your CUDA/OS from pytorch.org.
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-Launch the tabbed GUI (preprocess/train/infer/batch/real-time/benchmark/review) with:
+## Quick Start (GUI)
 
+Launch the dashboard:
 ```bash
 python behaviorscope_gui.py
 ```
 
-Notes:
-- Tkinter ships with most Python installs on Windows/macOS. On some Linux distros you may need `python3-tk`.
-- The GUI can save/load its settings from the `File` menu.
+Typical workflow:
+1. Preprocess: run YOLO over videos to generate cropped clips and `sequence_manifest.json`.
+2. Train: select a backbone + temporal head, optionally enable pose fusion.
+3. Inference: run the trained model on long videos to export timelines and metrics.
+4. Review: visualize predictions with overlays.
 
-### Typical GUI workflow (quick mental model)
+## Pipeline Overview (Paper-Style)
 
-1) **Preprocess tab**: run YOLO over your class-sorted clips to create cropped windows + `sequence_manifest.json` (this is where your train/val/test split is defined).
-2) **Train tab**: train a sequence classifier from the manifest (`best_model.pt` is saved to your run folder).
-3) **Infer tab**: run the trained model on a long video and export CSV/JSON/XLSX.
-4) **Review / Batch tabs**: sanity-check and process many videos (review video overlays, merged CSVs, metrics).
+### Stage A: YOLO Cropping (and Optional Keypoints)
+For each frame, BehaviorScope runs Ultralytics YOLO (`cropping.py`) to obtain a bounding box for the animal. It then:
+- expands the box by `pad_ratio` (adds context and reduces crop jitter sensitivity),
+- crops the frame, and
+- resizes to `crop_size x crop_size` (square crop).
 
-Tip: most GUI controls map directly to the CLI flags shown in the examples below (and the tooltips explain the intent/range).
+If the YOLO weights support pose, the same call may return keypoints. In this repo, keypoints are treated as optional metadata:
+- RGB-only experiments can force keypoints to be `off` (use non-pose YOLO weights, or pass `--yolo_mode bbox` in inference). This is designed so researchers can evaluate whether adding pose boosts classification accurary (or perform ablation studies).
+- Pose+RGB experiments require that keypoints exist during preprocessing so the dataset contains pose features before model training.
 
-## Model/backbone options
+YOLO task vs `yolo_mode` (common source of confusion):
+- YOLO task (`detect` vs `pose`) controls what the YOLO model is asked to output (GUI exposes this as "YOLO Task").
+- `yolo_mode` (`auto` / `bbox` / `pose`) controls how BehaviorScope uses YOLO outputs during inference:
+  - `auto`: use pose **only when a full window has keypoints**; otherwise that window runs RGB-only.
+  - `bbox`: always RGB-only (keypoints ignored even if YOLO returns them).
+  - `pose`: request pose from YOLO and use it when available; windows with missing keypoints still fall back to RGB-only by default.
 
-- Frame backbones (use LSTM/attention pooling): `mobilenet_v3_small`, `efficientnet_b0`, `vit_b_16`
-  - `vit_b_16` is heavier and requires `crop_size/frame_size=224` in this repo.
-- Video backbone: `slowfast_tiny`
-  - SlowFast already models time internally, so `--sequence_model` / attention pooling / LSTM settings are ignored.
+Strict pose experiments (recommended when comparing RGB-only vs Pose+RGB):
+- Use `--require_pose` during inference/benchmarking to **error** if any window is missing pose (instead of silently falling back to RGB-only).
+- Always verify the inference log line: `Pose features used in X/Y windows`. If `X=0`, the run behaved like RGB-only even if the model supports pose.
 
-## Temporal head case studies (what the knobs mean)
+Single-animal assumption:
+- BehaviorScope is configured for **single-animal** analysis. It selects the highest-confidence detection per frame and locks YOLO to `max_det=1` + NMS.
+- If `keep_last_box` is enabled, missing detections can reuse the last bbox/keypoints to keep crops stable through brief YOLO misses.
 
-BehaviorScope always builds **frame embeddings** first (CNN/ViT), then applies a **temporal head** to summarize a window of frames into one prediction.
+Reproducibility note: keep `crop_size` and `pad_ratio` consistent between preprocessing and inference. Otherwise, the learned mapping between pose coordinates and pixel content can drift.
 
-### The main temporal knobs
+### Stage B: Windowing / Clip Construction
+BehaviorScope classifies fixed-length windows of frames:
+- `window_size`: number of frames per clip (default is 30, see `prepare_sequences_from_yolo.py`).
+- `window_stride`: step between successive windows (commonly `window_size//2` for overlap).
 
-- `--sequence_model {lstm,attention}`:
-  - `lstm`: order-aware (it models “frame 1 → frame 2 → …”), which is usually important for motion (locomotion).
-  - `attention`: in this repo’s current implementation, temporal attention has **no explicit positional encoding**, so it behaves more like content-based pooling/mixing across frames than a strict “order-aware” motion model.
-- `--bidirectional` (LSTM only): uses both past and future frames within the window (great for offline segmentation; not causal/real-time).
-- `--attention_pool`: learns to **weight timesteps** instead of always using the “last” timestep (most useful with `--sequence_model lstm`; `--sequence_model attention` already uses attention pooling as its head).
-- `--temporal_attention_layers N`: adds N self-attention blocks on the per-frame embeddings *before* the temporal head (useful for denoising / mixing cues across the window; not explicitly order-aware unless positional encoding is added).
-- `--attention_heads H`: number of attention heads used by `--attention_pool` and `--temporal_attention_layers`.
-  - Must divide the embedding dim: for BiLSTM, the dim is `hidden_dim * 2`; for ViT, the dim is 768.
-- `--feature_se`: squeezes/weights **feature channels** (often helps a bit; usually smaller effect than `--attention_pool`).
+During preprocessing (`prepare_sequences_from_yolo.py`), each window is saved and indexed in `sequence_manifest.json`.
 
-### Case study A: “Keyframe” behavior (grooming-like)
+What preprocessing saves (when enabled):
+- QA crops (`--save_frame_crops`): individual `*.jpg` crops per frame under `output_root/qa_crops/...`. If keypoints exist, the saved crop includes a keypoint overlay (crop-adjusted) so you can visually validate pose->crop mapping.
+- Sequence tensors (`--save_sequence_npz`): one `*.npz` per window under `output_root/sequence_npz/...` containing:
+  - `frames`: `uint8` RGB frames shaped `[T, H, W, 3]` (already cropped and resized to `crop_size`).
+  - `keypoints` (optional): `float32` shaped `[T, K, 3]` in **crop pixel coordinates** (`x_px`, `y_px`, `conf`). Included only when **all frames in the window** have keypoints.
+  - Debug fields (optional): `keypoints_xy_raw`, `keypoints_conf_raw`, `bbox_xyxy`, `crop_xyxy` so you can map back to original-frame coordinates during inspection/review.
 
-Hypothesis: the behavior is defined by a few distinctive poses that may occur anywhere inside the window.
+### Stage C: Pose Feature Extraction (If Keypoints Exist)
+Pose is handled at the **window/clip level**:
+- A clip only gets pose features when **all frames in the window** have keypoints (consistent `K`). If any frame is missing keypoints, that clip is treated as **RGB-only** (so the model can still predict on imperfect pose runs).
 
-- Problem: an LSTM that uses only the last timestep can underweight those key poses if they don’t happen near the end.
-- Good setting: `--sequence_model lstm --attention_pool` (lets the model keep order via LSTM, but still focus on the most informative frames).
-- If you’re already using `vit_b_16`: attention pooling is cheap relative to ViT compute and often improves robustness to brief occlusions/noisy frames.
+When pose is present, the dataset loader (`data.py`) applies the same spatial transforms to keypoints that it applies to frames (flip/rotate/scale/translate), then converts keypoints into a per-frame pose feature vector using `utils/pose_features.py`:
+- centered (x, y, conf) coordinates (crop-relative),
+- pairwise distances between keypoints (geometry-heavy, more invariant),
+- per-keypoint speeds (temporal derivatives).
 
-### Case study B: “Order-dependent” behavior (locomotion-like)
+The classifier therefore consumes pose as a dense vector per frame: `[B, T, D_pose]`.
 
-Hypothesis: the **sequence** matters (e.g., stepping pattern / body translation over time).
+Augmentation semantics (important for temporal models):
+- Spatial + color augmentation parameters are sampled **once per clip** and applied consistently to all frames (and to keypoints when present). This avoids per-frame flip-flopping inside a single temporal window.
+- Validation uses **no augmentation** (resize + normalize only).
 
-- Problem: attention without positional encoding can “see” frames but doesn’t strongly encode *which came first*.
-- Good setting: `--sequence_model lstm` (optionally `--bidirectional` for offline segmentation) and consider `--attention_pool` as an add-on.
-- Start simple: `--num_layers 1` is usually enough for short windows (e.g., 16–32 frames).
+Note on flips and keypoint identity:
+- If your keypoint ordering encodes left/right semantics, flip augmentation ideally swaps keypoint indices. BehaviorScope flips coordinates; disable flips if you need strict left/right identity preservation.
 
-### Case study C: Mixed windows + transition boundaries
+### Stage D: Visual Backbone + Temporal Head
+The classifier (`model.py::BehaviorSequenceClassifier`) supports:
+- Frame backbones: MobileNetV3, EfficientNet-B0, ViT-B/16 (encode each frame -> a feature sequence).
+- Video backbones: SlowFast variants (encode space-time directly; temporal-head settings are mostly bypassed).
 
-Hypothesis: a 16-frame window sometimes contains a transition (end of A + start of B).
+Temporal aggregation can be:
+- LSTM (optionally with attention pooling),
+- attention pooling (no recurrent state),
+- or inherently handled by SlowFast.
 
-- Problem: last-timestep pooling may bias toward “whatever happens at the end”.
-- Good setting: `--attention_pool` helps because it can distribute weight across the window instead of “last frame wins”.
-- Also consider your windowing: smaller `window_stride` improves boundary resolution (at the cost of more windows).
+#### Temporal Head Controls (Key Nuances)
+These controls can look similar in the GUI, but they affect different parts of the temporal pathway:
 
-## Expected dataset layout
+- `--sequence_model lstm`:
+  - Uses an LSTM to model time.
+  - If `--attention_pool` is enabled, the LSTM outputs are pooled by a learned-query multi-head attention module (implemented as `model.py::TemporalAttentionPooling`) instead of using only the final timestep.
 
-`--dataset_root` should contain one folder per behavior/class, each with videos:
+- `--sequence_model attention`:
+  - No LSTM is used.
+  - Per-frame backbone features are pooled directly across time using `TemporalAttentionPooling` (a learned query attending to the sequence).
 
-```
-dataset_root/
-  Ambulatory/*.mp4
-  Grooming/*.mp4
-  ...
-```
+- `--temporal_attention_layers N`:
+  - Adds `N` stacked self-attention blocks over the time dimension (implemented as `model.py::TemporalSelfAttentionBlock`) before the sequence head/pooling.
+  - If `N=0`, there are no self-attention blocks. This does NOT disable attention pooling if you selected an attention head or enabled `--attention_pool`.
 
-Supported video extensions: `.mp4`, `.avi`, `.mov`, `.mkv`.
+- `--attention_heads H`:
+  - Sets the number of heads inside PyTorch's `nn.MultiheadAttention` modules used for:
+    - temporal self-attention blocks (`--temporal_attention_layers > 0`), and
+    - attention pooling (`--attention_pool` or `--sequence_model attention`).
+  - This is not "H separate temporal classifiers"; it is one attention module that internally splits the embedding into `H` subspaces to attend to different temporal patterns in parallel.
+  - Constraint: the relevant embedding dimension must be divisible by `H` (the code validates this at startup).
 
-## Windowing math (`window_size`, `window_stride`)
+- Positional encoding (`--positional_encoding`):
+  - When using attention (self-attn blocks and/or attention pooling), positional encoding is what lets attention distinguish "early vs late" frames rather than treating the sequence as a bag of frames.
 
-BehaviorScope produces segmentation by running a classifier on sliding windows of frames.
+Example configurations (same backbone/crops; only temporal head differs):
 
-Let:
-- `fps` = frames per second
-- `W` = `window_size` (frames)
-- `S` = `window_stride` (frames)
-- `T` = total frames in the video (frames)
+- LSTM baseline (no attention pooling):
+  - `--sequence_model lstm --temporal_attention_layers 0` and leave `--attention_pool` off.
+  - Uses LSTM final state as the clip representation.
 
-Equations:
-- Window duration (seconds): `W / fps`
-- Step between predictions (seconds): `S / fps`
-- Overlap ratio: `(W - S) / W = 1 - (S / W)`
-- Predictions per second: `fps / S`
-- Number of full windows (when `T >= W`): `floor((T - W) / S) + 1`
-- Window `i` covers frames `[i*S, i*S + W - 1]` and times `[i*S/fps, (i*S + W - 1)/fps]`
+- LSTM + attention pooling (often helps if the key moment is not near the end of the clip):
+  - `--sequence_model lstm --attention_pool --temporal_attention_layers 0 --attention_heads 8`
+  - Uses LSTM for dynamics + multi-head attention to pool across all timesteps.
 
-Examples (at `fps=30`):
-- `W=6`, `S=4` -> window `0.20s`, step `0.133s`, overlap `33%`, predictions/sec `7.5`
-  - For a 10s clip (`T=300`): windows `floor((300-6)/4)+1 = 74`
-- `W=30`, `S=6` -> window `1.00s`, step `0.20s`, overlap `80%`, predictions/sec `5`
-  - For a 10s clip (`T=300`): windows `floor((300-30)/6)+1 = 46`
+- Attention pooling head (no recurrence):
+  - `--sequence_model attention --temporal_attention_layers 0 --attention_heads 8`
+  - Uses a learned query to pool per-frame embeddings; no temporal self-attention blocks unless you set `--temporal_attention_layers > 0`.
 
-Practical tip: choose stride from your desired segmentation resolution: `S ~= fps * desired_step_seconds`.
+### Stage E: Optional Pose Fusion (Late Fusion)
+If training is configured with `--use_pose`, the model inserts `model.py::PoseVisualFusion` between the visual backbone output and the temporal head/classifier head.
 
-### Practical starting points (walking/rearing/grooming)
+Important implementation details:
+- Fusion operates on feature vectors (e.g., `[B, T, D_visual]` and `[B, T, D_pose]`), not on pixel grids or ViT patch maps.
+- This makes the fusion path robust to keypoint jitter in the specific sense that jitter does not shift which RGB patches the model sees. Jitter can still affect the pose feature vector, so pose quality and preprocessing consistency still matter.
+- The implementation supports mixed pose availability (some clips missing pose) without accidentally letting "missing pose" change the RGB-only pathway.
 
-There is no "correct" window length without knowing the timescale of each behavior, but you can still pick sane defaults:
+## Pose Fusion Strategies (What Exactly Runs)
 
-- Start by choosing an output resolution (how often you want a new label): `step_sec = S/fps` (often `0.10-0.25s`).
-- Then choose a window duration long enough to include the key motion context, but short enough to avoid mixing behaviors (often `0.5-2.0s`).
-- For segmentation, use overlap (stride smaller than window): a common starting point is `S ~= W/4` to `W/2`.
+### 1) Gated Attention (Default)
+Mechanism (implemented):
+- Let `V_t` be the visual feature vector at time `t` (dimension `D_visual`).
+- Let `P_t` be the pose feature vector at time `t` (dimension `D_pose`), projected to `P'_t` (dimension `D_fusion`).
+- Compute a channel-wise gate `g_t = sigmoid(MLP([V_t, P'_t]))` with dimension `D_visual`.
+- Reweight the visual features: `V'_t = V_t * g_t`.
+- Fused output: `concat(V'_t, P'_t)`.
 
-Example settings at `fps=30` (starting points you can tune):
-- Rearing (often brief): `W=16-32` (0.53-1.07s), `S=4-8` (0.13-0.27s)
-- Walking (often longer): `W=32-64` (1.07-2.13s), `S=8-16` (0.27-0.53s)
-- Grooming (often longer/repetitive): `W=64-128` (2.13-4.27s), `S=8-16` (0.27-0.53s)
+What it is / isn't:
+- It IS feature-space attention (channel gating).
+- It is NOT a spatial attention mask over pixels or ViT patches.
 
-SlowFast note: if you use `slowfast_alpha`, the slow pathway only sees about `ceil(W/alpha)` timesteps. A good rule of thumb is `W >= 4*alpha` so the slow path sees at least ~4 frames (e.g., with `alpha=4`, start at `W>=16`).
+Pros (typical):
+- Low compute overhead vs transformer fusion.
+- Strong "defensible baseline" when pose provides coarse behavioral priors and RGB provides texture/motion cues.
+- Less brittle to keypoint-to-pixel misalignment because it does not mask pixels.
 
-## 1) Prepare cropped sequences (YOLO)
+Cons / failure modes:
+- Pose cannot directly "point" the model to a spatial region; interpretability is feature-level.
+- Pose noise (especially in velocity features) can still harm performance.
 
+### 2) Cross-Modal Transformer (Deep Fusion, Lightweight)
+Mechanism (implemented):
+- Treat visual and pose embeddings as two tokens and mix them with a small Transformer encoder layer.
+- For frame backbones, this is applied per timestep: for each `t`, build tokens `[V_t, proj(P'_t)]` with a shared `d_model`, run one Transformer encoder layer, then concatenate outputs.
+- For SlowFast/global features, pose is pooled over time to a single vector and fused once with the global visual embedding.
+
+Pros (typical):
+- Bidirectional interactions: pose can reshape visual representation and visual context can reshape pose representation.
+- Often improves robustness under occlusion (**depends on dataset and keypoint quality**). *Test this before you use it at scale as my personal experience with it is behavior-dependent (works well for some behaviors-- not so much for other behaviors).*
+
+Cons / failure modes:
+- More compute and harder to tune; can overfit on small datasets.
+- If pose is systematically noisy, the transformer can amplify cross-modal noise without careful regularization.
+
+**Implementation note:** this is a "two-token mixer" transformer, not a large cross-attention stack. It is intentionally lightweight to keep training/inference practical.
+
+## RGB-only Baseline vs Pose+RGB (Explicit Contrast)
+
+### RGB-only (Crops -> Visual Backbone -> Temporal Head)
+Pros:
+- Simplest experimental baseline; fewer moving parts.
+- No dependence on keypoint quality, keypoint ordering, or keypoint domain shift.
+
+Cons:
+- More sensitive to nuisance variation that pose would abstract away (lighting, bedding texture, background changes).
+- Occlusion can cause ambiguous frames where posture cues are not explicit in pixels.
+
+How to run (example):
+- Train without `--use_pose`.
+- During inference, force bbox-only behavior with `--yolo_mode bbox` to ignore any keypoints.
+
+### Pose+RGB (Late Fusion)
+Pros:
+- Adds geometric inductive bias (posture, relative limb distances, motion) that often generalizes better.
+- Can reduce spurious correlations because pose is crop-relative and geometry-heavy.
+
+Cons:
+- Requires stable keypoint extraction and consistent preprocessing/inference configs (`pad_ratio`, `crop_size`).
+- Pose-derived velocities are sensitive to jitter unless keypoints/confidence are reliable.
+
+## Key Features & Methodologies
+
+### Differential Learning Rates
+BehaviorScope supports differential learning rates between:
+- Head/Fusion: `--lr`
+- Backbone: `--backbone_lr` (used when `--train_backbone` is enabled)
+
+Current defaults:
+- Head LR (`--lr`): `5e-5`
+- Backbone LR (`--backbone_lr`): `1e-4`
+
+GUI: set Head LR and Backbone LR separately.
+CLI: `--lr 5e-5 --backbone_lr 1e-4`
+
+### Default Training Hyperparameters (Current Defaults)
+- `epochs=500`
+- `weight_decay=3e-4`
+- `dropout=0.5`
+- `early-stop patience=50`
+
+### Learning Rate Schedulers
+- ReduceLROnPlateau: lowers LR when validation loss stalls.
+- CosineAnnealing: smooth decay to a small fraction of initial LR.
+
+## Validation & Metrics
+
+Terminology:
+- Clip: a fixed-length sequence of frames for classification (default 30 frames).
+- Ground truth (GT): manually annotated behavior labels.
+
+Recommended metrics:
+- Macro-F1: robust to class imbalance.
+- Confusion matrices: expose common confusions between behaviors.
+- Optional manual protocol: "semantic error rate" by auditing biologically implausible transitions.
+
+Quantification outputs (inference):
+- The `*.metrics.xlsx` export reports movement/kinematics in **pixel units** (e.g., distance in pixels, speed in pixels/second computed from FPS). When pose keypoints are available, additional keypoint-derived center/kinematics fields are included.
+
+## Quick Start (CLI)
+
+### 1) Preprocessing
+Run YOLO over a dataset to generate crops + windows + a manifest:
 ```bash
-python prepare_sequences_from_yolo.py --dataset_root "C:\path\to\dataset_root" --yolo_weights "C:\path\to\best.pt" --output_root "C:\path\to\processed_sequences" --manifest_path "C:\path\to\processed_sequences\sequence_manifest.json" --window_size 16 --window_stride 8 --crop_size 224 --pad_ratio 0.25 --yolo_conf 0.10 --yolo_iou 0.50 --yolo_imgsz 640 --device cuda:0 --save_sequence_npz --save_frame_crops False --train_ratio 0.80 --val_ratio 0.10 --test_ratio 0.10 --split_strategy video --min_sequence_count 1
+python prepare_sequences_from_yolo.py \
+  --dataset_root "data/train_set" \
+  --yolo_weights "yolov8n-pose.pt" \
+  --yolo_task pose \
+  --output_root "data/processed" \
+  --save_sequence_npz \
+  --save_frame_crops \
+  --keep_last_box \
+  --split_strategy video
 ```
 
-Notes:
-- `--save_sequence_npz` / `--save_frame_crops` accept `True/False`; you can also pass the flag with no value to mean `True`.
-- Output folders under `--output_root`: `qa_crops/`, `sequence_npz/`, plus the manifest JSON.
-- `--split_strategy` controls how train/val/test splits are created:
-  - `window` (default): stratified split over windows/samples (can leak overlapping windows from the same video across splits).
-  - `video`: keeps all windows from the same `source_video` together (recommended for generalization; ratios are approximate if you have few videos).
-  - In the GUI: Preprocess tab → Train/Val/Test split → Split strategy.
-
-## 2) Train
-
-Example A (frame backbone: ViT + BiLSTM + attention pooling):
-
+### 2) Training
+Pose+RGB (late fusion):
 ```bash
-python train_behavior_lstm.py --manifest_path "C:\path\to\processed_sequences\sequence_manifest.json" --output_dir "C:\path\to\runs" --run_name "vit_b16_lstm_win16" --epochs 60 --batch_size 8 --device cuda:0 --backbone vit_b_16 --sequence_model lstm --hidden_dim 256 --num_layers 1 --bidirectional --attention_pool --attention_heads 8 --temporal_attention_layers 0 --feature_se --dropout 0.3 --lr 5e-4 --weight_decay 1e-4
+python train_behavior_lstm.py \
+  --manifest_path "data/processed/sequence_manifest.json" \
+  --backbone mobilenet_v3_small \
+  --use_pose
 ```
 
-Example B (video backbone: SlowFast):
+Training defaults (epochs/LR/weight decay/augment settings) are loaded from `default_config.yaml`. Override via CLI flags or pass a full config with `--config`.
 
+RGB-only baseline (recommended ablation):
 ```bash
-python train_behavior_lstm.py --manifest_path "C:\path\to\processed_sequences\sequence_manifest.json" --output_dir "C:\path\to\runs" --run_name "slowfast_win16" --epochs 60 --batch_size 8 --device cuda:0 --backbone slowfast_tiny --slowfast_alpha 4 --slowfast_fusion_ratio 0.25 --slowfast_base_channels 48 --dropout 0.3 --lr 2e-4 --weight_decay 1e-4
+python train_behavior_lstm.py \
+  --manifest_path "data/processed/sequence_manifest.json" \
+  --backbone mobilenet_v3_small
 ```
 
-Note: training applies mild augmentations by default; disable them with `--disable_augment`.
-
-## 3) Inference on a long video
-
+Imbalanced labels (helps rare behaviors):
 ```bash
-python infer_behavior_lstm.py --model_path "C:\path\to\runs\vit_b16_lstm_win16\best_model.pt" --video_path "C:\path\to\session.mp4" --yolo_weights "C:\path\to\best.pt" --output_csv "C:\path\to\predictions\session.csv" --output_json "C:\path\to\predictions\session_windows.json" --device cuda:0 --keep_last_box
+python train_behavior_lstm.py \
+  --manifest_path "data/processed/sequence_manifest.json" \
+  --class_weighting inverse \
+  --scheduler plateau \
+  --train_sampler weighted
 ```
 
-Notes:
-- The inference script prints an effective processing speed in FPS (wall-clock throughput) so you can benchmark runtime on your system.
-- Optional: `--output_xlsx ...` exports an Excel workbook that combines per-frame YOLO tracking + kinematics with behavior probabilities mapped from the windowed model outputs.
-- If your `--yolo_weights` are a YOLO-pose model, the workbook (and review overlays) also include keypoints and keypoint-derived kinematics.
-- `--yolo_mode bbox|pose|auto` can be used to force bbox-only export, require keypoints, or auto-detect (default).
+#### Best Checkpoints (Accuracy + Macro-F1)
+`train_behavior_lstm.py` always saves two "best" checkpoints (no extra flags required):
+- `best_model.pt`: highest validation accuracy
+- `best_model_macro_f1.pt`: highest validation macro-F1
 
-### 3a) Per-frame metrics export (XLSX)
+Plain language:
+- Accuracy can look "great" even if the model ignores a rare behavior (e.g., always predicting the most common label).
+- Macro-F1 gives each class equal weight, so it drops sharply when a class is never predicted.
 
-The classifier runs on sliding windows, but ethologists often want frame-level tracking and quantification. If you pass `--output_xlsx`, BehaviorScope exports a workbook that includes:
-- Per-frame YOLO bbox (`x1,y1,x2,y2`) + detection status + confidence
-- Per-frame bbox center (raw + smoothed) and kinematics (distance/speed/acceleration)
-- If using a YOLO-pose model: per-frame keypoints (`kpt_00_*`, `kpt_01_*`, ...) plus keypoint centroid + kinematics (`kpt_center_*`, `kpt_speed_*`, ...).
-- Per-frame behavior Top‑K probabilities (derived from the windowed LSTM outputs; see `--per_frame_mode` below)
-- The original per-window LSTM outputs in a separate sheet (`lstm_outputs`)
-- A `bouts` sheet (contiguous runs of the per-frame behavior labels)
+Technical note:
+- Macro-F1 is the unweighted mean of per-class F1 scores. In this implementation, a class that is never predicted gets F1=0 (it is not ignored), so collapse is reflected directly in macro-F1.
 
-Example (single video):
+When to use which checkpoint:
+- Use `best_model.pt` when classes are reasonably balanced and you mostly care about overall correctness.
+- Use `best_model_macro_f1.pt` when labels are imbalanced and you care about rare behaviors.
 
+Example (imbalanced labels):
+- Epoch A: `val_accuracy=0.90`, but predicts only the most common class -> `val_macro_f1=0.25` (rare classes ignored).
+- Epoch B: `val_accuracy=0.82`, but performs across all classes -> `val_macro_f1=0.62`.
+
+`best_model.pt` would pick Epoch A, while `best_model_macro_f1.pt` would pick Epoch B.
+
+#### Plateau Scheduler (What It Monitors)
+If you use `--scheduler plateau` (ReduceLROnPlateau), the scheduler steps based on **validation loss** (i.e., it reduces LR when `val_loss` stops improving). This is usually smoother/more stable than stepping on accuracy/F1.
+
+#### GUI Note (Which Model Is "Best"?)
+Training from the GUI produces both `best_model.pt` and `best_model_macro_f1.pt` in the run folder. During inference, select whichever checkpoint matches your goal (overall accuracy vs rare-class performance).
+
+### 3) Inference
+Apply the model to a new video:
 ```bash
-python infer_behavior_lstm.py --model_path "C:\path\to\runs\slowfast_win6\best_model.pt" --video_path "C:\path\to\session.mp4" --yolo_weights "C:\path\to\best.pt" --output_csv "C:\path\to\predictions\session.behavior.csv" --output_json "C:\path\to\predictions\session.behavior.windows.json" --output_xlsx "C:\path\to\predictions\session.metrics.xlsx" --per_frame_mode true --top_k 3 --smoothing ema --ema_alpha 0.2 --device cuda:0 --keep_last_box
+python infer_behavior_lstm.py --model_path "behavior_lstm_runs/YOUR_RUN/best_model.pt" --video_path "experiment.mp4" --yolo_weights "yolov8n-pose.pt" --keep_last_box
 ```
 
-#### Workbook structure
-
-The workbook contains these sheets:
-- `per_frame` (and, for very long videos, `per_frame_2`, `per_frame_3`, … to stay under Excel’s row limit)
-- `lstm_outputs` (one row per inference window)
-- `bouts` (one row per behavior bout, derived from `per_frame.behavior_label`)
-- `metadata` (run settings + file paths used to generate the workbook)
-
-#### `per_frame` sheet: columns and meaning
-
-Frame identity:
-- `frame_idx`: 0‑based frame index
-- `time_s`: `frame_idx / fps`
-
-YOLO tracking:
-- `yolo_status`:
-  - `detected`: YOLO found a bbox for this frame
-  - `reused`: YOLO missed this frame, but `--keep_last_box` reused the last bbox (still produces a crop)
-  - `missed`: no bbox available (and the frame is explicitly marked as missed for transparency/active learning)
-- `yolo_conf`: confidence for the selected bbox (or the reused bbox); `0.0` for `missed`
-- `bbox_x1`, `bbox_y1`, `bbox_x2`, `bbox_y2`: bbox corners in pixels (blank for `missed`)
-
-Pose keypoints (optional; only present when using a YOLO-pose model):
-- `kpt_00_x`, `kpt_00_y`, `kpt_00_conf`, ...: keypoint pixel coordinates + confidence. Indices are model-defined (users provide their own naming/mapping).
-- `kpt_center_x`, `kpt_center_y`: keypoint centroid in pixels (confidence-weighted when confidences are available).
-- `kpt_center_x_smooth`, `kpt_center_y_smooth` and `kpt_step_dist_px`, `kpt_speed_px_s`, ...: the same smoothing + kinematics pipeline applied to the keypoint centroid.
-
-Centers:
-- `center_x`, `center_y`: raw bbox center in pixels (blank for `missed`)
-- `center_x_smooth`, `center_y_smooth`: smoothed/filled center in pixels, used to compute kinematics (may be filled even when `yolo_status=missed`, depending on the smoothing method; treat these as imputed values)
-
-Kinematics (computed from the smoothed center, so all values are in pixels-based units):
-- `step_dist_px`: center displacement from the previous frame (pixels/frame)
-- `speed_px_s`: `step_dist_px * fps` (pixels/second)
-- `accel_px_s2`: finite difference of speed (pixels/second²)
-- `cum_dist_px`: cumulative distance traveled since frame 0 (pixels)
-
-Behavior (derived from window-level model outputs):
-- `behavior_label`, `behavior_conf`: Top‑1 label/probability after window→frame mapping and thresholding
-- `top2_label`, `top2_prob`, … up to `topK_*` (controlled by `--top_k`)
-
-Summary table (how common columns are computed):
-
-| Column | Physical meaning | Units | How it’s computed |
-| --- | --- | --- | --- |
-| `step_dist_px` | Frame-to-frame displacement of the tracked center | pixels/frame | Euclidean distance between consecutive `center_x_smooth, center_y_smooth` values |
-| `speed_px_s` | Speed estimate of the tracked center | pixels/s | `step_dist_px * fps` |
-| `accel_px_s2` | Acceleration estimate of the tracked center | pixels/s² | `(speed_t - speed_{t-1}) * fps` |
-| `cum_dist_px` | Cumulative distance traveled by the tracked center | pixels | Cumulative sum of `step_dist_px` (held constant through missing centers) |
-| `behavior_label` | Per-frame Top‑1 predicted behavior after mapping | class name | Derived from window predictions via `--per_frame_mode` (`simple` = nearest window center, `true` = average of all covering windows); forced to `Unknown` when `yolo_status=missed` or Top‑1 < `--prob_threshold` |
-| `behavior_conf` | Confidence/probability of `behavior_label` | probability (0–1) | Top‑1 probability after window→frame mapping (blank/NaN when `behavior_label=Unknown`) |
-| `top2_label` | Second-most likely behavior for the frame | class name | Same mapped Top‑K distribution as `behavior_label` (only present when `--top_k >= 2`) |
-| `top2_prob` | Probability of `top2_label` | probability (0–1) | Same mapped Top‑K distribution as `behavior_conf` |
-
-Important rules applied when writing `per_frame`:
-- If `yolo_status == missed`, behavior is forced to `Unknown` (so missed frames are always obvious in downstream analysis).
-- If the Top‑1 probability for a frame is below `--prob_threshold`, behavior is set to `Unknown` (and Top‑K columns are blanked for that frame).
-- Only Top‑K is exported (no full probability distribution per frame) to keep XLSX files compact and human-readable.
-
-#### `lstm_outputs` sheet (per-window, unchanged model outputs)
-
-This sheet is for users who want the original stride/window-based output without any frame mapping.
-Each row corresponds to one inference window and includes:
-- `start_frame`, `end_frame`, `center_frame` (window location)
-- `label`, `confidence` (Top‑1)
-- `top2_*` … `topK_*` (Top‑K for the window, controlled by `--top_k`)
-
-#### `bouts` sheet (bout table derived from `per_frame`)
-
-This sheet segments the `per_frame.behavior_label` stream into contiguous bouts and reports:
-- `label`
-- `start_frame`, `end_frame`, `start_time`, `end_time`, `duration_s`
-- `mean_confidence` (mean of `per_frame.behavior_conf` within the bout; NaNs ignored)
-- `distance_px` (difference in `cum_dist_px` between the bout end and start; pixels)
-- If using a YOLO-pose model: `distance_px_kpt` computed from `kpt_cum_dist_px`.
-
-You can filter out `label == "Unknown"` if you only want confident bouts.
-
-### Window → frame mapping (`--per_frame_mode`)
-
-The model predicts on windows, not individual frames. `--per_frame_mode` controls how those window-level predictions are mapped back onto frames in `per_frame`.
-This is a methodological choice: pick the mode that matches your analysis goals.
-
-`--per_frame_mode none`
-- Writes YOLO tracking + kinematics to `per_frame`, but leaves per-frame behavior as `Unknown`.
-- Use when you only need tracking metrics, or when you plan to do your own custom window→frame mapping downstream.
-
-`--per_frame_mode simple` (nearest-window-center assignment)
-- For each frame, choose the single window whose `center_frame` is nearest to that frame, and copy that window’s Top‑K to the frame.
-- Pros:
-  - Very easy to interpret and fast to compute.
-  - Low memory: only uses each window’s Top‑K (not the full class distribution).
-  - Good default for visualization (clean overlays) and “stride-resolution” analyses.
-- Cons / interpretation notes:
-  - This produces piecewise-constant behavior probabilities across frames (because one window “owns” each frame).
-  - Near transition boundaries, assignments can flip between adjacent windows, especially with small stride.
-  - The per-frame label still represents a decision made with window context (it is not a truly frame-local classifier).
-
-`--per_frame_mode true` (probability averaging across all covering windows)
-- For each frame, collect every window that covers that frame and average their full class-probability vectors; then compute the per-frame Top‑K from that averaged distribution.
-- Pros:
-  - Uses all overlapping windows consistently, which can reduce boundary jitter.
-  - Produces “true per-frame probabilities” in the sense that each frame gets its own probability vector derived from all evidence that includes that frame.
-  - Better suited for probability-based analyses (e.g., uncertainty over time, threshold sweeps, active learning sampling).
-- Cons / interpretation notes:
-  - Requires storing the full probability vector for every window (memory scales with `num_windows * num_classes`).
-  - Because windows include surrounding frames, the per-frame probability is still context-dependent (offline / non-causal). In real-time, this implies a delay on the order of the window length if you want the per-frame label to use symmetric context around the frame.
-
-In both `simple` and `true` modes:
-- Frames not covered by any window (e.g., at the very beginning/end depending on settings, or when YOLO misses and `--keep_last_box` is off) are set to `Unknown`.
-- Frames with `yolo_status=missed` are always forced to `Unknown`.
-
-### Top‑K export (`--top_k`) and the “K cap”
-
-`--top_k K` controls how many of the highest-probability behavior classes are written per row (Top‑1 plus Top‑2 … Top‑K).
-This does **not** change inference; it only changes how much probability information is exported.
-
-BehaviorScope clamps `K` to a maximum of **5** (the “K cap”):
-- If you request `--top_k` greater than 5, it is automatically reduced to 5.
-- If your model has fewer than `K` classes, it is automatically reduced to `num_classes`.
-
-Why cap at 5?
-- XLSX files get wide quickly; exporting many classes makes the workbook harder to use and significantly larger.
-- Top‑5 usually captures the useful ambiguity for review/active learning without turning the sheet into a full probability dump.
-
-### Center smoothing (`--smoothing`, `--ema_alpha`, `--interp_max_gap`)
-
-Smoothing affects only the center-based kinematics (`step_dist_px`, `speed_px_s`, `accel_px_s2`, `cum_dist_px`). It does not change the behavior model outputs.
-
-- `--smoothing none`: kinematics use the raw bbox center; missed frames yield blank centers/kinematics.
-- `--smoothing ema`: exponential moving average over the center; gaps are typically carried forward (imputation).
-  - `--ema_alpha` controls responsiveness (`0 < alpha <= 1`; larger = faster response, less smoothing).
-- `--smoothing kalman`: a simple constant-velocity Kalman filter; can predict through short gaps (imputation).
-- `--smoothing interpolation`: linear interpolation across short gaps only.
-  - `--interp_max_gap` is the maximum gap (in frames) that will be interpolated; larger gaps remain blank.
-
-All distance/speed/acceleration are in pixel-based units. To convert to real-world units (e.g., mm), apply your calibration factor (e.g., `mm_per_px`) downstream.
-
-### Single-animal YOLO guardrails (`max_det=1`, `nms=True`)
-
-This repo is currently designed for **single-animal** experiments only:
-- YOLO is forced to `max_det=1` and `nms=True` during inference, even if you pass different values.
-- In the GUI, the corresponding controls are visible but disabled (to make the single-animal constraint explicit).
-- If you plan to add multi-animal IDs later, these guardrails are the places you’ll relax/extend.
-
-## 3b) Batch inference (folder of videos)
-
+If your dataset is imbalanced (rare behaviors), consider using `best_model_macro_f1.pt` instead of `best_model.pt`:
 ```bash
-python batch_process_videos.py --input_dir "C:\path\to\videos" --output_dir "C:\path\to\outputs" --model_path "C:\path\to\runs\slowfast_win6\best_model.pt" --yolo_weights "C:\path\to\best.pt" --device cuda:0 --keep_last_box
+python infer_behavior_lstm.py --model_path "behavior_lstm_runs/YOUR_RUN/best_model_macro_f1.pt" --video_path "experiment.mp4" --yolo_weights "yolov8n-pose.pt" --keep_last_box
 ```
 
-Notes:
-- Use `--export_xlsx` to export a per-video `*.metrics.xlsx` workbook (see “Per-frame metrics export (XLSX)” above).
-- If you are exporting review videos (`--skip_review_video` is NOT set), batch mode will also export `*.metrics.xlsx` automatically so the MP4 overlay can use the bbox-anchored labels.
-- XLSX export options apply in batch mode too: `--per_frame_mode`, `--top_k`, `--smoothing`, `--ema_alpha`, `--interp_max_gap`.
-
-Outputs are written under `--output_dir` mirroring the `--input_dir` folder structure:
-- `*.behavior.csv` (merged segments)
-- `*.behavior.windows.json` (per-window predictions, unless `--skip_json`)
-- `*.metrics.xlsx` (per-frame bbox + metrics + behavior Top‑K, when `--export_xlsx` OR when exporting review videos)
-- `*.review.mp4` (annotated review export, unless `--skip_review_video`)
-
-## 3c) Benchmark (YOLO + crop + classifier)
-
-Benchmark accuracy + throughput using the `val` split from your preprocessing manifest:
-
+Force RGB-only inference even if pose is available:
 ```bash
-python benchmark_pipeline.py --manifest_path "C:\path\to\processed_sequences\sequence_manifest.json" --model_path "C:\path\to\runs\slowfast_win6\best_model.pt" --yolo_weights "C:\path\to\best.pt" --device cuda:0
+python infer_behavior_lstm.py --model_path "behavior_lstm_runs/YOUR_RUN/best_model.pt" --video_path "experiment.mp4" --yolo_weights "yolov8n-pose.pt" --yolo_mode bbox --keep_last_box
 ```
 
-Outputs:
-- Per-class accuracy on the requested split (`--split val` by default)
-- Full pipeline throughput in FPS (frames/sec), computed from `YOLO + crop + classifier` timing
-
-## 4) Visual review
-
+Require pose for every inference window (strict Pose+RGB comparison mode):
 ```bash
-python review_annotations.py --video_path "C:\path\to\session.mp4" --annotations_csv "C:\path\to\predictions\session.behavior.csv" --output_video "C:\path\to\predictions\session_review.mp4" --no_display
+python infer_behavior_lstm.py --model_path "behavior_lstm_runs/YOUR_RUN/best_model.pt" --video_path "experiment.mp4" --yolo_weights "yolov8n-pose.pt" --yolo_mode pose --require_pose --keep_last_box
 ```
 
-To draw clean YOLO-style bbox labels (instead of the top panel overlay), pass the metrics workbook:
+## Advanced Configuration
 
-```bash
-python review_annotations.py --video_path "C:\path\to\session.mp4" --metrics_xlsx "C:\path\to\predictions\session.metrics.xlsx" --output_video "C:\path\to\predictions\session_review.mp4" --no_display
-```
+### SlowFast R50
+We support `slowfast_r50` (Kinetics-400 pre-trained).
+- Typical settings: `slowfast_alpha=4` and `window_size` around 30-32 frames are common. The official model is usually trained with 32-frame clips; other lengths may work but are less "standard".
+- Fusion: pose is pooled over time and fused once with the global SlowFast embedding (late fusion).
 
-Notes:
-- If `--metrics_xlsx` is provided, `review_annotations.py` reads the `per_frame*` sheet(s) and draws a YOLO-style bbox + label box anchored to the animal (no dashboard panel covering the video).
-- The bbox label will also include YOLO status when relevant (e.g., `[reused]` or `[missed]`).
-- If keypoint columns are present in the workbook (YOLO-pose), the overlay also draws keypoints.
-- Use `--label_bg_alpha 0.3-0.7` to make the label background more transparent (reduces occlusion during visual QA).
-- Use `--font_scale` and `--thickness` to control overlay text size and line width.
+### Outputs
+- Preprocessing: `sequence_manifest.json`, `qa_crops/` (optional), `sequence_npz/` (optional).
+- Training: `config.yaml` (resolved run config), `best_model.pt`, `best_model_macro_f1.pt`, `training_curves.png`, confusion matrix plots (if enabled), plus startup previews like `startup_crops_preview.png`, `startup_pose_preview_train.png`, `startup_pose_preview_val.png`, and `startup_pose_aug_preview_train.png`.
+- Inference: `*.behavior.csv` (timeline), `*.metrics.xlsx` (per-frame / per-window metrics).
 
 ## License
 
-See `LICENSE` (AGPL-3.0).
+See `LICENSE` (AGPL-3.0)-- same as IntegraPose.

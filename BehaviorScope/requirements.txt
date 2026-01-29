@@ -1,7 +1,10 @@
-numpy
-opencv-python
-Pillow
-openpyxl
-ultralytics
-torch
-torchvision
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=9.5.0
+openpyxl>=3.1.0
+ultralytics>=8.0.0
+torch>=2.0.0
+torchvision>=0.15.0
+matplotlib>=3.7.0
+pytorchvideo>=0.1.5
+PyYAML>=6.0
