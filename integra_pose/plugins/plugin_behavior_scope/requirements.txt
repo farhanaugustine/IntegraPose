@@ -1,0 +1,12 @@
+# Optional dependency guide for BehaviorScope Toolkit.
+#
+# This plugin does not add extra pip-only packages beyond the main IntegraPose stack, but it does
+# require a matching PyTorch + torchvision install. Those wheels are hardware-specific, so they are
+# intentionally not pinned here.
+#
+# Recommended install order:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements.txt
+#
+# If you use CUDA, replace the PyTorch index URL with the one that matches your hardware from:
+#   https://pytorch.org/get-started/locally/

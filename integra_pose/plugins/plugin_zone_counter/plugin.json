@@ -1,0 +1,6 @@
+{
+  "name": "Zone Counter",
+  "version": "1.0.2",
+  "description": "Real-time zone entry counter with polygon overlay on Supervision inference streams.",
+  "author": "IntegraPose"
+}

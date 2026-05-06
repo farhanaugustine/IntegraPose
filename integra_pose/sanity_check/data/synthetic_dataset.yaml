@@ -1,0 +1,8 @@
+# Synthetic class metadata for the IntegraPose sanity check.
+# This is NOT a training dataset — it only carries class names so the
+# bout analyser can produce human-readable output during the test.
+
+names:
+  0: walking
+  1: rearing
+nc: 2

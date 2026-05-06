@@ -1,0 +1,71 @@
+{
+  "dataset_preparation": {
+    "source_directory": "examples/tandem_yolo/clips_for_labeling",
+    "key_mapping": {
+      "a": "Ambulatory",
+      "g": "Grooming",
+      "w": "Wall-Rearing",
+      "r": "Rearing",
+      "s": "Sniffing",
+      "d": "Digging"
+
+    },
+    "class_mapping": {
+      "Ambulatory": 0,
+      "Wall-Rearing": 1,
+      "Grooming": 2,
+      "Rearing": 3,
+      "Sniffing": 4,
+      "Digging": 5
+    }
+  },
+  "data": {
+    "pose_directory": "final_labeled_pose_data",
+    "output_directory": "output_folder",
+    "keypoint_names": [
+      "Nose", "Left Ear", "Right Ear", "Base of Neck", "Left Front Paw", 
+      "Right Front Paw", "Center Spine", "Left Rear Paw", "Right Rear Paw", 
+      "Base of Tail", "Mid Tail", "Tail Tip"
+    ],
+    "model_save_filename": "lstm_classifier.pt"
+  },
+  "process": {
+    "source_directory": "clips_for_labeling",
+    "yolo_model_path": "A2C2f_C3k2_C2PSA_Backbone_L-Model.pt",
+    "confidence_threshold": 0.5,
+    "device": 0
+  },
+  "feature_params": {
+    "angles_to_compute": [
+      ["Left Ear", "Nose", "Right Ear"],
+      ["Left Front Paw", "Base of Neck", "Right Front Paw"],
+      ["Base of Neck", "Center Spine", "Base of Tail"]
+    ]
+  },
+  "sequence_params": {
+    "sequence_length": 15
+  },
+  "lstm_classifier_params": {
+    "model_type": "attention",
+    "hidden_dim": 128,
+    "num_layers": 2,
+    "dropout_rate": 0.5
+  },
+  "training_params": {
+    "epochs": 50,
+    "batch_size": 32,
+    "learning_rate": 0.001,
+    "test_split_ratio": 0.2,
+    "use_smote": false
+  },
+  "inference_params": {
+    "video_source": "examples/tandem_yolo/videos/demo_video.mp4",
+    "output_directory": "inference_output",
+    "save_annotated_video": true,
+    "draw_skeleton": true,
+    "yolo_model_path": "A2C2f_C3k2_C2PSA_Backbone_L-Model.pt",
+    "yolo_confidence_threshold": 0.5,
+    "lstm_classifier_path": "output_folder/lstm_classifier.pt",
+    "device": 0
+  }
+}

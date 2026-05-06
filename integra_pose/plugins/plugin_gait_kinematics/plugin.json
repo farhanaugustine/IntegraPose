@@ -1,0 +1,6 @@
+{
+  "name": "Gait & Kinematic Dashboard",
+  "version": "1.0.2",
+  "description": "Stride/gait metrics, kinematic dashboards, and batch analysis helpers for tracked pose data.",
+  "author": "IntegraPose"
+}

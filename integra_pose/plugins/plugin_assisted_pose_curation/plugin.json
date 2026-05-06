@@ -1,0 +1,7 @@
+{
+  "name": "Assisted Pose Curation",
+  "version": "0.1.0",
+  "description": "Advanced single-animal YOLO pose curation with assistive pseudolabeling, draggable keypoints, propagation, and dataset export.",
+  "author": "IntegraPose"
+}
+

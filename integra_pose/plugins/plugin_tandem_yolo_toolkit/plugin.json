@@ -1,0 +1,6 @@
+{
+  "name": "Tandem YOLO Toolkit",
+  "version": "1.0.2",
+  "description": "Coupled YOLO + temporal classifier workflow for training, dataset preparation, and real-time inference.",
+  "author": "IntegraPose"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Dataset Augmentor Lab",
+  "version": "1.0.2",
+  "description": "GUI-driven dataset augmentation for YOLO bbox and pose-label datasets.",
+  "author": "IntegraPose"
+}

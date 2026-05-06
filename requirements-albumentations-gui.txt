@@ -1,0 +1,31 @@
+# Optional Albumentations add-on for the desktop GUI environment.
+#
+# Install this after the main environment so pip does not pull opencv-python-headless: (If you get opencv assocated crashes; uninstall all opencv versions and then reinstall it)
+#   pip install -r requirements.txt
+#   pip install --no-deps -r requirements-albumentations-gui.txt
+#
+# This project keeps GUI-enabled OpenCV pinned in requirements.txt because the application uses
+# cv2.imshow(), cv2.namedWindow(), and cv2.selectROI(). Installing the PyPI albumentations package
+# with normal dependency resolution would add opencv-python-headless and can break the aforementioned features.
+# This file therefore lists the needed transitive packages explicitly so "--no-deps" works in a fresh
+# environment after the base IntegraPose install. 
+# Do not run plain `pip install -r requirements-albumentations-gui.txt`, because that would still allow
+# `albumentations` to add `opencv-python-headless`.
+#
+# Pin the Albumentations stack explicitly. IntegraPose does not use pydantic directly; it is listed
+# here only because albumentations==1.4.21 declares pydantic>=2.7.0 and the --no-deps install flow
+# requires us to include that transitive dependency ourselves.
+
+numpy==1.26.4
+scipy==1.11.4
+opencv-python==4.9.0.80
+PyYAML==6.0.2
+typing-extensions==4.14.0
+annotated-types==0.7.0
+albumentations==1.4.21
+albucore==0.0.20
+pydantic==2.8.2
+pydantic-core==2.20.1
+stringzilla==4.6.0
+simsimd==6.5.16
+eval-type-backport==0.3.1

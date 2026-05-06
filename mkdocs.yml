@@ -1,0 +1,91 @@
+site_name: IntegraPose
+site_description: 'Pose estimation, behavior analytics, and sub-behavior discovery for research labs — in one desktop application.'
+site_author: 'IntegraPose Team'
+site_url: 'https://farhanaugustine.github.io/IntegraPose'
+
+repo_name: 'farhanaugustine/IntegraPose'
+repo_url: 'https://github.com/farhanaugustine/IntegraPose'
+edit_uri: 'edit/main/docs/'
+
+theme:
+  name: material
+  logo: assets/images/logos/IntegraPose.png
+  palette:
+    - scheme: default
+      primary: 'white'
+      accent: 'teal'
+  features:
+    - content.code.annotate
+    - content.tabs.link
+    - navigation.expand
+    - navigation.indexes
+    - navigation.instant
+    - navigation.sections
+    - navigation.tabs
+    - navigation.top
+    - search.highlight
+    - search.share
+    - search.suggest
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+
+extra_css:
+  - assets/stylesheets/extra.css
+
+nav:
+  - 'Home': 'index.md'
+  - 'Showcase': 'showcase.md'
+  - 'Getting Started':
+    - 'Installation': 'getting-started/installation.md'
+    - 'Quick Start': 'getting-started/quick-start.md'
+  - 'Workflows':
+    - 'Detection-Only Model Workflow': 'workflows/detection-only-model-workflow.md'
+    - 'Pose Model Workflow': 'workflows/pose-model-workflow.md'
+  - 'User Guide':
+    - 'Project Files & Bundles': 'user-guide/project-files-and-bundles.md'
+    - 'Data Preprocessing Tab': 'user-guide/data-preprocessing.md'
+    - 'Setup & Annotation Tab': 'user-guide/setup-tab.md'
+    - 'Model Training Tab': 'user-guide/training-tab.md'
+    - 'Inference Tab': 'user-guide/inference-tab.md'
+    - 'Webcam Inference Tab': 'user-guide/webcam-tab.md'
+    - 'Bout Analytics Tab': 'user-guide/roi-analytics.md'
+    - 'Sub-Behavior Discovery (Tab 7)': 'user-guide/pose-clustering.md'
+    - 'Batch Processing Wizard': 'user-guide/batch-processing-wizard.md'
+    - 'Model Registry': 'user-guide/model-registry.md'
+    - 'Metrics Reference (Bio)': 'user-guide/metrics-reference.md'
+    - 'Bout Confirmation': 'user-guide/bout-confirmation.md'
+    - 'Advanced Bout Scorer': 'user-guide/advanced-bout-analyzer.md'
+    - 'Skeleton Editor': 'user-guide/skeleton-editor.md'
+    - 'Log Console': 'user-guide/log-tab.md'
+  - 'Plugins':
+    - 'Plugin Catalog': 'plugins/plugin-catalog.md'
+    - 'Plugin Development': 'plugins/plugin-development.md'
+    - 'Dataset creation':
+      - 'Assisted Pose Curation': 'plugins/assisted-pose-curation.md'
+      - 'AutoLabel Forge': 'plugins/autolabel-forge.md'
+      - 'Dataset Augmentor Lab': 'plugins/dataset-augmentor-lab.md'
+    - 'Behavior & sequence modeling':
+      - 'BehaviorScope Toolkit': 'plugins/behavior-scope.md'
+      - 'Tandem YOLO Toolkit': 'plugins/tandem-yolo-toolkit.md'
+    - 'Domain-specific analytics':
+      - 'Gait & Kinematic Dashboard': 'plugins/gait-kinematics.md'
+      - 'Zone Counter': 'plugins/zone-counter.md'
+    - 'Exploration & review':
+      - 'EDA Tool': 'plugins/eda-plugin.md'
+  - 'Advanced':
+    - 'Customizing the YOLO Model': 'advanced/customizing-yolo-model.md'
+  - 'Project':
+    - 'Citations & Acknowledgements': 'project/citations-and-acknowledgments.md'
+  - 'Tutorials': 'tutorials.md'

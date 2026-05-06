@@ -1,0 +1,46 @@
+# Python bytecode/caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test/build caches
+.pytest_cache/
+tests/_tmp_pytest/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# MkDocs build output
+site/
+
+# Runtime logs
+*.log
+
+# Common output folders
+runs/
+
+# Notebook caches
+.ipynb_checkpoints/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# Model artifacts / weights
+*.pt
+*.pth
+*.onnx
+*.engine
+*.tflite
+*.pb
+*.h5
+*.ckpt
+*.weights
+models/
+*.log
+*.pyc

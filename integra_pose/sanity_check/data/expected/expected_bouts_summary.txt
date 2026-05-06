@@ -1,0 +1,11 @@
+# Expected output from the IntegraPose sanity-check synthetic batch
+# (10 frames, 2 behaviour classes, 1 animal). Reference values
+# resolved with: max_gap_frames=2, min_bout_frames=2, fps=30.0.
+#
+# Format: key=value, one per line. The runner parses this loosely.
+
+n_bouts_total = 2
+n_bouts_walking = 1
+n_bouts_rearing = 1
+n_unique_tracks = 1
+n_frames_total = 10

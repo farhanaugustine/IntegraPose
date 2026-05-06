@@ -1,0 +1,6 @@
+{
+  "name": "EDA Tool",
+  "version": "1.0.2",
+  "description": "Exploratory data analysis workspace for pose/bout outputs (plots, PCA, clustering, exports).",
+  "author": "IntegraPose"
+}

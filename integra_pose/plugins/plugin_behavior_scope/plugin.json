@@ -1,0 +1,6 @@
+{
+  "name": "BehaviorScope Toolkit",
+  "version": "1.0.2",
+  "description": "GUI integration for the BehaviorScope v2 training/inference pipeline.",
+  "author": "IntegraPose"
+}

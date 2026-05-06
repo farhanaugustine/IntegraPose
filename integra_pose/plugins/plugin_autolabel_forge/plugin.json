@@ -1,0 +1,6 @@
+{
+  "name": "AutoLabel Forge",
+  "version": "1.0.2",
+  "description": "GroundingDINO autolabel + manual point-prompt annotation for YOLO detection and optional segmentation labels.",
+  "author": "IntegraPose"
+}
