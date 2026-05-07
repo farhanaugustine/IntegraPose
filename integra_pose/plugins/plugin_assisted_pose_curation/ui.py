@@ -196,6 +196,13 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         self._render_size: tuple[int, int] = (1, 1)
         self._render_origin: tuple[int, int] = (0, 0)
         self._reset_viewport = True
+        self._viewer_popout: Optional[tk.Toplevel] = None
+        self._popout_canvas: Optional[tk.Canvas] = None
+        self._popout_photo: Optional[ImageTk.PhotoImage] = None
+        self._popout_render_scale = 1.0
+        self._popout_render_size: tuple[int, int] = (1, 1)
+        self._popout_render_origin: tuple[int, int] = (0, 0)
+        self._popout_reset_viewport = True
         self._dragging_kp_index: Optional[int] = None
         self._active_kp_index = 0
         self._keypoint_names = list(DEFAULT_KEYPOINT_NAMES)
@@ -910,6 +917,7 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         ttk.Button(toolbar_bottom, text="Zoom +", command=self._zoom_in).pack(side="left", padx=(6, 0))
         ttk.Button(toolbar_bottom, text="1:1", command=self._zoom_actual).pack(side="left", padx=(6, 0))
         ttk.Button(toolbar_bottom, text="Fit [0]", command=self._zoom_fit).pack(side="left", padx=(6, 0))
+        ttk.Button(toolbar_bottom, text="Pop Out Viewer", command=self._open_viewer_popout).pack(side="left", padx=(10, 0))
         ttk.Label(toolbar_bottom, textvariable=self._zoom_var, width=28).pack(side="left", padx=(10, 0))
         self._toolbar_hint_label = ttk.Label(
             toolbar_bottom,
@@ -929,22 +937,7 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         self._canvas_vscroll.grid(row=0, column=1, sticky="ns")
         self._canvas_hscroll.grid(row=1, column=0, sticky="ew")
         self._canvas.configure(xscrollcommand=self._canvas_hscroll.set, yscrollcommand=self._canvas_vscroll.set)
-        self._canvas.bind("<ButtonPress-1>", self._on_canvas_left_press, add="+")
-        self._canvas.bind("<B1-Motion>", self._on_canvas_drag, add="+")
-        self._canvas.bind("<ButtonRelease-1>", self._on_canvas_left_release, add="+")
-        self._canvas.bind("<Button-3>", self._on_canvas_right_click, add="+")
-        self._canvas.bind("<Shift-ButtonPress-1>", self._pan_start, add="+")
-        self._canvas.bind("<Shift-B1-Motion>", self._pan_drag, add="+")
-        self._canvas.bind("<ButtonPress-2>", self._pan_start, add="+")
-        self._canvas.bind("<Control-ButtonPress-2>", self._on_ctrl_middle_click, add="+")
-        self._canvas.bind("<B2-Motion>", self._pan_drag, add="+")
-        self._canvas.bind("<MouseWheel>", self._on_mousewheel, add="+")
-        self._canvas.bind("<Shift-MouseWheel>", self._on_shift_mousewheel, add="+")
-        self._canvas.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel, add="+")
-        self._canvas.bind("<Button-4>", self._on_linux_wheel_up, add="+")
-        self._canvas.bind("<Button-5>", self._on_linux_wheel_down, add="+")
-        self._canvas.bind("<Control-Button-4>", self._on_linux_ctrl_wheel_up, add="+")
-        self._canvas.bind("<Control-Button-5>", self._on_linux_ctrl_wheel_down, add="+")
+        self._bind_viewer_canvas(self._canvas)
         self._canvas.bind("<Configure>", lambda _e: self._render_scene(), add="+")
 
         status = ttk.Label(right, textvariable=self._status_var, style="Status.TLabel", wraplength=960, justify="left")
@@ -953,6 +946,87 @@ class AssistedPoseCurationWindow(tk.Toplevel):
 
         workspace.add(left_shell, weight=0)
         workspace.add(right, weight=1)
+
+    def _bind_viewer_canvas(self, canvas: tk.Canvas) -> None:
+        canvas.bind("<ButtonPress-1>", self._on_canvas_left_press, add="+")
+        canvas.bind("<B1-Motion>", self._on_canvas_drag, add="+")
+        canvas.bind("<ButtonRelease-1>", self._on_canvas_left_release, add="+")
+        canvas.bind("<Button-3>", self._on_canvas_right_click, add="+")
+        canvas.bind("<Shift-ButtonPress-1>", self._pan_start, add="+")
+        canvas.bind("<Shift-B1-Motion>", self._pan_drag, add="+")
+        canvas.bind("<ButtonPress-2>", self._pan_start, add="+")
+        canvas.bind("<Control-ButtonPress-2>", self._on_ctrl_middle_click, add="+")
+        canvas.bind("<B2-Motion>", self._pan_drag, add="+")
+        canvas.bind("<MouseWheel>", self._on_mousewheel, add="+")
+        canvas.bind("<Shift-MouseWheel>", self._on_shift_mousewheel, add="+")
+        canvas.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel, add="+")
+        canvas.bind("<Button-4>", self._on_linux_wheel_up, add="+")
+        canvas.bind("<Button-5>", self._on_linux_wheel_down, add="+")
+        canvas.bind("<Control-Button-4>", self._on_linux_ctrl_wheel_up, add="+")
+        canvas.bind("<Control-Button-5>", self._on_linux_ctrl_wheel_down, add="+")
+
+    def _open_viewer_popout(self) -> None:
+        if self._viewer_popout is not None and self._viewer_popout.winfo_exists():
+            self._viewer_popout.lift()
+            self._viewer_popout.focus_force()
+            return
+
+        window = tk.Toplevel(self)
+        window.title("Assisted Pose Curation Viewer")
+        width = min(max(900, int(self._screen_width * 0.82)), self._screen_width - 80)
+        height = min(max(650, int(self._screen_height * 0.82)), self._screen_height - 80)
+        window.geometry(f"{width}x{height}")
+        window.minsize(720, 520)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(1, weight=1)
+
+        toolbar = ttk.Frame(window, padding=(8, 8, 8, 4))
+        toolbar.grid(row=0, column=0, sticky="ew")
+        ttk.Button(toolbar, text="Zoom -", command=lambda: self._zoom_out(canvas=self._popout_canvas)).pack(side="left")
+        ttk.Button(toolbar, text="Zoom +", command=lambda: self._zoom_in(canvas=self._popout_canvas)).pack(side="left", padx=(6, 0))
+        ttk.Button(toolbar, text="1:1", command=lambda: self._zoom_actual(canvas=self._popout_canvas)).pack(side="left", padx=(6, 0))
+        ttk.Button(toolbar, text="Fit", command=self._zoom_fit).pack(side="left", padx=(6, 0))
+        ttk.Label(toolbar, textvariable=self._zoom_var, width=28).pack(side="left", padx=(10, 0))
+        ttk.Label(
+            toolbar,
+            text="Click/drag edits keypoints. Ctrl+Wheel zooms. Shift+drag pans.",
+            style="Status.TLabel",
+        ).pack(side="right")
+
+        viewer = ttk.Frame(window, padding=(8, 4, 8, 8))
+        viewer.grid(row=1, column=0, sticky="nsew")
+        viewer.columnconfigure(0, weight=1)
+        viewer.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(viewer, highlightthickness=0, background="#111111", xscrollincrement=1, yscrollincrement=1)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vscroll = ttk.Scrollbar(viewer, orient="vertical", command=canvas.yview)
+        hscroll = ttk.Scrollbar(viewer, orient="horizontal", command=canvas.xview)
+        vscroll.grid(row=0, column=1, sticky="ns")
+        hscroll.grid(row=1, column=0, sticky="ew")
+        canvas.configure(xscrollcommand=hscroll.set, yscrollcommand=vscroll.set)
+        self._bind_viewer_canvas(canvas)
+        canvas.bind("<Configure>", lambda _e: self._render_scene(), add="+")
+        self._bind_popout_shortcuts(window)
+
+        self._viewer_popout = window
+        self._popout_canvas = canvas
+        self._popout_reset_viewport = True
+        window.protocol("WM_DELETE_WINDOW", self._close_viewer_popout)
+        self._render_scene()
+        window.lift()
+        window.focus_force()
+
+    def _close_viewer_popout(self) -> None:
+        window = self._viewer_popout
+        self._viewer_popout = None
+        self._popout_canvas = None
+        self._popout_photo = None
+        self._popout_render_scale = 1.0
+        self._popout_render_size = (1, 1)
+        self._popout_render_origin = (0, 0)
+        self._popout_reset_viewport = True
+        if window is not None and window.winfo_exists():
+            window.destroy()
 
     def _build_settings_tab(self) -> None:
         container = ttk.Frame(self._settings_tab)
@@ -1204,6 +1278,27 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         self.bind("<Control-Shift-c>", lambda _e: self._copy_previous_pose(), add="+")
         for key_text in "1234567890":
             self.bind(f"<KeyPress-{key_text}>", lambda event, raw=key_text: self._handle_class_shortcut(event, raw), add="+")
+
+    def _bind_popout_shortcuts(self, target: tk.Toplevel) -> None:
+        target.bind("<KeyPress-p>", lambda _e: self._prev_image(), add="+")
+        target.bind("<KeyPress-P>", lambda _e: self._prev_image(), add="+")
+        target.bind("<KeyPress-n>", lambda _e: self._next_image(), add="+")
+        target.bind("<KeyPress-N>", lambda _e: self._next_image(), add="+")
+        target.bind("<Control-s>", lambda _e: self._save_current_pose(), add="+")
+        target.bind("<Control-S>", lambda _e: self._save_current_pose(), add="+")
+        target.bind("<KeyPress-a>", lambda _e: self._rerun_assist(), add="+")
+        target.bind("<KeyPress-A>", lambda _e: self._rerun_assist(), add="+")
+        target.bind("<KeyPress-h>", lambda _e: self._toggle_assist_overlay(), add="+")
+        target.bind("<KeyPress-H>", lambda _e: self._toggle_assist_overlay(), add="+")
+        target.bind("<Control-Return>", lambda _e: self._accept_assist_and_save(), add="+")
+        target.bind("<Control-KeyPress-0>", lambda _e: self._zoom_fit(), add="+")
+        target.bind("<KeyPress-equal>", lambda _e: self._zoom_in(canvas=self._popout_canvas), add="+")
+        target.bind("<KeyPress-plus>", lambda _e: self._zoom_in(canvas=self._popout_canvas), add="+")
+        target.bind("<KeyPress-minus>", lambda _e: self._zoom_out(canvas=self._popout_canvas), add="+")
+        target.bind("<KeyPress-underscore>", lambda _e: self._zoom_out(canvas=self._popout_canvas), add="+")
+        target.bind("<Control-Shift-c>", lambda _e: self._copy_previous_pose(), add="+")
+        for key_text in "1234567890":
+            target.bind(f"<KeyPress-{key_text}>", lambda event, raw=key_text: self._handle_class_shortcut(event, raw), add="+")
 
     def _add_path_row(
         self,
@@ -2091,6 +2186,7 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         self._refresh_instance_tree()
         self._refresh_keypoint_tree()
         self._render_scene()
+        self._focus_active_instance(adjust_zoom=False)
 
     def _on_instance_tree_select(self, _event=None) -> None:
         if not hasattr(self, "_instance_tree"):
@@ -3036,6 +3132,7 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         self._current_path = path
         self._current_image = image
         self._reset_viewport = True
+        self._popout_reset_viewport = True
         self._dragging_kp_index = None
         self._load_curation_manifest()
         loaded_instances = self._load_instances_for_path(path, image.shape[1], image.shape[0])
@@ -3082,6 +3179,7 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         self._refresh_instance_tree()
         self._refresh_keypoint_tree()
         self._render_scene()
+        self._auto_focus_frame_subjects(adjust_zoom=True)
         self._write_classes_txt()
         self._refresh_review_counts()
 
@@ -3447,6 +3545,7 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         self._refresh_instance_tree()
         self._refresh_keypoint_tree()
         self._render_scene()
+        self._auto_focus_frame_subjects(adjust_zoom=True)
         primary_meta = assist_instances[0].get("assist_meta", {})
         det_conf = float(primary_meta.get("detection_conf", 0.0) or 0.0)
         model_kpts = int(primary_meta.get("model_keypoint_count", 0) or 0)
@@ -3492,26 +3591,70 @@ class AssistedPoseCurationWindow(tk.Toplevel):
                 )
         self._clear_task_state("Assist complete")
 
+    def _viewer_canvas_from_event(self, event) -> tk.Canvas:
+        widget = getattr(event, "widget", None)
+        if self._popout_canvas is not None and widget is self._popout_canvas:
+            return self._popout_canvas
+        return self._canvas
+
+    def _viewer_render_state(self, canvas: Optional[tk.Canvas] = None) -> tuple[float, tuple[int, int], tuple[int, int]]:
+        if canvas is not None and self._popout_canvas is not None and canvas is self._popout_canvas:
+            return self._popout_render_scale, self._popout_render_origin, self._popout_render_size
+        return self._render_scale, self._render_origin, self._render_size
+
+    def _set_viewer_render_state(
+        self,
+        canvas: tk.Canvas,
+        render_scale: float,
+        render_origin: tuple[int, int],
+        render_size: tuple[int, int],
+    ) -> None:
+        if self._popout_canvas is not None and canvas is self._popout_canvas:
+            self._popout_render_scale = render_scale
+            self._popout_render_origin = render_origin
+            self._popout_render_size = render_size
+            return
+        self._render_scale = render_scale
+        self._render_origin = render_origin
+        self._render_size = render_size
+
+    def _viewer_reset_viewport(self, canvas: Optional[tk.Canvas] = None) -> bool:
+        if canvas is not None and self._popout_canvas is not None and canvas is self._popout_canvas:
+            return self._popout_reset_viewport
+        return self._reset_viewport
+
+    def _set_viewer_reset_viewport(self, canvas: Optional[tk.Canvas], value: bool) -> None:
+        if canvas is not None and self._popout_canvas is not None and canvas is self._popout_canvas:
+            self._popout_reset_viewport = value
+            return
+        self._reset_viewport = value
+
     def _render_scene(self) -> None:
+        self._render_scene_to_canvas(self._canvas)
+        if self._popout_canvas is not None and self._viewer_popout is not None and self._viewer_popout.winfo_exists():
+            self._render_scene_to_canvas(self._popout_canvas)
+        self._update_status_text()
+
+    def _render_scene_to_canvas(self, canvas: tk.Canvas) -> None:
         image = self._current_image
         if image is None:
-            self._canvas.delete("all")
-            self._canvas.configure(scrollregion=(0, 0, 1, 1))
-            self._render_size = (1, 1)
-            self._render_origin = (0, 0)
-            self._zoom_var.set("Zoom: fit 100% | image 100%")
+            canvas.delete("all")
+            canvas.configure(scrollregion=(0, 0, 1, 1))
+            self._set_viewer_render_state(canvas, 1.0, (0, 0), (1, 1))
+            if canvas is self._canvas:
+                self._zoom_var.set("Zoom: fit 100% | image 100%")
             return
         img_h, img_w = image.shape[:2]
-        canvas_w = max(1, self._canvas.winfo_width())
-        canvas_h = max(1, self._canvas.winfo_height())
+        canvas_w = max(1, canvas.winfo_width())
+        canvas_h = max(1, canvas.winfo_height())
         if canvas_w < 16 or canvas_h < 16:
             self.after(20, self._render_scene)
             return
-        fit_scale = self._compute_fit_scale(img_w, img_h)
-        self._render_scale = max(0.01, fit_scale * self._zoom)
-        render_w = max(1, int(round(img_w * self._render_scale)))
-        render_h = max(1, int(round(img_h * self._render_scale)))
-        interpolation = cv2.INTER_AREA if self._render_scale < 1.0 else cv2.INTER_LINEAR
+        fit_scale = self._compute_fit_scale(img_w, img_h, canvas=canvas)
+        render_scale = max(0.01, fit_scale * self._zoom)
+        render_w = max(1, int(round(img_w * render_scale)))
+        render_h = max(1, int(round(img_h * render_scale)))
+        interpolation = cv2.INTER_AREA if render_scale < 1.0 else cv2.INTER_LINEAR
         if render_w != img_w or render_h != img_h:
             scene = cv2.resize(image, (render_w, render_h), interpolation=interpolation)
         else:
@@ -3538,8 +3681,8 @@ class AssistedPoseCurationWindow(tk.Toplevel):
 
         def _scale_xy(x: float, y: float) -> tuple[int, int]:
             return (
-                int(round(float(x) * self._render_scale)),
-                int(round(float(y) * self._render_scale)),
+                int(round(float(x) * render_scale)),
+                int(round(float(y) * render_scale)),
             )
 
         def _draw_text(text: str, origin: tuple[int, int], color: tuple[int, int, int], font_scale: float) -> None:
@@ -3659,13 +3802,18 @@ class AssistedPoseCurationWindow(tk.Toplevel):
                     )
 
         rgb = cv2.cvtColor(scene, cv2.COLOR_BGR2RGB)
-        self._photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        if canvas is self._canvas:
+            self._photo = photo
+        else:
+            self._popout_photo = photo
         x_frac = 0.0
         y_frac = 0.0
-        if not self._reset_viewport:
+        reset_viewport = self._viewer_reset_viewport(canvas)
+        if not reset_viewport:
             try:
-                x_frac = float(self._canvas.xview()[0])
-                y_frac = float(self._canvas.yview()[0])
+                x_frac = float(canvas.xview()[0])
+                y_frac = float(canvas.yview()[0])
             except Exception:
                 x_frac = 0.0
                 y_frac = 0.0
@@ -3674,22 +3822,21 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         origin_y = max(0, int(round((canvas_h - render_h) / 2.0)))
         scroll_w = max(canvas_w, origin_x + render_w)
         scroll_h = max(canvas_h, origin_y + render_h)
-        self._render_origin = (origin_x, origin_y)
-        self._canvas.delete("all")
-        self._canvas.create_image(origin_x, origin_y, image=self._photo, anchor="nw")
-        self._canvas.configure(scrollregion=(0, 0, scroll_w, scroll_h))
-        self._render_size = (scroll_w, scroll_h)
-        if self._reset_viewport:
-            self._canvas.xview_moveto(0.0)
-            self._canvas.yview_moveto(0.0)
-            self._reset_viewport = False
+        self._set_viewer_render_state(canvas, render_scale, (origin_x, origin_y), (scroll_w, scroll_h))
+        canvas.delete("all")
+        canvas.create_image(origin_x, origin_y, image=photo, anchor="nw")
+        canvas.configure(scrollregion=(0, 0, scroll_w, scroll_h))
+        if reset_viewport:
+            canvas.xview_moveto(0.0)
+            canvas.yview_moveto(0.0)
+            self._set_viewer_reset_viewport(canvas, False)
         else:
-            self._canvas.xview_moveto(max(0.0, min(1.0, x_frac)))
-            self._canvas.yview_moveto(max(0.0, min(1.0, y_frac)))
-        self._zoom_var.set(
-            f"Zoom: fit {int(round(self._zoom * 100.0))}% | image {int(round(self._render_scale * 100.0))}%"
-        )
-        self._update_status_text()
+            canvas.xview_moveto(max(0.0, min(1.0, x_frac)))
+            canvas.yview_moveto(max(0.0, min(1.0, y_frac)))
+        if canvas is self._canvas:
+            self._zoom_var.set(
+                f"Zoom: fit {int(round(self._zoom * 100.0))}% | image {int(round(render_scale * 100.0))}%"
+            )
 
     def _update_status_text(self) -> None:
         if self._current_path is None or self._current_image is None:
@@ -3712,14 +3859,22 @@ class AssistedPoseCurationWindow(tk.Toplevel):
             f" | inst {self._active_instance_index + 1}/{len(self._frame_instances)} | labeled={labeled_count}{class_text}{label_text}{bbox_text}"
         )
 
-    def _canvas_to_image(self, event_x: float, event_y: float) -> tuple[float, float]:
+    def _canvas_to_image(
+        self,
+        event_x: float,
+        event_y: float,
+        *,
+        canvas: Optional[tk.Canvas] = None,
+    ) -> tuple[float, float]:
         if self._current_image is None:
             return 0.0, 0.0
-        canvas_x = self._canvas.canvasx(event_x) - float(self._render_origin[0])
-        canvas_y = self._canvas.canvasy(event_y) - float(self._render_origin[1])
+        target_canvas = canvas or self._canvas
+        render_scale, render_origin, _render_size = self._viewer_render_state(target_canvas)
+        canvas_x = target_canvas.canvasx(event_x) - float(render_origin[0])
+        canvas_y = target_canvas.canvasy(event_y) - float(render_origin[1])
         img_h, img_w = self._current_image.shape[:2]
-        x = max(0.0, min(float(img_w - 1), float(canvas_x) / max(self._render_scale, 1e-6)))
-        y = max(0.0, min(float(img_h - 1), float(canvas_y) / max(self._render_scale, 1e-6)))
+        x = max(0.0, min(float(img_w - 1), float(canvas_x) / max(render_scale, 1e-6)))
+        y = max(0.0, min(float(img_h - 1), float(canvas_y) / max(render_scale, 1e-6)))
         return x, y
 
     def _instance_bbox_xyxy(self, instance: dict[str, Any]) -> Optional[tuple[int, int, int, int]]:
@@ -3733,8 +3888,15 @@ class AssistedPoseCurationWindow(tk.Toplevel):
             padding_ratio=max(0.0, _safe_float(self._bbox_padding_var.get(), 0.15)),
         )
 
-    def _find_nearest_keypoint(self, x: float, y: float) -> Optional[tuple[int, int]]:
-        threshold = max(8.0, 12.0 / max(self._render_scale, 1e-6))
+    def _find_nearest_keypoint(
+        self,
+        x: float,
+        y: float,
+        *,
+        render_scale: Optional[float] = None,
+    ) -> Optional[tuple[int, int]]:
+        scale = self._render_scale if render_scale is None else render_scale
+        threshold = max(8.0, 12.0 / max(scale, 1e-6))
         best_hit: Optional[tuple[int, int]] = None
         best_dist = float("inf")
         for inst_idx, instance in enumerate(self._frame_instances):
@@ -3768,8 +3930,10 @@ class AssistedPoseCurationWindow(tk.Toplevel):
             return
         if self._current_image is None or not self._current_pose:
             return
-        x, y = self._canvas_to_image(event.x, event.y)
-        hit = self._find_nearest_keypoint(x, y)
+        canvas = self._viewer_canvas_from_event(event)
+        render_scale, _origin, _size = self._viewer_render_state(canvas)
+        x, y = self._canvas_to_image(event.x, event.y, canvas=canvas)
+        hit = self._find_nearest_keypoint(x, y, render_scale=render_scale)
         if hit is not None:
             inst_idx, idx = hit
             self._active_instance_index = inst_idx
@@ -3797,7 +3961,8 @@ class AssistedPoseCurationWindow(tk.Toplevel):
     def _on_canvas_drag(self, event) -> None:
         if self._dragging_kp_index is None or self._current_image is None:
             return
-        x, y = self._canvas_to_image(event.x, event.y)
+        canvas = self._viewer_canvas_from_event(event)
+        x, y = self._canvas_to_image(event.x, event.y, canvas=canvas)
         idx = self._dragging_kp_index
         if not (0 <= idx < len(self._current_pose)):
             return
@@ -3816,8 +3981,10 @@ class AssistedPoseCurationWindow(tk.Toplevel):
     def _on_canvas_right_click(self, event) -> None:
         if self._current_image is None:
             return
-        x, y = self._canvas_to_image(event.x, event.y)
-        hit = self._find_nearest_keypoint(x, y)
+        canvas = self._viewer_canvas_from_event(event)
+        render_scale, _origin, _size = self._viewer_render_state(canvas)
+        x, y = self._canvas_to_image(event.x, event.y, canvas=canvas)
+        hit = self._find_nearest_keypoint(x, y, render_scale=render_scale)
         if hit is None:
             bbox_hit = self._find_instance_at_point(x, y)
             if bbox_hit is not None:
@@ -3844,11 +4011,13 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         self._render_scene()
 
     def _pan_start(self, event):
-        self._canvas.scan_mark(event.x, event.y)
+        canvas = self._viewer_canvas_from_event(event)
+        canvas.scan_mark(event.x, event.y)
         return "break"
 
     def _pan_drag(self, event):
-        self._canvas.scan_dragto(event.x, event.y, gain=1)
+        canvas = self._viewer_canvas_from_event(event)
+        canvas.scan_dragto(event.x, event.y, gain=1)
         return "break"
 
     def _on_mousewheel(self, event):
@@ -3858,7 +4027,7 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         delta = int(getattr(event, "delta", 0))
         if delta:
             steps = -1 if delta > 0 else 1
-            self._canvas.yview_scroll(steps * 3, "units")
+            self._viewer_canvas_from_event(event).yview_scroll(steps * 3, "units")
         return "break"
 
     def _on_shift_mousewheel(self, event):
@@ -3868,103 +4037,198 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         delta = int(getattr(event, "delta", 0))
         if delta:
             steps = -1 if delta > 0 else 1
-            self._canvas.xview_scroll(steps * 3, "units")
+            self._viewer_canvas_from_event(event).xview_scroll(steps * 3, "units")
         return "break"
 
     def _on_ctrl_mousewheel(self, event):
+        canvas = self._viewer_canvas_from_event(event)
         delta = int(getattr(event, "delta", 0))
         if delta > 0:
-            self._set_zoom(self._zoom * 1.2, focus_canvas_xy=(event.x, event.y))
+            self._set_zoom(self._zoom * 1.2, focus_canvas_xy=(event.x, event.y), canvas=canvas)
         elif delta < 0:
-            self._set_zoom(self._zoom / 1.2, focus_canvas_xy=(event.x, event.y))
+            self._set_zoom(self._zoom / 1.2, focus_canvas_xy=(event.x, event.y), canvas=canvas)
         return "break"
 
-    def _on_linux_wheel_up(self, _event):
-        self._canvas.yview_scroll(-3, "units")
+    def _on_linux_wheel_up(self, event):
+        self._viewer_canvas_from_event(event).yview_scroll(-3, "units")
         return "break"
 
-    def _on_linux_wheel_down(self, _event):
-        self._canvas.yview_scroll(3, "units")
+    def _on_linux_wheel_down(self, event):
+        self._viewer_canvas_from_event(event).yview_scroll(3, "units")
         return "break"
 
     def _on_linux_ctrl_wheel_up(self, event):
-        self._set_zoom(self._zoom * 1.2, focus_canvas_xy=(event.x, event.y))
+        self._set_zoom(self._zoom * 1.2, focus_canvas_xy=(event.x, event.y), canvas=self._viewer_canvas_from_event(event))
         return "break"
 
     def _on_linux_ctrl_wheel_down(self, event):
-        self._set_zoom(self._zoom / 1.2, focus_canvas_xy=(event.x, event.y))
+        self._set_zoom(self._zoom / 1.2, focus_canvas_xy=(event.x, event.y), canvas=self._viewer_canvas_from_event(event))
         return "break"
 
-    def _zoom_in(self) -> None:
-        self._set_zoom(self._zoom * 1.2)
+    def _zoom_in(self, *, canvas: Optional[tk.Canvas] = None) -> None:
+        self._set_zoom(self._zoom * 1.2, canvas=canvas)
 
-    def _zoom_out(self) -> None:
-        self._set_zoom(self._zoom / 1.2)
+    def _zoom_out(self, *, canvas: Optional[tk.Canvas] = None) -> None:
+        self._set_zoom(self._zoom / 1.2, canvas=canvas)
 
-    def _zoom_actual(self) -> None:
+    def _zoom_actual(self, *, canvas: Optional[tk.Canvas] = None) -> None:
         if self._current_image is None:
             return
         img_h, img_w = self._current_image.shape[:2]
-        fit_scale = self._compute_fit_scale(img_w, img_h)
+        fit_scale = self._compute_fit_scale(img_w, img_h, canvas=canvas)
         if fit_scale <= 0.0:
             return
-        self._set_zoom(1.0 / fit_scale)
+        self._set_zoom(1.0 / fit_scale, canvas=canvas)
 
     def _zoom_fit(self) -> None:
         self._zoom = 1.0
         self._reset_viewport = True
+        self._popout_reset_viewport = True
         self._render_scene()
+
+    def _bbox_for_pose(self, pose: list[PosePoint] | object) -> Optional[tuple[int, int, int, int]]:
+        if self._current_image is None or not isinstance(pose, list) or not pose_has_any_labels(pose):
+            return None
+        img_h, img_w = self._current_image.shape[:2]
+        padding = max(0.0, _safe_float(self._bbox_padding_var.get(), 0.15))
+        return pose_bbox_xyxy(pose, img_w, img_h, padding_ratio=padding)
+
+    def _bbox_for_instance(self, instance: dict[str, Any]) -> Optional[tuple[int, int, int, int]]:
+        bbox = self._bbox_for_pose(instance.get("pose", []))
+        if bbox is not None:
+            return bbox
+        return self._bbox_for_pose(instance.get("assist_pose", []))
+
+    def _bbox_union(self, boxes: list[tuple[int, int, int, int]]) -> Optional[tuple[int, int, int, int]]:
+        if not boxes:
+            return None
+        return (
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        )
+
+    def _subject_bbox(self, *, active_only: bool = False) -> Optional[tuple[int, int, int, int]]:
+        if self._current_image is None:
+            return None
+        if active_only:
+            if not self._frame_instances:
+                return None
+            return self._bbox_for_instance(self._ensure_active_instance())
+
+        boxes: list[tuple[int, int, int, int]] = []
+        for instance in self._frame_instances:
+            bbox = self._bbox_for_instance(instance)
+            if bbox is not None:
+                boxes.append(bbox)
+        for instance in self._assist_instances:
+            bbox = self._bbox_for_pose(instance.get("pose", []))
+            if bbox is not None:
+                boxes.append(bbox)
+        return self._bbox_union(boxes)
+
+    def _bbox_center(self, bbox: tuple[int, int, int, int]) -> tuple[float, float]:
+        return ((float(bbox[0]) + float(bbox[2])) / 2.0, (float(bbox[1]) + float(bbox[3])) / 2.0)
+
+    def _zoom_for_bbox(self, bbox: tuple[int, int, int, int], *, canvas: Optional[tk.Canvas] = None) -> Optional[float]:
+        if self._current_image is None:
+            return None
+        target_canvas = canvas or self._canvas
+        canvas_w = max(1, target_canvas.winfo_width())
+        canvas_h = max(1, target_canvas.winfo_height())
+        if canvas_w < 16 or canvas_h < 16:
+            return None
+        img_h, img_w = self._current_image.shape[:2]
+        bbox_w = max(1.0, float(bbox[2] - bbox[0]))
+        bbox_h = max(1.0, float(bbox[3] - bbox[1]))
+        desired_scale = min(canvas_w / (bbox_w * 1.35), canvas_h / (bbox_h * 1.35))
+        fit_scale = self._compute_fit_scale(img_w, img_h, canvas=target_canvas)
+        if fit_scale <= 0.0:
+            return None
+        return max(1.0, min(self._zoom_max, desired_scale / fit_scale))
+
+    def _focus_bbox(
+        self,
+        bbox: Optional[tuple[int, int, int, int]],
+        *,
+        adjust_zoom: bool,
+        canvas: Optional[tk.Canvas] = None,
+    ) -> None:
+        if bbox is None or self._current_image is None:
+            return
+        target_canvas = canvas or self._canvas
+        if adjust_zoom:
+            zoom_value = self._zoom_for_bbox(bbox, canvas=target_canvas)
+            if zoom_value is not None and abs(zoom_value - self._zoom) > 1e-6:
+                self._set_viewer_reset_viewport(self._canvas, False)
+                if self._popout_canvas is not None:
+                    self._set_viewer_reset_viewport(self._popout_canvas, False)
+                self._zoom = zoom_value
+                self._render_scene()
+        center = self._bbox_center(bbox)
+        self._focus_view_on_image_point(center, canvas=target_canvas)
+        if target_canvas is self._canvas and self._popout_canvas is not None:
+            self._focus_view_on_image_point(center, canvas=self._popout_canvas)
+
+    def _auto_focus_frame_subjects(self, *, adjust_zoom: bool) -> None:
+        self._focus_bbox(self._subject_bbox(active_only=False), adjust_zoom=adjust_zoom)
+
+    def _focus_active_instance(self, *, adjust_zoom: bool) -> None:
+        self._focus_bbox(self._subject_bbox(active_only=True), adjust_zoom=adjust_zoom)
 
     def _preferred_zoom_focus_image_xy(self) -> tuple[float, float] | None:
         if self._current_image is None:
             return None
-        img_h, img_w = self._current_image.shape[:2]
-        padding = max(0.0, _safe_float(self._bbox_padding_var.get(), 0.15))
-        for pose in (self._current_pose, self._assist_pose):
-            bbox = pose_bbox_xyxy(pose, img_w, img_h, padding_ratio=padding)
-            if bbox is None:
-                continue
-            x1, y1, x2, y2 = bbox
-            return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+        bbox = self._subject_bbox(active_only=True)
+        if bbox is not None:
+            return self._bbox_center(bbox)
+        bbox = self._subject_bbox(active_only=False)
+        if bbox is not None:
+            return self._bbox_center(bbox)
         return None
 
     def _focus_view_on_image_point(
         self,
         image_xy: tuple[float, float],
         *,
+        canvas: Optional[tk.Canvas] = None,
         canvas_xy: tuple[float, float] | None = None,
     ) -> None:
         if self._current_image is None:
             return
-        target_x = float(self._render_origin[0]) + (float(image_xy[0]) * self._render_scale)
-        target_y = float(self._render_origin[1]) + (float(image_xy[1]) * self._render_scale)
+        target_canvas = canvas or self._canvas
+        render_scale, render_origin, render_size = self._viewer_render_state(target_canvas)
+        target_x = float(render_origin[0]) + (float(image_xy[0]) * render_scale)
+        target_y = float(render_origin[1]) + (float(image_xy[1]) * render_scale)
         if canvas_xy is None:
-            view_w = max(1, self._canvas.winfo_width())
-            view_h = max(1, self._canvas.winfo_height())
+            view_w = max(1, target_canvas.winfo_width())
+            view_h = max(1, target_canvas.winfo_height())
             cx = view_w / 2.0
             cy = view_h / 2.0
         else:
             cx, cy = canvas_xy
-        total_w, total_h = self._render_size
-        view_w = max(1, self._canvas.winfo_width())
-        view_h = max(1, self._canvas.winfo_height())
+        total_w, total_h = render_size
+        view_w = max(1, target_canvas.winfo_width())
+        view_h = max(1, target_canvas.winfo_height())
         x_span = max(1.0, float(total_w - view_w))
         y_span = max(1.0, float(total_h - view_h))
         x_frac = 0.0 if total_w <= view_w else max(0.0, min(1.0, float(target_x - cx) / x_span))
         y_frac = 0.0 if total_h <= view_h else max(0.0, min(1.0, float(target_y - cy) / y_span))
-        self._canvas.xview_moveto(x_frac)
-        self._canvas.yview_moveto(y_frac)
+        target_canvas.xview_moveto(x_frac)
+        target_canvas.yview_moveto(y_frac)
 
-    def _zoom_to_subject(self) -> None:
+    def _zoom_to_subject(self, *, canvas: Optional[tk.Canvas] = None) -> None:
         focus_image_xy = self._preferred_zoom_focus_image_xy()
         if focus_image_xy is None:
-            self._zoom_in()
+            self._zoom_in(canvas=canvas)
             return
-        self._set_zoom(self._zoom * 1.2, focus_image_xy=focus_image_xy)
+        self._set_zoom(self._zoom * 1.2, focus_image_xy=focus_image_xy, canvas=canvas)
 
-    def _compute_fit_scale(self, img_w: int, img_h: int) -> float:
-        canvas_w = max(1, self._canvas.winfo_width())
-        canvas_h = max(1, self._canvas.winfo_height())
+    def _compute_fit_scale(self, img_w: int, img_h: int, *, canvas: Optional[tk.Canvas] = None) -> float:
+        target_canvas = canvas or self._canvas
+        canvas_w = max(1, target_canvas.winfo_width())
+        canvas_h = max(1, target_canvas.winfo_height())
         fit_scale = min(canvas_w / max(img_w, 1), canvas_h / max(img_h, 1))
         return max(0.01, float(fit_scale))
 
@@ -3974,18 +4238,21 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         focus_canvas_xy: tuple[float, float] | None = None,
         *,
         focus_image_xy: tuple[float, float] | None = None,
+        canvas: Optional[tk.Canvas] = None,
     ) -> None:
         if self._current_image is None:
             return
+        target_canvas = canvas or self._canvas
         zoom_value = max(self._zoom_min, min(self._zoom_max, float(zoom_value)))
         if abs(zoom_value - self._zoom) < 1e-6:
             return
-        old_scale = max(self._render_scale, 1e-6)
+        old_scale, old_origin, _old_size = self._viewer_render_state(target_canvas)
+        old_scale = max(old_scale, 1e-6)
         if focus_canvas_xy is not None:
             cx, cy = focus_canvas_xy
             focus_image_xy = (
-                max(0.0, (float(self._canvas.canvasx(cx)) - float(self._render_origin[0])) / old_scale),
-                max(0.0, (float(self._canvas.canvasy(cy)) - float(self._render_origin[1])) / old_scale),
+                max(0.0, (float(target_canvas.canvasx(cx)) - float(old_origin[0])) / old_scale),
+                max(0.0, (float(target_canvas.canvasy(cy)) - float(old_origin[1])) / old_scale),
             )
         elif focus_image_xy is None:
             focus_image_xy = self._preferred_zoom_focus_image_xy()
@@ -3993,10 +4260,12 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         self._render_scene()
         if focus_image_xy is None:
             return
-        self._focus_view_on_image_point(focus_image_xy, canvas_xy=focus_canvas_xy)
+        self._focus_view_on_image_point(focus_image_xy, canvas=target_canvas, canvas_xy=focus_canvas_xy)
+        if focus_canvas_xy is None and target_canvas is self._canvas and self._popout_canvas is not None:
+            self._focus_view_on_image_point(focus_image_xy, canvas=self._popout_canvas)
 
-    def _on_ctrl_middle_click(self, _event):
-        self._zoom_to_subject()
+    def _on_ctrl_middle_click(self, event):
+        self._zoom_to_subject(canvas=self._viewer_canvas_from_event(event))
         return "break"
 
     def _create_split(self, *, warn_on_pending_review: bool = True) -> None:
@@ -4271,6 +4540,7 @@ class AssistedPoseCurationWindow(tk.Toplevel):
             if save_choice:
                 if not self._save_current_pose():
                     return
+        self._close_viewer_popout()
         self.destroy()
 
 

@@ -41,6 +41,25 @@ a:hover {
   backdrop-filter: blur(12px);
 }
 
+.md-grid {
+  max-width: 86rem;
+}
+
+.md-header__inner {
+  min-height: 3rem;
+}
+
+.md-header__button.md-logo {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  margin: 0.35rem 0.2rem;
+  padding: 0;
+  overflow: hidden;
+}
+
 .md-header__title,
 .md-tabs__link,
 .md-nav__link {
@@ -54,12 +73,17 @@ a:hover {
 }
 
 .md-header__button.md-logo img {
-  height: 34px;
+  display: block;
+  max-height: 1.9rem;
+  max-width: 1.9rem;
+  height: auto;
   width: auto;
+  object-fit: contain;
 }
 
 .md-content__inner {
   margin-top: 0;
+  max-width: none;
 }
 
 .landing-hero {
