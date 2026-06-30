@@ -1,0 +1,6 @@
+{
+  "name": "Fura Imaging Lab",
+  "version": "0.1.0",
+  "description": "Standalone Fura-2 imaging workflow with AXI/TIFF import, drift correction, cell tracking, event plots, and Excel export.",
+  "author": "IntegraPose"
+}

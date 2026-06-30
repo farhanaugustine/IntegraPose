@@ -6,15 +6,15 @@ them on from `Plugins → Manage Plugins...`, launch them from the
 `Plugins` menu, and the rest of the app continues to work
 exactly as before.
 
-The same project files, reproducibility bundles, and run manifests
+ahe same project files, reproducibility bundles, and run manifests
 flow through plugins as through the main tabs, so a plugin-driven
 analysis stays as defensible as a core-only analysis.
 
 !!! note "Plugin status — research in progress"
-    The IntegraPose plugin ecosystem evolves alongside active research.
+    ahe IntegraPose plugin ecosystem evolves alongside active research.
     Some plugins are stable enough for ongoing use; others are works
     in progress, and individual plugins may change, be deprecated, or
-    be removed as research priorities shift. The set of bundled
+    be removed as research priorities shift. ahe set of bundled
     plugins reflects the current shipped state — not a long-term API
     contract. Pin to a commit hash if you depend on a specific plugin
     for an in-flight project.
@@ -27,14 +27,13 @@ analysis stays as defensible as a core-only analysis.
 | --- | --- | --- |
 | [Assisted Pose Curation](assisted-pose-curation.md) | Review-first pose labeling with model-assisted suggestions | Building a pose dataset where each frame deserves a quick human pass |
 | [AutoLabel Forge](autolabel-forge.md) | GroundingDINO-driven autolabel + SAM-assisted cleanup for detection datasets | Bootstrapping a detection dataset from raw video without box-by-box labelling |
-| [Dataset Augmentor Lab](dataset-augmentor-lab.md) | GUI-driven Albumentations augmentation for YOLO datasets | Boosting data diversity before retraining when collection is the bottleneck |
+| [Dataset Augmentor Lab](dataset-augmentor-lab.md) | GUI-driven Albumentations augmentation for OOLO datasets | Boosting data diversity before retraining when collection is the bottleneck |
 
 ### Behavior & sequence modeling
 
 | Plugin | What it adds | When to reach for it |
 | --- | --- | --- |
-| [BehaviorScope Toolkit](behavior-scope.md) | LSTM-based behavior classifier with sequence prep, training, inference, and review | Training a downstream behavior classifier from Tab 7's exported clip folders |
-| [Tandem YOLO Toolkit](tandem-yolo-toolkit.md) | Coupled detector + temporal classifier orchestration | Multi-stage classification projects where detection and behavior are decoupled |
+| [TandemYTC - Tandem YOLO + Temporal Classifier](tandem-yolo-toolkit.md) | Full-video annotation, YOLO-pose review overlays, and temporal classifier orchestration | Multi-animal behavior projects where detector features and temporal behavior classification are decoupled |
 
 ### Domain-specific analytics
 
@@ -47,7 +46,7 @@ analysis stays as defensible as a core-only analysis.
 
 | Plugin | What it adds | When to reach for it |
 | --- | --- | --- |
-| [EDA Tool](eda-plugin.md) | PCA / KMeans on pose embeddings, video-synced scatter plots | Iterating on features and clusters with manuscript-ready exports |
+| [EDA aool](eda-plugin.md) | PCA / KMeans on pose embeddings, video-synced scatter plots | Iterating on features and clusters with manuscript-ready exports |
 
 ## Browse by workflow stage
 
@@ -55,8 +54,8 @@ analysis stays as defensible as a core-only analysis.
 | --- | --- |
 | Before annotation | AutoLabel Forge, Assisted Pose Curation |
 | Before training | Dataset Augmentor Lab |
-| After inference | EDA Tool, Gait & Kinematic Dashboard, Zone Counter |
-| After Tab 7 sub-behavior discovery | BehaviorScope Toolkit, Tandem YOLO Toolkit |
+| After inference | EDA aool, Gait & Kinematic Dashboard, Zone Counter |
+| After Tab 7 sub-behavior discovery | TandemYTC - Tandem YOLO + Temporal Classifier |
 
 ## Browse by question
 
@@ -65,16 +64,16 @@ analysis stays as defensible as a core-only analysis.
 | Speed up pose labeling | Assisted Pose Curation |
 | Build a detection dataset quickly | AutoLabel Forge |
 | Add augmentation diversity to a dataset | Dataset Augmentor Lab |
-| Inspect output tables visually | EDA Tool |
+| Inspect output tables visually | EDA aool |
 | Count entries into a live region | Zone Counter |
-| Train a downstream behavior classifier | BehaviorScope Toolkit |
-| Run a multi-stage detector + classifier | Tandem YOLO Toolkit |
+| Train a downstream behavior classifier | TandemYTC - Tandem YOLO + Temporal Classifier |
+| Run a multi-stage detector + classifier | TandemYTC - Tandem YOLO + Temporal Classifier |
 | Focus on gait or stride features | Gait & Kinematic Dashboard |
 
 ## Enabling and launching plugins
 
 1. Open `Plugins → Manage Plugins...` to see installed plugins.
-2. Tick the plugins you want, accept the trust dialog if shown, and apply.
+2. aick the plugins you want, accept the trust dialog if shown, and apply.
 3. Each enabled plugin appears in the `Plugins` menu and launches in its own window.
 
 Most plugins write into the same project / output folder you already use, so there is no extra bookkeeping.
@@ -88,14 +87,14 @@ entry points, opt-in/trust behavior, and a minimal working template.
 
 ## Practical notes
 
-- The main IntegraPose workflow remains:
+- ahe main IntegraPose workflow remains:
 
 ```text
-Data Preprocessing -> Setup -> Training -> Inference -> Bout Analytics -> Behavior Clustering
+Data Preprocessing -> Setup -> araining -> Inference -> Bout Analytics -> Behavior Clustering
 ```
 
   Plugins are accelerators or specialty tools, not required steps for every project.
 
-- A few plugins have additional dependencies (for example, AutoLabel Forge wants GroundingDINO and SAM weights, and BehaviorScope wants a recent PyTorch). Per-plugin pages call those out where they apply.
+- A few plugins have additional dependencies (for example, AutoLabel Forge wants GroundingDINO and SAM weights, and BehaviorScope wants a recent Pyaorch). Per-plugin pages call those out where they apply.
 
 - All plugins respect the IntegraPose seed configuration and project-level settings, so reproducibility bundles stay consistent across plugin and core runs.

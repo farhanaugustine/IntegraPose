@@ -13,6 +13,7 @@ _DEFAULT_TRUSTED = {
     "plugin_autolabel_forge",
     "plugin_dataset_augmentor_lab",
     "plugin_eda",
+    "plugin_fura_imaging_lab",
     "plugin_gait_kinematics",
     "plugin_tandem_yolo_toolkit",
     "plugin_behavior_scope",
@@ -73,19 +74,6 @@ def get_trust_state(plugin_path: Path) -> Optional[str]:
     return trust_store.get(str(plugin_path.resolve()))
 
 
-def clear_trust_state(plugin_path: Path) -> bool:
-    """Remove a stored allow/deny decision for a third-party plugin."""
-    if is_bundled_plugin_path(plugin_path):
-        return False
-    trust_store = _load_trust_store()
-    key = str(plugin_path.resolve())
-    if key not in trust_store:
-        return False
-    del trust_store[key]
-    _save_trust_store(trust_store)
-    return True
-
-
 def get_plugin_metadata(plugin_path: Path) -> PluginMetadata:
     """Load metadata from plugin.json when available, otherwise fall back to defaults."""
     manifest, _manifest_path = _load_manifest(plugin_path)
@@ -133,14 +121,13 @@ def ensure_plugin_trusted(plugin_path: Path, prompt: Optional[PromptFn]) -> Plug
     trust_store = _load_trust_store()
     key = str(plugin_path.resolve())
     existing = trust_store.get(key)
-    reprompting_after_denial = existing == "deny"
     if existing == "allow":
         return PluginTrustDecision(
             allowed=True,
             level="DEBUG",
             message=f"Previously trusted plugin '{metadata.name}' at {plugin_path}",
         )
-    if existing == "deny" and prompt is None:
+    if existing == "deny":
         return PluginTrustDecision(
             allowed=False,
             level="WARNING",
@@ -168,13 +155,10 @@ def ensure_plugin_trusted(plugin_path: Path, prompt: Optional[PromptFn]) -> Plug
 
     _update_trust_store(key, should_trust)
     if should_trust:
-        message = f"Plugin '{metadata.name}' trusted by user confirmation."
-        if reprompting_after_denial:
-            message = f"Plugin '{metadata.name}' trust denial was replaced by user confirmation."
         return PluginTrustDecision(
             allowed=True,
             level="INFO",
-            message=message,
+            message=f"Plugin '{metadata.name}' trusted by user confirmation.",
         )
     return PluginTrustDecision(
         allowed=False,

@@ -1,0 +1,6 @@
+# Optional dependency add-ons for Fura Imaging Lab.
+#
+# Install after the main GUI environment:
+#   pip install -r requirements.txt
+#   pip install -r integra_pose/plugins/plugin_fura_imaging_lab/requirements.txt
+tifffile

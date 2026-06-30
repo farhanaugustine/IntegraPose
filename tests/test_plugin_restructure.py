@@ -23,13 +23,6 @@ from integra_pose.utils.config_manager import ConfigManager
             "launch",
             "module",
         ),
-        (
-            "integra_pose.plugins.plugin_tandem_yolo_toolkit.plugin",
-            "integra_pose.plugins.plugin_tandem_yolo_toolkit.tandem_yolo_classifier",
-            "tandem_yolo_classifier",
-            "load_config",
-            "module",
-        ),
     ],
 )
 def test_plugin_imports_use_local_packages(

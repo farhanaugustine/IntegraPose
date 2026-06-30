@@ -1,3 +1,3 @@
-"""Standalone Tandem YOLO classifier toolkit plugin."""
+"""TandemYTC plugin."""
 
 __all__ = []

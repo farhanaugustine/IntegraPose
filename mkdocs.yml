@@ -77,10 +77,10 @@ nav:
       - 'AutoLabel Forge': 'plugins/autolabel-forge.md'
       - 'Dataset Augmentor Lab': 'plugins/dataset-augmentor-lab.md'
     - 'Behavior & sequence modeling':
-      - 'BehaviorScope Toolkit': 'plugins/behavior-scope.md'
-      - 'Tandem YOLO Toolkit': 'plugins/tandem-yolo-toolkit.md'
+      - 'TandemYTC - Tandem YOLO + Temporal Classifier': 'plugins/tandem-yolo-toolkit.md'
     - 'Domain-specific analytics':
       - 'Gait & Kinematic Dashboard': 'plugins/gait-kinematics.md'
+      - 'Fura Imaging Lab': 'plugins/fura-imaging-lab.md'
       - 'Zone Counter': 'plugins/zone-counter.md'
     - 'Exploration & review':
       - 'EDA Tool': 'plugins/eda-plugin.md'

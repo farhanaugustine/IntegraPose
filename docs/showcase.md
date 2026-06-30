@@ -15,6 +15,26 @@ This page highlights a few example visual outputs from IntegraPose. These sample
 
 <div class="landing-showcase-grid">
   <div class="landing-showcase-card">
+    <img src="../assets/images/tandemytc/annotation-workspace.png" alt="TandemYTC annotation workspace screenshot">
+    <h3>TandemYTC workspace</h3>
+    <p>Shows full-video behavior annotation, timeline review, behavior hotkeys, and skeleton-cache controls for YOLO-pose temporal classifier projects.</p>
+  </div>
+  <div class="landing-showcase-card">
+    <img src="../assets/videos/samples/MARS/mars_mouse060_investigation.gif" alt="MARS mouse investigation annotation overlay">
+    <h3>MARS investigation overlay</h3>
+    <p>Shows TandemYTC-style full-video inference with behavior confidence, tracked animals, bounding boxes, and pose keypoints over MARS mouse footage.</p>
+  </div>
+  <div class="landing-showcase-card">
+    <img src="../assets/videos/samples/MARS/mars_mouse060_mount.gif" alt="MARS mouse mount annotation overlay">
+    <h3>MARS mount overlay</h3>
+    <p>Highlights a high-confidence mount segment with multi-animal tracks, pose points, and the live behavior probability strip visible in the frame.</p>
+  </div>
+  <div class="landing-showcase-card">
+    <img src="../assets/videos/samples/MARS/mars_mouse060_contact_transition.gif" alt="MARS mouse contact transition annotation overlay">
+    <h3>MARS contact transition</h3>
+    <p>Captures a close-contact interaction where the temporal classifier probabilities shift as the animals change posture and relative position.</p>
+  </div>
+  <div class="landing-showcase-card">
     <img src="../assets/videos/samples/RealTimeBehavior.gif" alt="Real-time behavior demo in IntegraPose">
     <h3>Real-time behavior demo</h3>
     <p>Illustrates overlay-driven review and immediate visual feedback during a live-style workflow.</p>

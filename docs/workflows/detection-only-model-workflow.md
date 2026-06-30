@@ -98,7 +98,7 @@ You may also find these useful:
 | --- | --- |
 | `Zone Counter` plugin | Live zone counts during active experiments |
 | `EDA Tool` plugin | Explore output tables and quick plots |
-| `BehaviorScope Toolkit` plugin | Temporal classification workflows outside Tab 7 |
+| `TandemYTC - Tandem YOLO + Temporal Classifier` plugin | Temporal classification workflows outside Tab 7 |
 
 See the [Plugin Catalog](../plugins/plugin-catalog.md) for the full list.
 

@@ -41,25 +41,6 @@ a:hover {
   backdrop-filter: blur(12px);
 }
 
-.md-grid {
-  max-width: 86rem;
-}
-
-.md-header__inner {
-  min-height: 3rem;
-}
-
-.md-header__button.md-logo {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 2.25rem;
-  height: 2.25rem;
-  margin: 0.35rem 0.2rem;
-  padding: 0;
-  overflow: hidden;
-}
-
 .md-header__title,
 .md-tabs__link,
 .md-nav__link {
@@ -73,17 +54,12 @@ a:hover {
 }
 
 .md-header__button.md-logo img {
-  display: block;
-  max-height: 1.9rem;
-  max-width: 1.9rem;
-  height: auto;
+  height: 34px;
   width: auto;
-  object-fit: contain;
 }
 
 .md-content__inner {
   margin-top: 0;
-  max-width: none;
 }
 
 .landing-hero {
@@ -265,6 +241,26 @@ a:hover {
   margin: 0;
   padding: 0 1rem 1rem;
   color: var(--landing-muted);
+}
+
+.plugin-screenshot {
+  margin: 1.4rem 0 1.8rem;
+}
+
+.plugin-screenshot img {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--landing-border);
+  border-radius: 12px;
+  background: #f8fbfa;
+  box-shadow: var(--landing-shadow-soft);
+}
+
+.plugin-screenshot figcaption {
+  margin-top: 0.55rem;
+  color: var(--landing-muted);
+  font-size: 0.9rem;
+  line-height: 1.5;
 }
 
 .ack-logos {

@@ -1,0 +1,16 @@
+behaviors:
+  - name: Investigation
+    hotkey: I
+    color: "#3E8EDE"
+  - name: Attack
+    hotkey: A
+    color: "#D94141"
+  - name: Mount
+    hotkey: M
+    color: "#A9791E"
+  - name: Grooming
+    hotkey: G
+    color: "#22A67A"
+  - name: Locomotion
+    hotkey: L
+    color: "#6F6AD6"

@@ -1,6 +1,6 @@
 {
-  "name": "Tandem YOLO Toolkit",
-  "version": "1.0.2",
-  "description": "Coupled YOLO + temporal classifier workflow for training, dataset preparation, and real-time inference.",
+  "name": "TandemYTC - Tandem YOLO + Temporal Classifier",
+  "version": "2.0.0-alpha.1",
+  "description": "Qt full-video annotation, dataset preparation, training, and bounded-latency inference workflow for YOLO features plus temporal behavior classifiers.",
   "author": "IntegraPose"
 }

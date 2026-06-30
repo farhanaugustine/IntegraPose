@@ -10,8 +10,10 @@
 # Some plugins also have their own add-on requirement files:
 #   - integra_pose/plugins/plugin_behavior_scope/requirements.txt
 #   - integra_pose/plugins/plugin_autolabel_forge/requirements.txt
+#   - integra_pose/plugins/plugin_fura_imaging_lab/requirements.txt
 #   - requirements-albumentations-gui.txt (Dataset Augmentor Lab)
 
+PySide6>=6.5.0
 scipy==1.11.4
 seaborn==0.13.2
 statsmodels==0.14.2

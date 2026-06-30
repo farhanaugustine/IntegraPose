@@ -18,17 +18,6 @@ _PLUGIN_IMPORT_STUBS = {
         "integra_pose.plugins.plugin_gait_kinematics.gait_kinematics",
         {"launch": _noop},
     ),
-    "integra_pose.plugins.plugin_tandem_yolo_toolkit.plugin": (
-        "integra_pose.plugins.plugin_tandem_yolo_toolkit.tandem_yolo_classifier",
-        {
-            "load_config": _noop,
-            "process_clips_in_directory": _noop,
-            "process_and_relabel_files": _noop,
-            "run_training_pipeline": _noop,
-            "run_real_time_inference": _noop,
-            "launch_clipper_gui": _noop,
-        },
-    ),
 }
 
 
@@ -83,6 +72,7 @@ class FakeMenu:
     "plugin_name",
     [
         "plugin_eda",
+        "plugin_dataset_augmentor_lab",
         "plugin_gait_kinematics",
         "plugin_tandem_yolo_toolkit",
         "plugin_zone_counter",
@@ -100,8 +90,9 @@ def test_bundled_plugins_are_auto_trusted(plugin_name: str) -> None:
     ("module_path", "expected_label"),
     [
         ("integra_pose.plugins.plugin_eda.plugin", "Launch EDA Tool"),
+        ("integra_pose.plugins.plugin_dataset_augmentor_lab.plugin", "Dataset Augmentor Lab"),
         ("integra_pose.plugins.plugin_gait_kinematics.plugin", "Gait & Kinematic Dashboard"),
-        ("integra_pose.plugins.plugin_tandem_yolo_toolkit.plugin", "Tandem YOLO Toolkit"),
+        ("integra_pose.plugins.plugin_tandem_yolo_toolkit.plugin", "TandemYTC - Tandem YOLO + Temporal Classifier"),
         ("integra_pose.plugins.plugin_zone_counter.plugin", "Zone Counter"),
     ],
 )
@@ -145,44 +136,3 @@ def test_register_plugin_adds_menu_entry(module_path: str, expected_label: str) 
             if original_resolver is not None:
                 module._resolve_eda_gui = original_resolver
                 module._eda_gui_module = None
-
-def test_denied_third_party_plugin_can_be_reprompted(tmp_path, monkeypatch) -> None:
-    store_path = tmp_path / "trusted_plugins.json"
-    monkeypatch.setattr(plugin_security, "_TRUST_STORE_PATH", store_path)
-
-    plugin_dir = tmp_path / "plugin_example"
-    plugin_dir.mkdir()
-    (plugin_dir / "plugin.json").write_text(
-        '{"name": "Example Plugin", "version": "1.0.0", "author": "Test"}',
-        encoding="utf-8",
-    )
-
-    declined = plugin_security.ensure_plugin_trusted(plugin_dir, prompt=lambda _metadata: False)
-    assert declined.allowed is False
-    assert plugin_security.get_trust_state(plugin_dir) == "deny"
-
-    startup_check = plugin_security.ensure_plugin_trusted(plugin_dir, prompt=None)
-    assert startup_check.allowed is False
-    assert "denied earlier" in startup_check.message
-
-    accepted = plugin_security.ensure_plugin_trusted(plugin_dir, prompt=lambda _metadata: True)
-    assert accepted.allowed is True
-    assert plugin_security.get_trust_state(plugin_dir) == "allow"
-    assert "replaced" in accepted.message
-
-
-def test_clear_trust_state_removes_stored_decision(tmp_path, monkeypatch) -> None:
-    store_path = tmp_path / "trusted_plugins.json"
-    monkeypatch.setattr(plugin_security, "_TRUST_STORE_PATH", store_path)
-
-    plugin_dir = tmp_path / "plugin_example"
-    plugin_dir.mkdir()
-    (plugin_dir / "plugin.json").write_text('{"name": "Example Plugin"}', encoding="utf-8")
-
-    plugin_security.ensure_plugin_trusted(plugin_dir, prompt=lambda _metadata: False)
-    assert plugin_security.get_trust_state(plugin_dir) == "deny"
-
-    assert plugin_security.clear_trust_state(plugin_dir) is True
-    assert plugin_security.get_trust_state(plugin_dir) is None
-    assert plugin_security.clear_trust_state(plugin_dir) is False
-

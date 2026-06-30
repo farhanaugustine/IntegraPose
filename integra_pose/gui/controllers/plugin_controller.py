@@ -494,24 +494,6 @@ class PluginController:
         # Rebuild menu to remove plugin-provided entries.
         self.load_plugins()
 
-    def reset_plugin_trust(self, plugin: DiscoveredPlugin) -> bool:
-        cleared = plugin_security.clear_trust_state(plugin.path)
-        if cleared and plugin_opt_in.is_plugin_enabled(plugin.path):
-            plugin_opt_in.set_plugin_enabled(
-                plugin.path,
-                False,
-                name=plugin.metadata.name,
-                version=plugin.metadata.version,
-                source=plugin.source,
-            )
-        if cleared:
-            self.app.log_message(
-                f"Cleared stored trust decision for plugin '{plugin.metadata.name}'.",
-                "INFO",
-            )
-            self.load_plugins()
-        return cleared
-
     def _toast_plugin_failure(self, plugin: DiscoveredPlugin) -> None:
         toast = getattr(self.app, "_toast", None)
         if callable(toast):
@@ -668,17 +650,16 @@ class _PluginManagerWindow(tk.Toplevel):
 
         btns = ttk.Frame(self)
         btns.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
-        btns.columnconfigure(6, weight=1)
+        btns.columnconfigure(5, weight=1)
 
         ttk.Button(btns, text="Enable", command=self._enable_selected).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(btns, text="Disable", command=self._disable_selected).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(btns, text="Open Folder", command=self._open_selected_folder).grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(btns, text="Reset Trust", command=self._reset_trust_selected).grid(row=0, column=3, padx=(0, 8))
         ttk.Button(btns, text="Open Plugins Folder", command=controller.open_user_plugins_folder).grid(
-            row=0, column=4, padx=(0, 8)
+            row=0, column=3, padx=(0, 8)
         )
-        ttk.Button(btns, text="Refresh", command=self.refresh).grid(row=0, column=5, padx=(0, 8))
-        ttk.Button(btns, text="Close", command=self.destroy).grid(row=0, column=7, sticky="e")
+        ttk.Button(btns, text="Refresh", command=self.refresh).grid(row=0, column=4, padx=(0, 8))
+        ttk.Button(btns, text="Close", command=self.destroy).grid(row=0, column=6, sticky="e")
 
         self.tree.bind("<<TreeviewSelect>>", self._on_select, add="+")
         self._plugins_by_iid: dict[str, DiscoveredPlugin] = {}
@@ -756,37 +737,6 @@ class _PluginManagerWindow(tk.Toplevel):
             return
         self.controller.disable_plugin(plugin)
         self.refresh()
-
-    def _reset_trust_selected(self) -> None:
-        plugin = self._selected_plugin()
-        if plugin is None:
-            return
-        if plugin_security.is_bundled_plugin_path(plugin.path):
-            messagebox.showinfo(
-                "Reset Trust",
-                "Bundled plugins are trusted as part of the IntegraPose install and do not use a stored trust decision.",
-                parent=self,
-            )
-            return
-        if plugin_security.get_trust_state(plugin.path) is None:
-            messagebox.showinfo(
-                "Reset Trust",
-                f"No stored trust decision exists for '{plugin.metadata.name}'.",
-                parent=self,
-            )
-            return
-        if not messagebox.askyesno(
-            "Reset plugin trust?",
-            (
-                f"Clear the stored trust decision for '{plugin.metadata.name}'?\n\n"
-                "The plugin will be disabled until you enable it again and accept the trust prompt."
-            ),
-            parent=self,
-            icon=messagebox.WARNING,
-        ):
-            return
-        if self.controller.reset_plugin_trust(plugin):
-            self.refresh()
 
     def _open_selected_folder(self) -> None:
         plugin = self._selected_plugin()

@@ -112,7 +112,7 @@ class AutoLabelForgeWindow(tk.Toplevel):
         apply_adaptive_window_geometry(
             self,
             preferred_size=(1220, 860),
-            min_size=(1024, 700),
+            min_size=(900, 640),
         )
         self.style = apply_plugin_chrome(self, main_app)
 
@@ -174,7 +174,7 @@ class AutoLabelForgeWindow(tk.Toplevel):
         log_frame = ttk.LabelFrame(outer, text="Run Log", padding=8)
         log_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         log_frame.columnconfigure(0, weight=1)
-        self._log_text = tk.Text(log_frame, height=10, state="disabled", wrap="word")
+        self._log_text = tk.Text(log_frame, height=6, state="disabled", wrap="word")
         self._log_text.grid(row=0, column=0, sticky="ew")
         log_scroll = ttk.Scrollbar(log_frame, command=self._log_text.yview)
         log_scroll.grid(row=0, column=1, sticky="ns")
@@ -272,8 +272,7 @@ class AutoLabelForgeWindow(tk.Toplevel):
         frame = ttk.Frame(self._manual_tab, padding=10)
         frame.pack(fill="both", expand=True)
         frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=0)
-        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(0, weight=1)
 
         self._manual_image_dir_var = tk.StringVar()
         self._manual_label_dir_var = tk.StringVar()
@@ -284,46 +283,55 @@ class AutoLabelForgeWindow(tk.Toplevel):
         self._manual_status_var = tk.StringVar(value="Load an image folder to begin.")
         self._manual_zoom_var = tk.StringVar(value="Zoom: 100%")
 
-        left = ttk.Frame(frame)
-        left.grid(row=0, column=0, sticky="nsw", padx=(0, 10))
+        workspace = ttk.Panedwindow(frame, orient=tk.HORIZONTAL)
+        workspace.grid(row=0, column=0, sticky="nsew")
+
+        left_shell = ttk.Frame(workspace)
+        left_shell.rowconfigure(0, weight=1)
+        left_shell.columnconfigure(0, weight=1)
+        self._manual_left_canvas, left = create_scrollable_section(self, left_shell)
+        self._manual_left_canvas.configure(width=360)
         left.columnconfigure(0, weight=1)
 
         paths = ttk.LabelFrame(left, text="Input / Output", padding=10)
         paths.grid(row=0, column=0, sticky="ew")
-        paths.columnconfigure(1, weight=1)
-        self._add_path_row(paths, 0, "Image Folder:", self._manual_image_dir_var, self._manual_browse_images)
-        self._add_path_row(paths, 1, "Detection Labels Folder:", self._manual_label_dir_var, lambda: self._browse_dir(self._manual_label_dir_var))
-        self._add_path_row(paths, 2, "Segmentation Labels Folder:", self._manual_seg_dir_var, lambda: self._browse_dir(self._manual_seg_dir_var))
+        paths.columnconfigure(0, weight=1)
+        paths.columnconfigure(1, weight=0)
+        self._add_compact_path_row(paths, 0, "Image Folder:", self._manual_image_dir_var, self._manual_browse_images)
+        self._add_compact_path_row(paths, 1, "Detection Labels Folder:", self._manual_label_dir_var, lambda: self._browse_dir(self._manual_label_dir_var))
+        self._add_compact_path_row(paths, 2, "Segmentation Labels Folder:", self._manual_seg_dir_var, lambda: self._browse_dir(self._manual_seg_dir_var))
 
         model_row = ttk.Frame(paths)
-        model_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-        ttk.Label(model_row, text="Prompt model:").pack(side="left")
+        model_row.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        model_row.columnconfigure(1, weight=1)
+        ttk.Label(model_row, text="Prompt model:").grid(row=0, column=0, sticky="w")
         self._manual_model_combo = ttk.Combobox(
             model_row,
             textvariable=self._manual_model_alias_var,
             values=MANUAL_MODEL_PRESETS,
             state="normal",
-            width=22,
+            width=18,
         )
-        self._manual_model_combo.pack(side="left", padx=(6, 8))
-        ttk.Button(model_row, text="Warm Up Model", command=self._manual_warmup_model).pack(side="left")
-        ttk.Label(
+        self._manual_model_combo.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        ttk.Button(model_row, text="Warm Up Model", command=self._manual_warmup_model).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self._manual_model_tip_label = ttk.Label(
             paths,
             text="Tip: use mobile_sam.pt for an EfficientSAM-sized smaller model.",
             style="Status.TLabel",
-            wraplength=340,
+            wraplength=320,
             justify="left",
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        )
+        self._manual_model_tip_label.grid(row=10, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Checkbutton(
             paths,
             text="Preserve segmentation polygons (YOLO seg format)",
             variable=self._manual_preserve_masks_var,
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         class_box = ttk.LabelFrame(left, text="Classes (one class name per line)", padding=10)
         class_box.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         class_box.columnconfigure(0, weight=1)
-        self._manual_class_text = tk.Text(class_box, height=4, wrap="word")
+        self._manual_class_text = tk.Text(class_box, height=4, width=28, wrap="word")
         self._manual_class_text.grid(row=0, column=0, sticky="ew")
         self._manual_class_text.insert("1.0", "mouse")
         class_ctrl = ttk.Frame(class_box)
@@ -336,7 +344,7 @@ class AutoLabelForgeWindow(tk.Toplevel):
         self._manual_class_combo = ttk.Combobox(active_cls, textvariable=self._manual_class_var, values=(), state="readonly", width=28)
         self._manual_class_combo.pack(side="left", padx=(6, 0))
 
-        controls_note = ttk.Label(
+        self._manual_controls_note_label = ttk.Label(
             left,
             text=(
                 "Mouse: LMB positive, RMB negative, Shift+LMB drag pan, wheel scroll.\n"
@@ -344,35 +352,41 @@ class AutoLabelForgeWindow(tk.Toplevel):
                 "Keys: Enter accept, U undo, C clear, P/N prev-next, 1..9 class."
             ),
             style="Status.TLabel",
-            wraplength=340,
+            wraplength=320,
             justify="left",
         )
-        controls_note.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self._manual_controls_note_label.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        left.bind("<Configure>", self._manual_on_left_panel_configure, add="+")
 
-        right = ttk.Frame(frame)
-        right.grid(row=0, column=1, sticky="nsew")
+        right = ttk.Frame(workspace)
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=1)
 
         toolbar = ttk.Frame(right)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        self._manual_prev_btn = ttk.Button(toolbar, text="Prev [P]", command=self._manual_prev_image)
+        toolbar.columnconfigure(0, weight=1)
+        toolbar_top = ttk.Frame(toolbar)
+        toolbar_top.grid(row=0, column=0, sticky="ew")
+        toolbar_bottom = ttk.Frame(toolbar)
+        toolbar_bottom.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self._manual_prev_btn = ttk.Button(toolbar_top, text="Prev [P]", command=self._manual_prev_image)
         self._manual_prev_btn.pack(side="left")
-        self._manual_next_btn = ttk.Button(toolbar, text="Next [N]", command=self._manual_next_image)
+        self._manual_next_btn = ttk.Button(toolbar_top, text="Next [N]", command=self._manual_next_image)
         self._manual_next_btn.pack(side="left", padx=(6, 0))
-        self._manual_clear_btn = ttk.Button(toolbar, text="Clear points [C]", command=self._manual_clear_points)
+        self._manual_clear_btn = ttk.Button(toolbar_top, text="Clear [C]", command=self._manual_clear_points)
         self._manual_clear_btn.pack(side="left", padx=(12, 0))
-        self._manual_undo_btn = ttk.Button(toolbar, text="Undo point [U]", command=self._manual_undo_point)
+        self._manual_undo_btn = ttk.Button(toolbar_top, text="Undo [U]", command=self._manual_undo_point)
         self._manual_undo_btn.pack(side="left", padx=(6, 0))
-        self._manual_accept_btn = ttk.Button(toolbar, text="Accept mask [Enter]", command=self._manual_accept_preview, style="Accent.TButton")
+        self._manual_accept_btn = ttk.Button(toolbar_top, text="Accept [Enter]", command=self._manual_accept_preview, style="Accent.TButton")
         self._manual_accept_btn.pack(side="left", padx=(12, 0))
-        self._manual_zoom_out_btn = ttk.Button(toolbar, text="Zoom -", command=self._manual_zoom_out)
-        self._manual_zoom_out_btn.pack(side="left", padx=(20, 0))
-        self._manual_zoom_in_btn = ttk.Button(toolbar, text="Zoom +", command=self._manual_zoom_in)
+        self._manual_zoom_out_btn = ttk.Button(toolbar_bottom, text="Zoom -", command=self._manual_zoom_out)
+        self._manual_zoom_out_btn.pack(side="left")
+        self._manual_zoom_in_btn = ttk.Button(toolbar_bottom, text="Zoom +", command=self._manual_zoom_in)
         self._manual_zoom_in_btn.pack(side="left", padx=(6, 0))
-        self._manual_zoom_fit_btn = ttk.Button(toolbar, text="Fit [0]", command=self._manual_zoom_fit)
+        self._manual_zoom_fit_btn = ttk.Button(toolbar_bottom, text="Fit [0]", command=self._manual_zoom_fit)
         self._manual_zoom_fit_btn.pack(side="left", padx=(6, 0))
-        ttk.Label(toolbar, textvariable=self._manual_zoom_var, width=12).pack(side="left", padx=(10, 0))
+        ttk.Label(toolbar_bottom, textvariable=self._manual_zoom_var, width=12).pack(side="left", padx=(10, 0))
+        ttk.Label(toolbar_bottom, text="Drag divider to resize panels.", style="Status.TLabel").pack(side="right")
 
         viewer = ttk.LabelFrame(right, text="Image Viewer", padding=6)
         viewer.grid(row=1, column=0, sticky="nsew")
@@ -408,11 +422,23 @@ class AutoLabelForgeWindow(tk.Toplevel):
         self._manual_canvas.bind("<Control-Button-4>", self._manual_on_linux_ctrl_wheel_up, add="+")
         self._manual_canvas.bind("<Control-Button-5>", self._manual_on_linux_ctrl_wheel_down, add="+")
         self._manual_canvas.bind("<Configure>", lambda _e: self._manual_render_scene(), add="+")
-        status = ttk.Label(right, textvariable=self._manual_status_var, style="Status.TLabel", wraplength=940, justify="left")
-        status.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self._manual_status_label = ttk.Label(right, textvariable=self._manual_status_var, style="Status.TLabel", wraplength=720, justify="left")
+        self._manual_status_label.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        right.bind("<Configure>", self._manual_on_right_panel_configure, add="+")
+
+        workspace.add(left_shell, weight=0)
+        workspace.add(right, weight=1)
 
         self._manual_refresh_classes()
         self._manual_set_controls_state(False)
+
+    def _manual_on_left_panel_configure(self, event) -> None:
+        wraplength = max(220, min(360, int(event.width) - 28))
+        self._manual_model_tip_label.configure(wraplength=wraplength)
+        self._manual_controls_note_label.configure(wraplength=wraplength)
+
+    def _manual_on_right_panel_configure(self, event) -> None:
+        self._manual_status_label.configure(wraplength=max(320, int(event.width) - 28))
 
     def _bind_shortcuts(self) -> None:
         self.bind("<KeyPress-n>", lambda _e: self._manual_next_image(), add="+")
@@ -436,6 +462,12 @@ class AutoLabelForgeWindow(tk.Toplevel):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w")
         ttk.Entry(parent, textvariable=var).grid(row=row, column=1, sticky="ew", padx=(8, 8), pady=2)
         ttk.Button(parent, text="Browse...", command=browse_fn).grid(row=row, column=2, sticky="e")
+
+    def _add_compact_path_row(self, parent, row: int, label: str, var: tk.StringVar, browse_fn) -> None:
+        base_row = row * 3
+        ttk.Label(parent, text=label).grid(row=base_row, column=0, columnspan=3, sticky="w")
+        ttk.Entry(parent, textvariable=var, width=24).grid(row=base_row + 1, column=0, columnspan=3, sticky="ew", pady=(2, 4))
+        ttk.Button(parent, text="Browse...", command=browse_fn).grid(row=base_row + 2, column=0, columnspan=3, sticky="ew", pady=(0, 6))
 
     def _browse_dir(self, var: tk.StringVar) -> None:
         start = var.get().strip() or str(Path.cwd())
