@@ -1,6 +1,6 @@
 # Assisted Pose Curation Plugin
 
-!!! note "Plugin status — research in progress"
+!!! note "Plugin status - research in progress"
     The IntegraPose plugin ecosystem evolves with active research. Some plugins are stable, others are works in progress, and the set may change as research needs shift. Pin to a commit if you depend on a specific plugin for an in-flight project.
 
 !!! note

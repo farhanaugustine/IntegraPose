@@ -1,13 +1,13 @@
 # Advanced Bout Scorer
 
-Use the Advanced Bout Scorer when you need frame-accurate verification or manual annotation of behavioral events. The window opens from **Bout Analytics → Open Advanced Bout Scorer** or by double-clicking a bout in the analytics table.
+Use the Advanced Bout Scorer when you need frame-accurate verification or manual annotation of behavioral events. The window opens from **Bout Analytics -> Open Advanced Bout Scorer** or by double-clicking a bout in the analytics table.
 
 ## Workspace overview
 
-- **Video preview** (left) – Scrub through the source video to confirm each event. Playback respects the project’s frame rate and resizes automatically to fit the window.
-- **Transport controls** – Play/pause, drag the timeline slider, or jump by single frames. The status label displays both frame counts and elapsed seconds.
-- **Scoring panel** (top right) – Choose the animal (track ID), pick the behavior label, and set start/end frames for the current bout.
-- **Scored bouts table** (bottom right) – Accumulates every manual entry with duration in seconds for quick auditing before export.
+- **Video preview** (left) - Scrub through the source video to confirm each event. Playback respects the project's frame rate and resizes automatically to fit the window.
+- **Transport controls** - Play/pause, drag the timeline slider, or jump by single frames. The status label displays both frame counts and elapsed seconds.
+- **Scoring panel** (top right) - Choose the animal (track ID), pick the behavior label, and set start/end frames for the current bout.
+- **Scored bouts table** (bottom right) - Accumulates every manual entry with duration in seconds for quick auditing before export.
 
 ## Annotating a bout
 

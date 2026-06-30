@@ -17,7 +17,7 @@ If you want a complete step-by-step workflow, jump straight to one of these:
 | `4. Inference` | Run file-based detection or pose inference |
 | `5. Webcam Inference` | Run live pose inference |
 | `6. Bout Analytics` | Compute bouts and ROI metrics |
-| `7. Behavior Clustering` | Optional — split YOLO classes into the sub-behaviors they actually contain |
+| `7. Behavior Clustering` | Optional - split YOLO classes into the sub-behaviors they actually contain |
 | `File -> Batch Processing Wizard...` | Process many videos with shared settings |
 | `Plugins` | Optional toolkits and specialty workflows |
 

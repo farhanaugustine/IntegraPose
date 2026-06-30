@@ -23,7 +23,7 @@ Design custom keypoint layouts and edge connections for Supervision overlays or 
 
 - Press **Save Skeleton** to export the configuration as JSON. The file contains the ordered keypoint names and the index pairs that define each edge.
 - Saving automatically switches the inference overlay settings to use the new skeleton and stores the file path in the active project.
-- Custom skeletons can be shared across projects; point the inference tab’s **Skeleton Source** at the saved JSON to reuse your definitions.
+- Custom skeletons can be shared across projects; point the inference tab's **Skeleton Source** at the saved JSON to reuse your definitions.
 
 ## Tips
 

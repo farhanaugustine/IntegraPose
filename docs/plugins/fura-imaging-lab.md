@@ -1,6 +1,6 @@
 # Fura Imaging Lab
 
-!!! note "Plugin status — research in progress"
+!!! note "Plugin status - research in progress"
     The IntegraPose plugin ecosystem evolves with active research. Some plugins are stable, others are works in progress, and the set may change as research needs shift. Pin to a commit if you depend on a specific plugin for an in-flight project.
 
 Fura Imaging Lab brings calcium-imaging analysis into IntegraPose. It
@@ -12,7 +12,7 @@ for downstream statistics.
 
 | Best for | Less ideal for |
 | --- | --- |
-| Fura-2 ratiometric calcium imaging from upright or inverted scopes | Wide-field behavior video — that's the main app's job |
+| Fura-2 ratiometric calcium imaging from upright or inverted scopes | Wide-field behavior video - that's the main app's job |
 | Quick alignment + ROI tracking workflows that don't need a full ImageJ pipeline | Highly customized post-processing already handled by lab-specific MATLAB tools |
 | Lab projects that want imaging traces alongside pose / behavior outputs in one project | Pure exploratory imaging without a downstream analytics need |
 
@@ -48,7 +48,7 @@ multi-page TIFFs will need a manual conversion step otherwise.
 ## Practical advice
 
 - Run alignment **before** drawing ROIs; otherwise drift smears the trace.
-- Keep ROI labels short and meaningful — they become column names in the workbook.
+- Keep ROI labels short and meaningful - they become column names in the workbook.
 - Save a project file so the same ROI set can be reused on a follow-up recording.
 
 ## Where this fits

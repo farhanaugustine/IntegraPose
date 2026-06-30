@@ -1,6 +1,6 @@
 # AutoLabel Forge
 
-!!! note "Plugin status — research in progress"
+!!! note "Plugin status - research in progress"
     The IntegraPose plugin ecosystem evolves with active research. Some plugins are stable, others are works in progress, and the set may change as research needs shift. Pin to a commit if you depend on a specific plugin for an in-flight project.
 
 AutoLabel Forge bootstraps a detection dataset from raw video without
@@ -13,7 +13,7 @@ plugin window so you can go from "I have hours of video" to
 
 | Best for | Less ideal for |
 | --- | --- |
-| Detection dataset bootstrapping where the target object can be described in language | Pose datasets — use **Assisted Pose Curation** instead |
+| Detection dataset bootstrapping where the target object can be described in language | Pose datasets - use **Assisted Pose Curation** instead |
 | Rapid box labeling when the bottleneck is volume, not edge cases | Frame-perfect annotation with strict bounding-box conventions |
 | Building training data for new species, novel arenas, or unfamiliar viewpoints | Highly cluttered scenes where text prompts struggle to disambiguate |
 
@@ -55,8 +55,8 @@ Annotation** generates, so a Forge dataset drops directly into
 
 - Start with a short, specific prompt (`white mouse`) before trying broad ones (`animal`).
 - Run frame extraction at a rate that captures behavioral diversity, not every motion-blurred frame.
-- Use the manual cleanup pass to fix the 5–10% of frames where GroundingDINO disagrees with itself.
-- The `label_provenance.json` sidecar is queryable — filter on `provenance: "human"` to estimate review coverage before training.
+- Use the manual cleanup pass to fix the 5-10% of frames where GroundingDINO disagrees with itself.
+- The `label_provenance.json` sidecar is queryable - filter on `provenance: "human"` to estimate review coverage before training.
 
 ## Where this fits in the GUI workflow
 

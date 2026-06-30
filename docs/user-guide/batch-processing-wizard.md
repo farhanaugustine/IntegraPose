@@ -137,7 +137,7 @@ This makes batch outputs a first-class entry path into Tab 7 for pose-based mode
 
 ## Performance: where the work actually happens
 
-A common question once a batch run is going: *"my GPU isn't pegged at 100% — is something wrong?"* Almost always, no. A modern vision pipeline is **heterogeneous by design** — the GPU does the heavy linear algebra inside the model, and a long list of supporting tasks legitimately stay on the CPU. Both indicators lighting up during a run is correct.
+A common question once a batch run is going: *"my GPU isn't pegged at 100% - is something wrong?"* Almost always, no. A modern vision pipeline is **heterogeneous by design** - the GPU does the heavy linear algebra inside the model, and a long list of supporting tasks legitimately stay on the CPU. Both indicators lighting up during a run is correct.
 
 ### What runs where during a batch run
 
@@ -158,14 +158,14 @@ A common question once a batch run is going: *"my GPU isn't pegged at 100% — i
 
 ### How to tell what's bottlenecking you
 
-Open Task Manager → Performance tab and watch GPU and CPU utilization at the same time during the batch run.
+Open Task Manager -> Performance tab and watch GPU and CPU utilization at the same time during the batch run.
 
 | GPU util | CPU util | What it means | What to do |
 | --- | --- | --- | --- |
-| 70–100% | 50–100% | GPU-bound — the model is the bottleneck | Increase batch size; pick a smaller YOLO variant (`n` or `s`); shrink `imgsz` |
-| 30–60% | 70–100% | CPU-bound — decode / post-process / I/O can't keep up | Disable saving annotated video; lower trace overlay density; keep label-saving on without media output |
-| 90–100% | 30–50% | Healthy GPU-bound — you're getting most of the value out of the GPU | Nothing to do |
-| 30–50% | 30–50% | I/O-bound — the disk read or write is gating | Move source videos to an SSD; write outputs to a local disk, not a network share |
+| 70-100% | 50-100% | GPU-bound - the model is the bottleneck | Increase batch size; pick a smaller YOLO variant (`n` or `s`); shrink `imgsz` |
+| 30-60% | 70-100% | CPU-bound - decode / post-process / I/O can't keep up | Disable saving annotated video; lower trace overlay density; keep label-saving on without media output |
+| 90-100% | 30-50% | Healthy GPU-bound - you're getting most of the value out of the GPU | Nothing to do |
+| 30-50% | 30-50% | I/O-bound - the disk read or write is gating | Move source videos to an SSD; write outputs to a local disk, not a network share |
 
 If you're using a tuned BoT-SORT config with `with_reid: True`, the ReID model adds a per-frame GPU pass, so the GPU stays busy even between batches of the main pose model. That's working as intended.
 
@@ -180,7 +180,7 @@ If your GPU has plenty of VRAM, raising this to 32, 64, or 128 typically gives a
 
 ### Inference device default: `-1`
 
-The **Inference device** field defaults to `-1`. This is Ultralytics' "auto-pick the best idle GPU" flag — on a multi-GPU rig it picks whichever GPU is least loaded, on a single-GPU rig it picks the only GPU, and on a no-GPU rig it falls through to CPU. You don't need to change it for normal use.
+The **Inference device** field defaults to `-1`. This is Ultralytics' "auto-pick the best idle GPU" flag - on a multi-GPU rig it picks whichever GPU is least loaded, on a single-GPU rig it picks the only GPU, and on a no-GPU rig it falls through to CPU. You don't need to change it for normal use.
 
 You can still override it. Examples:
 
@@ -192,7 +192,7 @@ You can still override it. Examples:
 | `cpu` | Force CPU (note: see Tracker choice below) |
 | `mps` | Apple Silicon GPU |
 
-The default is `-1` rather than `cpu` because Ultralytics 8.4.18 has a bug where an explicit `cpu` device crashes when BoT-SORT's ReID submodel auto-selects its own device — even from Ultralytics' own CLI. Letting Ultralytics pick (`-1`) avoids that path entirely.
+The default is `-1` rather than `cpu` because Ultralytics 8.4.18 has a bug where an explicit `cpu` device crashes when BoT-SORT's ReID submodel auto-selects its own device - even from Ultralytics' own CLI. Letting Ultralytics pick (`-1`) avoids that path entirely.
 
 ### Tracker config
 
@@ -202,12 +202,12 @@ enabled). Provide a path to override with your own tuned YAML.
 
 | Tracker | GPU | CPU |
 | --- | --- | --- |
-| BoT-SORT with `with_reid: True` (Ultralytics default) | Best ID stability across occlusions | Crashes in Ultralytics 8.4.18 — upstream bug, not specific to IntegraPose. The default device of `-1` avoids this by auto-picking a GPU when one exists. |
+| BoT-SORT with `with_reid: True` (Ultralytics default) | Best ID stability across occlusions | Crashes in Ultralytics 8.4.18 - upstream bug, not specific to IntegraPose. The default device of `-1` avoids this by auto-picking a GPU when one exists. |
 | BoT-SORT with `with_reid: False` | Fast and stable | Works on CPU |
 | ByteTrack | Fast | The faster CPU choice; motion-based, no ReID model anywhere |
 
 IntegraPose passes whatever tracker you supply (or no override at all)
-straight to Ultralytics — no silent rewriting. For a CPU-only run with
+straight to Ultralytics - no silent rewriting. For a CPU-only run with
 multi-animal tracking, the cleanest path is to point the Tracker YAML
 field at `bytetrack.yaml` (or a custom `botsort.yaml` with
 `with_reid: False`). For GPU runs, the default `-1` device + bundled

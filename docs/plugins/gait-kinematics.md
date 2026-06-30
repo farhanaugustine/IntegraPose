@@ -1,6 +1,6 @@
 # Gait & Kinematic Dashboard
 
-!!! note "Plugin status — research in progress"
+!!! note "Plugin status - research in progress"
     The IntegraPose plugin ecosystem evolves with active research. Some plugins are stable, others are works in progress, and the set may change as research needs shift. Pin to a commit if you depend on a specific plugin for an in-flight project.
 
 The Gait & Kinematic Dashboard turns pose tracks into stride-level
@@ -13,7 +13,7 @@ labeling is needed once you have a working pose model.
 
 | Best for | Less ideal for |
 | --- | --- |
-| Locomotion studies — gait disorders, treatment effects, developmental locomotion | Behavioral studies that don't depend on stride-level kinematics |
+| Locomotion studies - gait disorders, treatment effects, developmental locomotion | Behavioral studies that don't depend on stride-level kinematics |
 | Comparing groups (e.g., WT vs KO) on standardized locomotion metrics | Single-track exploratory work where bout/event analysis is enough |
 | Side-view or overhead recordings where paw / limb keypoints are reliable | Recordings where keypoint occlusion is severe |
 
@@ -28,7 +28,7 @@ labeling is needed once you have a working pose model.
 | Paw angle | Paw orientation relative to direction of travel |
 | Group comparisons | Per-group means, distributions, and statistical comparisons |
 
-All metrics are emitted in **pixels** by default — IntegraPose's
+All metrics are emitted in **pixels** by default - IntegraPose's
 standardized unit. Convert to physical units (mm, cm) using your own
 calibration after export.
 

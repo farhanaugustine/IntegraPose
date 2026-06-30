@@ -11,7 +11,7 @@ Use this guide for the full end-to-end IntegraPose workflow: project setup, pose
 | Training | YOLO pose checkpoint |
 | Inference | Pose labels and optional videos or metrics |
 | Bout analytics | ROI and bout-level summaries |
-| Behavior Clustering (Tab 7) | Optional — split each YOLO class into the sub-behaviors it actually contains |
+| Behavior Clustering (Tab 7) | Optional - split each YOLO class into the sub-behaviors it actually contains |
 
 ## Recommended flow
 
