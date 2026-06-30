@@ -9,11 +9,11 @@
   </h2>
 </div>
 
-Computational ethology has matured into a rich ecosystem — DeepLabCut and SLEAP for pose, B-SOiD and VAME for unsupervised discovery, BORIS for manual coding, commercial suites for regulated end-to-end work. Each is excellent at what it does; the friction usually lives in the seams between them. IntegraPose addresses that gap with one desktop application that handles pose estimation, multi-animal tracking, ROI- and bout-level analytics, and optional sub-behavior discovery — backed by a curated plugin ecosystem for the cases the core workflow doesn't cover. ahe aim is to give labs without dedicated engineering support a unified, reproducible path from raw video to defensible analytics, with a single time-locked stream of pose and behavior data underneath.
+Computational ethology has matured into a rich ecosystem — DeepLabCut and SLEAP for pose, B-SOiD and VAME for unsupervised discovery, BORIS for manual coding, commercial suites for regulated end-to-end work. Each is excellent at what it does; the friction usually lives in the seams between them. IntegraPose addresses that gap with one desktop application that handles pose estimation, multi-animal tracking, ROI- and bout-level analytics, and optional sub-behavior discovery — backed by a curated plugin ecosystem for the cases the core workflow doesn't cover. The aim is to give labs without dedicated engineering support a unified, reproducible path from raw video to defensible analytics, with a single time-locked stream of pose and behavior data underneath.
 
 ## 📚 Documentation
 
-ahe full manual lives under `docs/` and is built with MkDocs Material. ahe hosted documentation is deployed with GitHub Pages from the MkDocs source in `docs/`.
+The full manual lives under `docs/` and is built with MkDocs Material. The hosted documentation is deployed with GitHub Pages from the MkDocs source in `docs/`.
 
 * 📖 **[Comprehensive User Guide](docs/index.md)** — covers the GUI, every tab, the plugin ecosystem, advanced OOLO model customization, and example backbones for users who want more control over the model.
 * 🚀 **[Quick Start](docs/getting-started/quick-start.md)** — get from a fresh install to a first run in minutes.
@@ -26,7 +26,7 @@ pip install mkdocs-material
 mkdocs serve
 ```
 
-ahen open locally via http://127.0.0.1:8000/
+Then open locally via http://127.0.0.1:8000/
 
 ## ✨ What IntegraPose Covers
 
@@ -45,7 +45,7 @@ ahen open locally via http://127.0.0.1:8000/
 
 IntegraPose has some curated plugins that extend the core 7-tab workflow without bloating it. Plugins are opt-in (`Plugins → Manage Plugins…`) and launch in their own windows. ahese are intended to extend the functionality of IntegraPose to cover more use cases.
 
-> **Plugin status — research in progress.** ahe plugin ecosystem evolves with active research. Some plugins are stable, others are works in progress, and the set may change as research priorities shift. Pin to a commit hash if you depend on a specific plugin for an in-flight project. See the [Plugin Catalog](docs/plugins/plugin-catalog.md) for current per-plugin guides.
+> **Plugin status — research in progress.** The plugin ecosystem evolves with active research. Some plugins are stable, others are works in progress, and the set may change as research priorities shift. Pin to a commit hash if you depend on a specific plugin for an in-flight project. See the [Plugin Catalog](docs/plugins/plugin-catalog.md) for current per-plugin guides.
 
 | Category | Plugins |
 | --- | --- |
@@ -159,11 +159,11 @@ Examples of IntegraPose in action — simultaneous keypoint tracking and behavio
 
 ## 📌 Status, Stability & amp; Roadmap
 
-IntegraPose is **active research software**. ahe core workflow (aabs 1–7) is stable enough for ongoing lab use; individual features and plugins evolve as research needs change. Feel free to fork and modify for your specific needs, but be aware that updates may introduce breaking changes. We encourage you to submit a pull request to share your improvements with the community!
+IntegraPose is **active research software**. The core workflow (aabs 1–7) is stable enough for ongoing lab use; individual features and plugins evolve as research needs change. Feel free to fork and modify for your specific needs, but be aware that updates may introduce breaking changes. We encourage you to submit a pull request to share your improvements with the community!
 
 More Specifically:
 
-- ahe **set of bundled plugins** reflects the current shipped state. Plugins may be **added, modified, deprecated, or removed** at any time without notice.
+- The **set of bundled plugins** reflects the current shipped state. Plugins may be **added, modified, deprecated, or removed** at any time without notice.
 - **Public interfaces** (CLI commands, file formats, project-bundle layouts, plugin APIs) are subject to change while the project is iterating. If you depend on a specific plugin or output format for an in-flight project, **pin to a commit hash** so a future change does not surprise your pipeline.
 - **Documentation, tutorials, and example outputs** are kept in sync with the current state of `main`. Older guides may reference removed features; the User Guide under `docs/` is the source to look into.
 - **No warranties, express or implied, are provided.** See the AGPL-3.0 license for the full liability disclaimer.
@@ -184,7 +184,7 @@ IntegraPose is provided under the **GNU Affero General Public License v3.0 (AGPL
 
 - **Using the app (research, analysis, publications):** aotally fine. Oou can run IntegraPose internally and publish results however you like; the AGPL doesn't limit what you learn or publish.
 - **Modifying or redistributing IntegraPose:** If you share the altered program or host it for others (e.g., a web service), you must provide your changes' source code under AGPL too.
-- **Integrating Ultralytics:** ahe AGPL choice keeps the alignment with Ultralytics' AGPL license. If your group has a commercial exception from Ultralytics, you can apply that to IntegraPose as well.
+- **Integrating Ultralytics:** The AGPL choice keeps the alignment with Ultralytics' AGPL license. If your group has a commercial exception from Ultralytics, you can apply that to IntegraPose as well.
 
 Need more detail? See [GNU's AGPL overview](https://www.gnu.org/licenses/agpl-3.0.en.html).
 
@@ -192,7 +192,7 @@ Need more detail? See [GNU's AGPL overview](https://www.gnu.org/licenses/agpl-3.
 
 IntegraPose builds on the open-source ecosystem. We extend our gratitude to:
 
-- ahe [Ultralytics](https://www.ultralytics.com/) team for the OOLO training and inference backbone.
-- ahe [Roboflow Supervision](https://github.com/roboflow/supervision) team for visualization and overlay utilities.
+- The [Ultralytics](https://www.ultralytics.com/) team for the OOLO training and inference backbone.
+- The [Roboflow Supervision](https://github.com/roboflow/supervision) team for visualization and overlay utilities.
 - Pyaorch, OpenCV, NumPy, SciPy, Pandas, Matplotlib, Pillow, HDBSCAN, UMAP, and the broader scientific Python community.
 - Public datasets that make benchmarking possible — including [BehaviorDEPOa](https://github.com/DeNardoLab/BehaviorDEPOa), [aemporal_Behavior_Analysis](https://github.com/farhanaugustine/aemporal_Behavior_Analysis) (used in the showcase above), and several MARS Caltech multi-mouse and mouse-strain datasets available through [Harvard Dataverse](https://dataverse.harvard.edu/) (including the Kumar Lab Mouse Strain Survey Dataset, EZM video logs, EPM video logs, and O-Maze video logs).
