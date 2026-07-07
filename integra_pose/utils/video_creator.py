@@ -5,7 +5,7 @@ import numpy as np
 import os
 import re
 from collections import Counter, defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from tqdm import tqdm
 
 def draw_star(image, center, color, size):
@@ -31,13 +31,26 @@ def draw_star(image, center, color, size):
 
 
 def _extract_frame_index(filename: str):
-    """Best-effort frame index extraction matching loader logic elsewhere in the app."""
-    match = re.search(r'_(\d+)\.txt$', filename)
-    if match:
-        return int(match.group(1))
-    matches = re.findall(r'\d+', filename)
-    if matches:
-        return int(matches[-1])
+    """Extract a zero/one-based frame token without treating video IDs as frames."""
+    stem = os.path.splitext(os.path.basename(str(filename)))[0]
+    if not stem:
+        return None
+
+    # Prefer explicit frame/image markers used by this app and common exporters:
+    # video_frame000123.txt, video_frame_000123.txt, img-000123.txt.
+    marker = re.search(r'(?i)(?:^|[_\-.])(?:frame|frm|image|img)[_\-]?(\d+)(?:$|[_\-.])', stem)
+    if marker:
+        return int(marker.group(1))
+
+    # Numeric-only stems are common for extracted-frame tools: 000123.txt.
+    if re.fullmatch(r'\d+', stem):
+        return int(stem)
+
+    # Keep backward compatibility for suffix-numbered label files while avoiding
+    # short subject/trial IDs like mouse_1.txt being silently interpreted as frames.
+    suffix = re.search(r'[_\-](\d{3,})$', stem)
+    if suffix:
+        return int(suffix.group(1))
     return None
 
 
@@ -53,6 +66,96 @@ def _looks_like_track_column(series: pd.Series) -> bool:
         return False
     rounded = np.round(values)
     return np.all(np.isclose(values, rounded)) and np.all(rounded >= 0)
+
+
+def _infer_track_column_index(df_numeric: pd.DataFrame) -> Optional[int]:
+    """Infer a trailing track-ID column without confusing keypoints for IDs."""
+    total_cols = int(df_numeric.shape[1])
+    if total_cols <= 5:
+        return None
+    if not _looks_like_track_column(df_numeric.iloc[:, -1]):
+        return None
+
+    payload_cols = total_cols - 5
+    payload_without_track = payload_cols - 1
+
+    # Detect-only rows: class x y w h [conf] [track_id]. A single normalized
+    # suffix is more likely confidence than a track ID unless labels.csv says otherwise.
+    if payload_cols <= 2:
+        if payload_cols == 1:
+            last_values = df_numeric.iloc[:, -1].dropna().to_numpy(dtype=float)
+            if last_values.size and np.all((0.0 <= last_values) & (last_values <= 1.0)):
+                return None
+        return total_cols - 1
+
+    no_track_pose_layout = payload_cols > 0 and (payload_cols % 2 == 0 or payload_cols % 3 == 0)
+    track_pose_layout = payload_without_track > 0 and (
+        payload_without_track % 2 == 0 or payload_without_track % 3 == 0
+    )
+
+    if track_pose_layout and not no_track_pose_layout:
+        return total_cols - 1
+    if not track_pose_layout:
+        return None
+
+    last_values = df_numeric.iloc[:, -1].dropna().to_numpy(dtype=float)
+    if last_values.size and np.all((0.0 <= last_values) & (last_values <= 1.0)):
+        return None
+    return total_cols - 1
+
+
+def _load_labels_csv_track_map(yolo_txt_folder: str, *, frame_count: int = 0) -> Dict[int, List[Optional[int]]]:
+    csv_path = os.path.join(str(yolo_txt_folder or ''), 'labels.csv')
+    if not os.path.isfile(csv_path):
+        return {}
+
+    try:
+        labels_df = pd.read_csv(csv_path)
+    except Exception as exc:
+        print(f"Warning: could not read labels.csv for validation video render: {exc}")
+        return {}
+    if labels_df.empty or 'frame' not in labels_df.columns or 'track_id' not in labels_df.columns:
+        return {}
+
+    frame_values = pd.to_numeric(labels_df['frame'], errors='coerce')
+    track_values = pd.to_numeric(labels_df['track_id'], errors='coerce')
+    row_map: Dict[int, List[Optional[int]]] = defaultdict(list)
+    for frame_raw, track_raw in zip(frame_values, track_values):
+        if pd.isna(frame_raw):
+            continue
+        frame_idx = int(round(float(frame_raw)))
+        if pd.isna(track_raw):
+            row_map[frame_idx].append(None)
+            continue
+        rounded = round(float(track_raw))
+        if abs(float(track_raw) - rounded) <= 1e-6:
+            row_map[frame_idx].append(int(rounded))
+        else:
+            row_map[frame_idx].append(None)
+    normalized = _normalize_detection_schedule_frames(
+        [(frame_idx, str(frame_idx)) for frame_idx in sorted(row_map.keys())],
+        frame_count=frame_count,
+    )
+    if not normalized:
+        return dict(row_map)
+    return {new_frame: row_map[int(old_token)] for new_frame, old_token in normalized}
+
+
+def _normalize_detection_schedule_frames(
+    schedule: List[Tuple[int, str]],
+    *,
+    frame_count: int = 0,
+) -> List[Tuple[int, str]]:
+    if not schedule:
+        return schedule
+    frame_indices = [frame_idx for frame_idx, _path in schedule]
+    if 0 in frame_indices:
+        return schedule
+    if min(frame_indices) != 1:
+        return schedule
+    if frame_count > 0 and max(frame_indices) == frame_count:
+        return [(frame_idx - 1, path) for frame_idx, path in schedule]
+    return schedule
 
 
 _DETECTION_COLUMNS = ['class', 'x_center', 'y_center', 'w', 'h', 'track_id']
@@ -779,7 +882,7 @@ def _build_object_frame_lookup(per_frame_df: Optional[pd.DataFrame]) -> Dict[int
     return dict(frame_lookup)
 
 
-def _build_detection_schedule(yolo_txt_folder: str) -> List[Tuple[int, str]]:
+def _build_detection_schedule(yolo_txt_folder: str, *, frame_count: int = 0) -> List[Tuple[int, str]]:
     """
     Build an ordered list mapping frame indices to YOLO detection text files.
     The list is sorted by frame index to allow sequential consumption without loading files into memory.
@@ -803,10 +906,14 @@ def _build_detection_schedule(yolo_txt_folder: str) -> List[Tuple[int, str]]:
         if frame_idx is None:
             continue
         schedule.append((frame_idx, os.path.join(yolo_txt_folder, filename)))
-    return schedule
+    return _normalize_detection_schedule_frames(schedule, frame_count=frame_count)
 
 
-def _parse_detection_file(txt_path: str) -> Optional[pd.DataFrame]:
+def _parse_detection_file(
+    txt_path: str,
+    *,
+    track_id_metadata: Sequence[Optional[int]] | None = None,
+) -> Optional[pd.DataFrame]:
     """
     Parse a YOLO detection text file into a DataFrame compatible with downstream rendering logic.
     Returns None when the file cannot be parsed; returns an empty DataFrame when the file has no detections.
@@ -835,7 +942,7 @@ def _parse_detection_file(txt_path: str) -> Optional[pd.DataFrame]:
         return pd.DataFrame(columns=_DETECTION_COLUMNS)
 
     total_cols = df_numeric.shape[1]
-    track_col_idx = total_cols - 1 if _looks_like_track_column(df_numeric.iloc[:, -1]) else None
+    track_col_idx = _infer_track_column_index(df_numeric)
 
     detections_df = pd.DataFrame(
         {
@@ -847,7 +954,20 @@ def _parse_detection_file(txt_path: str) -> Optional[pd.DataFrame]:
         }
     )
 
-    if track_col_idx is not None:
+    metadata_tracks = list(track_id_metadata or [])
+    if metadata_tracks:
+        values: List[int] = []
+        for idx in range(len(detections_df)):
+            metadata_value = metadata_tracks[idx] if idx < len(metadata_tracks) else None
+            if metadata_value is not None:
+                values.append(int(metadata_value))
+            elif track_col_idx is not None:
+                track_raw = pd.to_numeric(df_numeric.iloc[idx, track_col_idx], errors='coerce')
+                values.append(int(round(float(track_raw))) if pd.notna(track_raw) else 0)
+            else:
+                values.append(0)
+        detections_df['track_id'] = pd.Series(values, dtype='Int64')
+    elif track_col_idx is not None:
         detections_df['track_id'] = df_numeric.iloc[:, track_col_idx].round().astype('Int64')
     else:
         detections_df['track_id'] = pd.Series([0] * len(detections_df), dtype='Int64')
@@ -922,7 +1042,8 @@ def create_annotated_video(
     sidebar_header_scale = max(0.58, min(0.78, target_video_height / 920.0))
     sidebar_text_scale = max(0.46, min(0.6, target_video_height / 1120.0))
 
-    detection_schedule = _build_detection_schedule(yolo_txt_folder)
+    detection_schedule = _build_detection_schedule(yolo_txt_folder, frame_count=frame_count)
+    labels_csv_track_map = _load_labels_csv_track_map(yolo_txt_folder, frame_count=frame_count)
     detection_idx = 0
     detection_len = len(detection_schedule)
     normalized_rois = _coerce_polygon_groups(rois)
@@ -1454,7 +1575,10 @@ def create_annotated_video(
                 detection_idx += 1
             while detection_idx < detection_len and detection_schedule[detection_idx][0] == current_frame_idx:
                 _, detection_path = detection_schedule[detection_idx]
-                detection_df = _parse_detection_file(detection_path)
+                detection_df = _parse_detection_file(
+                    detection_path,
+                    track_id_metadata=labels_csv_track_map.get(current_frame_idx),
+                )
                 if detection_df is not None and not detection_df.empty:
                     collected_detections.append(detection_df)
                 detection_idx += 1

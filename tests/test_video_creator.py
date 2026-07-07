@@ -133,3 +133,57 @@ def test_estimate_sidebar_card_grid_height_scales_with_cards() -> None:
     assert one_col > 0
     assert two_col > 0
     assert one_col >= two_col
+
+
+def test_extract_frame_index_prefers_explicit_frame_marker() -> None:
+    assert video_creator._extract_frame_index("mouse_42_frame000003.txt") == 3
+    assert video_creator._extract_frame_index("mouse-42-frame_000004.txt") == 4
+    assert video_creator._extract_frame_index("000007.txt") == 7
+    assert video_creator._extract_frame_index("mouse_42_000009.txt") == 9
+    assert video_creator._extract_frame_index("mouse_42.txt") is None
+
+
+def test_detection_schedule_normalizes_clear_one_based_indices(tmp_path) -> None:
+    for frame_idx in (1, 2, 3):
+        (tmp_path / f"frame_{frame_idx}.txt").write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+
+    schedule = video_creator._build_detection_schedule(str(tmp_path), frame_count=3)
+
+    assert [frame_idx for frame_idx, _path in schedule] == [0, 1, 2]
+
+
+def test_detection_schedule_keeps_ambiguous_one_based_indices(tmp_path) -> None:
+    for frame_idx in (1, 2):
+        (tmp_path / f"frame_{frame_idx}.txt").write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+
+    schedule = video_creator._build_detection_schedule(str(tmp_path), frame_count=3)
+
+    assert [frame_idx for frame_idx, _path in schedule] == [1, 2]
+
+
+def test_labels_csv_track_map_normalizes_clear_one_based_frames(tmp_path) -> None:
+    (tmp_path / "labels.csv").write_text("frame,track_id\n1,11\n2,12\n3,13\n", encoding="utf-8")
+
+    track_map = video_creator._load_labels_csv_track_map(str(tmp_path), frame_count=3)
+
+    assert track_map == {0: [11], 1: [12], 2: [13]}
+
+
+def test_parse_detection_file_prefers_labels_csv_track_metadata(tmp_path) -> None:
+    label_path = tmp_path / "trial_frame000000.txt"
+    label_path.write_text("0 0.5 0.5 0.2 0.2 0.1 0.2 0.3 0.4\n", encoding="utf-8")
+
+    parsed = video_creator._parse_detection_file(str(label_path), track_id_metadata=[17])
+
+    assert parsed is not None
+    assert parsed.loc[0, "track_id"] == 17
+
+
+def test_parse_detection_file_does_not_treat_confidence_as_track(tmp_path) -> None:
+    label_path = tmp_path / "trial_frame000000.txt"
+    label_path.write_text("0 0.5 0.5 0.2 0.2 0.99\n", encoding="utf-8")
+
+    parsed = video_creator._parse_detection_file(str(label_path))
+
+    assert parsed is not None
+    assert parsed.loc[0, "track_id"] == 0
