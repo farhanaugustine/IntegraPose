@@ -23,6 +23,7 @@ from integra_pose.sanity_check.runner import (
     _stage_gui_smoke,
 )
 from integra_pose.sanity_check.system_info import (
+    _optional_package_version,
     collect_runtime_info,
     is_failure,
 )
@@ -140,6 +141,16 @@ class TestSystemInfo(unittest.TestCase):
         self.assertTrue(is_failure("(import error — RuntimeError: foo)"))
         self.assertFalse(is_failure("1.26.4"))
         self.assertFalse(is_failure("(version unknown)"))
+
+    def test_optional_inventory_does_not_import_plugin_module(self) -> None:
+        from unittest import mock
+
+        with mock.patch(
+            "integra_pose.sanity_check.system_info.importlib.import_module",
+            side_effect=AssertionError("optional plugin was imported"),
+        ):
+            version = _optional_package_version("umap")
+        self.assertTrue(version)
 
 
 class TestAtomicIoStage(unittest.TestCase):

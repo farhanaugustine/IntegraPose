@@ -8,9 +8,13 @@ reports either the resolved version string or a brief failure reason
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
+import importlib.util
 import platform
 import sys
 from typing import Dict
+
+from integra_pose.utils.torch_backend import detect_torch_backend
 
 
 # Modules whose presence is *required* for IntegraPose's core workflows.
@@ -41,6 +45,15 @@ _OPTIONAL_MODULES = (
     "scikit_posthocs",
 )
 
+_OPTIONAL_DISTRIBUTIONS = {
+    "hmmlearn": ("hmmlearn",),
+    "umap": ("umap-learn",),
+    "hdbscan": ("hdbscan",),
+    "albumentations": ("albumentations",),
+    "statsmodels": ("statsmodels",),
+    "scikit_posthocs": ("scikit-posthocs",),
+}
+
 
 def _module_version(module_name: str) -> str:
     """Return the version string for ``module_name``, or a failure reason.
@@ -69,6 +82,31 @@ def _module_version(module_name: str) -> str:
     return "(version unknown)"
 
 
+def _optional_package_version(module_name: str) -> str:
+    """Return optional-plugin availability without importing heavy modules.
+
+    UMAP imports Numba and may trigger expensive first-run initialization.
+    The sanity dialog only needs an inventory for optional plugins, so package
+    metadata is the correct side-effect-free probe. The plugin validates its
+    executable imports when the user launches it.
+    """
+    candidates = _OPTIONAL_DISTRIBUTIONS.get(module_name, (module_name,))
+    for distribution_name in candidates:
+        try:
+            return str(importlib.metadata.version(distribution_name))
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        except Exception as exc:  # pragma: no cover - defensive metadata failure
+            return f"(metadata error - {exc.__class__.__name__}: {exc})"
+
+    try:
+        if importlib.util.find_spec(module_name) is not None:
+            return "(version unknown)"
+    except Exception as exc:  # pragma: no cover - defensive finder failure
+        return f"(metadata error - {exc.__class__.__name__}: {exc})"
+    return "(missing - package not installed)"
+
+
 def collect_runtime_info() -> Dict[str, Dict[str, str]]:
     """Snapshot the runtime: python, OS, required + optional modules.
 
@@ -87,24 +125,21 @@ def collect_runtime_info() -> Dict[str, Dict[str, str]]:
         "executable": sys.executable,
     }
     required = {name: _module_version(name) for name in _REQUIRED_MODULES}
-    optional = {name: _module_version(name) for name in _OPTIONAL_MODULES}
+    optional = {name: _optional_package_version(name) for name in _OPTIONAL_MODULES}
 
-    # CUDA availability is a torch sub-fact worth reporting separately
-    # so users with a GPU box can see "torch is installed but CUDA isn't
-    # wired up" cleanly. Failure is non-fatal.
+    # GPU backend availability is a torch sub-fact worth reporting separately
+    # so users can see whether PyTorch resolved CPU, NVIDIA CUDA, or AMD ROCm.
     try:
-        import torch  # noqa: PLC0415
-
-        cuda_available = bool(torch.cuda.is_available())
-        if cuda_available:
-            try:
-                count = int(torch.cuda.device_count())
-                first = torch.cuda.get_device_name(0) if count else "(none)"
-                required["torch.cuda"] = f"available ({count} device(s); first: {first})"
-            except Exception:
-                required["torch.cuda"] = "available"
+        backend = detect_torch_backend("auto")
+        required["torch.backend"] = backend.backend
+        if backend.supports_cuda_api:
+            label = "ROCm/HIP via torch.cuda" if backend.is_rocm else "NVIDIA CUDA"
+            required["torch.cuda_api"] = (
+                f"available ({label}; {backend.device_count} device(s); "
+                f"first: {backend.display_name})"
+            )
         else:
-            required["torch.cuda"] = "not available (CPU-only)"
+            required["torch.cuda_api"] = "not available (CPU-only)"
     except Exception:
         # Already surfaced as a missing-torch row above.
         pass

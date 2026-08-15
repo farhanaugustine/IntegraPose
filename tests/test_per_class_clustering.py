@@ -1,20 +1,19 @@
-"""Tests for ADP-4 — per-class sub-behavior clustering.
+"""Tests for per-class sub-behavior clustering.
 
 The clustering module routes to UMAP + HDBSCAN, both of which are heavy
-optional dependencies. We split the test suite into two halves:
+optional dependencies. The test groups are:
 
   1. **Pure-logic tests** that exercise the orchestration — class
      iteration, skip-when-too-small, namespaced labels, the result
      dataclasses. These use a monkeypatched ``_cluster_one_class`` so
      UMAP/HDBSCAN aren't imported.
 
-  2. **End-to-end tests** that actually run UMAP + HDBSCAN on tiny
-     synthetic data. Skipped automatically when the libs aren't
-     installed.
+  2. **Algorithm-routing tests** that verify the UMAP boundary with
+     lightweight stand-ins, plus an end-to-end HDBSCAN test on tiny
+     synthetic data. Skipped automatically when HDBSCAN isn't installed.
 
-The orchestration tests are the load-bearing ones — they verify the
-contract Tab 7's runner depends on (skipped classes don't pollute the
-df, namespaced labels keep classes distinct, noise sentinel survives).
+The orchestration tests verify skipped-class handling, namespaced labels,
+and preservation of the noise sentinel.
 """
 
 from __future__ import annotations
@@ -36,9 +35,8 @@ def _have_pandas() -> bool:
         return False
 
 
-def _have_umap_hdbscan() -> bool:
+def _have_hdbscan() -> bool:
     try:
-        import umap  # noqa: F401
         import hdbscan  # noqa: F401
         return True
     except Exception:
@@ -232,14 +230,56 @@ class TestEdgeCases(_Base):
             self.cluster_per_class(df)
         self.assertIn("feature_vector", str(ctx.exception))
 
+    def test_invalid_umap_neighbor_count_raises(self) -> None:
+        rows = [(0, "subj", f, [1.0, 2.0, 3.0]) for f in range(40)]
+        with self.assertRaisesRegex(ValueError, "0 .* or at least 2"):
+            self.cluster_per_class(_make_df(rows), umap_neighbors=1)
+
+
+class TestAlgorithmRouting(_Base):
+    def test_zero_neighbors_skips_umap(self) -> None:
+        import types
+
+        import numpy as np
+
+        from integra_pose.hmm_vae_toolkit.per_class_clustering import (
+            _cluster_one_class,
+        )
+
+        observed = {}
+        fake_hdbscan = types.ModuleType("hdbscan")
+
+        class FakeHDBSCAN:
+            def __init__(self, **_kwargs):
+                pass
+
+            def fit_predict(self, matrix):
+                observed["matrix"] = np.asarray(matrix).copy()
+                return np.zeros(len(matrix), dtype=int)
+
+        fake_hdbscan.HDBSCAN = FakeHDBSCAN
+        feature_matrix = np.arange(30, dtype=float).reshape(10, 3)
+
+        with mock.patch.dict(sys.modules, {"umap": None, "hdbscan": fake_hdbscan}):
+            labels = _cluster_one_class(
+                feature_matrix,
+                min_cluster_size=2,
+                umap_neighbors=0,
+                umap_components=2,
+                seed=42,
+            )
+
+        np.testing.assert_array_equal(observed["matrix"], feature_matrix)
+        np.testing.assert_array_equal(labels, np.zeros(10, dtype=int))
+
 
 class TestEndToEnd(_Base):
-    """Smoke-tests with real UMAP + HDBSCAN. Skipped if libs not installed."""
+    """Smoke-test real HDBSCAN without paying UMAP's first-run JIT cost."""
 
     def setUp(self) -> None:
         super().setUp()
-        if not _have_umap_hdbscan():
-            self.skipTest("umap-learn / hdbscan unavailable in this environment")
+        if not _have_hdbscan():
+            self.skipTest("hdbscan unavailable in this environment")
 
     def test_two_distinct_subclusters_within_one_class(self) -> None:
         """Two well-separated blobs in feature space should produce two sub-clusters."""
@@ -257,7 +297,7 @@ class TestEndToEnd(_Base):
             f += 1
         df = _make_df(rows)
 
-        out_df, result = self.cluster_per_class(df, min_cluster_size=5, umap_neighbors=10)
+        out_df, result = self.cluster_per_class(df, min_cluster_size=5, umap_neighbors=0)
 
         # Should find ≥1 sub-cluster (HDBSCAN may collapse to 1, may
         # find 2; both are acceptable). The important guarantee is

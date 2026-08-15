@@ -14,17 +14,25 @@ except Exception:  # pragma: no cover
     from .config import MODEL_DEFAULTS
 
 
-def inspect_yolo_keypoint_count(weights_path: str) -> Optional[int]:
-    """Return the number of keypoints emitted by a YOLO-pose checkpoint."""
-    try:
-        from ultralytics import YOLO
-    except ImportError:
-        return None
-    try:
-        yolo = YOLO(weights_path)
-    except Exception:
-        return None
-    if getattr(yolo, "task", None) != "pose":
+def inspect_yolo_keypoint_count(
+    weights_path: str | None = None,
+    *,
+    model=None,
+) -> Optional[int]:
+    """Return the keypoint count without reloading an already-open YOLO model."""
+    yolo = model
+    if yolo is None:
+        if not weights_path:
+            return None
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            return None
+        try:
+            yolo = YOLO(weights_path)
+        except Exception:
+            return None
+    if getattr(yolo, "task", None) not in (None, "pose"):
         return None
     kpt_shape = getattr(yolo.model, "kpt_shape", None)
     if kpt_shape is None:
@@ -66,6 +74,13 @@ class TemporalPositionalEncoding(nn.Module):
             nn.init.normal_(self.embedding.weight, std=0.02)
         else:
             self.embedding = None
+        self.register_buffer(
+            "_sinusoidal_table",
+            self._sinusoidal(self.max_len, self.dim, torch.device("cpu"))
+            if self.kind == "sinusoidal"
+            else None,
+            persistent=False,
+        )
 
     @staticmethod
     def _sinusoidal(length: int, dim: int, device: torch.device) -> torch.Tensor:
@@ -94,7 +109,13 @@ class TemporalPositionalEncoding(nn.Module):
                 raise ValueError(f"Sequence length {length} exceeds max_len={self.max_len}.")
             pos = torch.arange(length, device=x.device, dtype=torch.long)
             return x + self.embedding(pos).unsqueeze(0).to(dtype=x.dtype)
-        return x + self._sinusoidal(length, dim, x.device).to(dtype=x.dtype).unsqueeze(0)
+        if self._sinusoidal_table is not None and length <= self.max_len:
+            pe = self._sinusoidal_table[:length]
+        else:
+            # Preserve the previous unbounded sinusoidal behavior for unusual
+            # inference windows larger than the configured cache.
+            pe = self._sinusoidal(length, dim, x.device)
+        return x + pe.to(device=x.device, dtype=x.dtype).unsqueeze(0)
 
 
 class TemporalAttentionPooling(nn.Module):
@@ -112,7 +133,9 @@ class TemporalAttentionPooling(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         query = self.query.expand(x.shape[0], -1, -1)
-        attn_out, _ = self.attn(query, x, x)
+        # Attention weights are never consumed. Disabling their materialization
+        # unlocks PyTorch's optimized scaled-dot-product attention path.
+        attn_out, _ = self.attn(query, x, x, need_weights=False)
         return self.norm(attn_out.squeeze(1))
 
 
@@ -345,30 +368,35 @@ class MultiAnimalBehaviorSequenceClassifier(nn.Module):
         device = next(self.parameters()).device
         nb = device.type == "cuda"
         animal_mask = batch["animal_mask"].to(device, non_blocking=nb)
-        pose_mask = batch["pose_mask"].to(device, non_blocking=nb)
-        pose_conf = batch["pose_conf"].to(device, non_blocking=nb)
-        crop_conf = batch["crop_conf"].to(device, non_blocking=nb)
-        track_conf = batch["track_conf"].to(device, non_blocking=nb)
-        track_age = batch["track_age"].to(device, non_blocking=nb)
-        pose_self = batch["pose_self"].to(device, non_blocking=nb)
-        rel_features = batch["relation_features"].to(device, non_blocking=nb)
-        rel_pose_conf = batch["relation_pose_conf"].to(device, non_blocking=nb)
-        rel_present = batch["relation_present"].to(device, non_blocking=nb)
 
         b, t, n = animal_mask.shape
         parts = []
         if self.pose_self_alive:
-            reliability = torch.stack([pose_conf, crop_conf, track_conf, track_age], dim=-1)
-            pose_input = torch.cat([pose_self, reliability], dim=-1)
+            if "pose_input" in batch:
+                pose_input = batch["pose_input"].to(device, non_blocking=nb)
+            else:
+                pose_conf = batch["pose_conf"].to(device, non_blocking=nb)
+                crop_conf = batch["crop_conf"].to(device, non_blocking=nb)
+                track_conf = batch["track_conf"].to(device, non_blocking=nb)
+                track_age = batch["track_age"].to(device, non_blocking=nb)
+                pose_self = batch["pose_self"].to(device, non_blocking=nb)
+                reliability = torch.stack([pose_conf, crop_conf, track_conf, track_age], dim=-1)
+                pose_input = torch.cat([pose_self, reliability], dim=-1)
             if self.disable_pose_self:
                 pose_input = torch.zeros_like(pose_input)
             pose_feat = self.pose_self_encoder(pose_input)
             parts.append(masked_mean(pose_feat, animal_mask, dim=2))
 
         if not self.disable_relations:
-            rel_pose_conf_unsq = rel_pose_conf.unsqueeze(-1)
-            rel_present_unsq = rel_present.float().unsqueeze(-1)
-            rel_input = torch.cat([rel_features, rel_pose_conf_unsq, rel_present_unsq], dim=-1)
+            rel_present = batch["relation_present"].to(device, non_blocking=nb)
+            if "relation_input" in batch:
+                rel_input = batch["relation_input"].to(device, non_blocking=nb)
+            else:
+                rel_features = batch["relation_features"].to(device, non_blocking=nb)
+                rel_pose_conf = batch["relation_pose_conf"].to(device, non_blocking=nb)
+                rel_pose_conf_unsq = rel_pose_conf.unsqueeze(-1)
+                rel_present_unsq = rel_present.float().unsqueeze(-1)
+                rel_input = torch.cat([rel_features, rel_pose_conf_unsq, rel_present_unsq], dim=-1)
             if self.relations_pose_only:
                 rel_input = rel_input.clone()
                 rel_input[..., :6] = 0

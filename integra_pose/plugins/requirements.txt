@@ -8,7 +8,6 @@
 #
 # Note: PyTorch is still installed separately (CPU/CUDA wheel per https://pytorch.org/get-started/locally/).
 # Some plugins also have their own add-on requirement files:
-#   - integra_pose/plugins/plugin_behavior_scope/requirements.txt
 #   - integra_pose/plugins/plugin_autolabel_forge/requirements.txt
 #   - integra_pose/plugins/plugin_fura_imaging_lab/requirements.txt
 #   - requirements-albumentations-gui.txt (Dataset Augmentor Lab)
@@ -28,11 +27,6 @@ imbalanced-learn==0.11.0
 pyEDM==2.2.3
 autodistill==0.1.29
 autodistill-grounding-dino==0.1.4
-roboflow==1.2.13
-# Pinned because roboflow 1.2.13 hard-pins idna==3.7. Without this line,
-# pip's resolver may install a newer idna and then warn about a conflict.
-# idna 3.7 is API-compatible with everything else in the stack.
-idna==3.7
 transformers==4.57.6
 
 # Optional YOLO-NAS pipeline (requires Python <=3.10 and NumPy <=1.23.x; use a separate env).

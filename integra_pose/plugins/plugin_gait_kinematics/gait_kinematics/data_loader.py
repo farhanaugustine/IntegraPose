@@ -1,58 +1,51 @@
+import logging
 import os
 import re
-import pandas as pd
-import numpy as np
-import logging
 from collections import defaultdict
+
+import numpy as np
+import pandas as pd
 from scipy.optimize import linear_sum_assignment
+
+from integra_pose.utils.frame_identity import (
+    FrameIdentityError,
+    load_frame_label_manifest,
+    parse_frame_index,
+    resolve_frame_label_indices,
+)
+from integra_pose.utils.yolo_pose_labels import (
+    load_pose_label_schema,
+    parse_yolo_pose_label,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _extract_frame_number(filename: str) -> int:
-    stem = os.path.splitext(filename)[0]
-    match = re.search(r'_(\d+)$', stem)
-    if match:
-        return int(match.group(1))
-    return 0
+def _extract_frame_number(filename: str) -> int | None:
+    """Compatibility wrapper around the shared frame-identity parser."""
+    return parse_frame_index(filename)
+
+
+def _matches_video_source(filename: str, video_base_name: str) -> bool:
+    """Return whether a label filename is scoped to the selected video."""
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    if stem.isdigit():
+        return True
+    if re.fullmatch(r"(?i)(?:frame|frm|image|img)[_-]?\d+", stem):
+        return True
+    base = str(video_base_name or "").strip()
+    if not base:
+        return True
+    if stem.casefold() == base.casefold():
+        return True
+    if not stem.casefold().startswith(base.casefold()):
+        return False
+    remainder = stem[len(base):]
+    return remainder.startswith(("_", "-", "."))
 
 
 def _is_int_like(value: float, tolerance: float = 1e-6) -> bool:
     return abs(value - round(value)) < tolerance
-
-
-def _parse_pose_line(parts: list[str], n_keypoints: int):
-    if len(parts) < 1 + 3 * n_keypoints:
-        raise ValueError(f"Pose line too short ({len(parts)} tokens).")
-
-    class_id = int(float(parts[0]))
-    remainder = parts[1:]
-
-    bbox = None
-    if len(remainder) >= 4 + 3 * n_keypoints:
-        bbox = [float(tok) for tok in remainder[:4]]
-        remainder = remainder[4:]
-
-    pose_tokens = remainder[-3 * n_keypoints :]
-    pose_data = [float(tok) for tok in pose_tokens]
-    prefix = remainder[:-3 * n_keypoints]
-
-    bbox_conf = None
-    track_id = None
-    if prefix:
-        candidate = float(prefix[-1])
-        if _is_int_like(candidate):
-            track_id = int(round(candidate))
-            if track_id < 0:
-                track_id = None
-            prefix = prefix[:-1]
-    if prefix:
-        try:
-            bbox_conf = float(prefix[-1])
-        except ValueError:
-            bbox_conf = None
-
-    return class_id, bbox, pose_data, track_id, bbox_conf
 
 
 def _compute_centroid(det: dict) -> tuple[np.ndarray | None, float]:
@@ -186,19 +179,46 @@ def load_yolo_data(txt_dir, video_width, video_height, keypoint_order, conf_thre
 
     num_keypoints = len(keypoint_order)
     detections: list[dict] = []
+    pose_schema = load_pose_label_schema(
+        txt_dir,
+        expected_keypoint_count=num_keypoints,
+    )
 
     logger.info("Scanning for detections across %s frames for base '%s'...", total_frames, video_base_name)
-    txt_files = [
-        fname
-        for fname in os.listdir(txt_dir)
-        if fname.endswith(".txt") and fname.startswith(video_base_name)
-    ]
+    all_txt_files = sorted(fname for fname in os.listdir(txt_dir) if fname.lower().endswith(".txt"))
+    txt_files = [fname for fname in all_txt_files if _matches_video_source(fname, video_base_name)]
+    skipped_source_files = sorted(set(all_txt_files) - set(txt_files))
+    if skipped_source_files:
+        logger.warning(
+            "Skipping %s TXT file(s) that do not belong to video '%s' (e.g. %s).",
+            len(skipped_source_files),
+            video_base_name,
+            ", ".join(skipped_source_files[:3]),
+        )
     if not txt_files:
         logger.warning("No pose files matching base name '%s' found in %s.", video_base_name, txt_dir)
         return pd.DataFrame()
 
-    for filename in sorted(txt_files, key=_extract_frame_number):
-        frame_idx = _extract_frame_number(filename)
+    frame_manifest = load_frame_label_manifest(txt_dir)
+    manifest_source = str(frame_manifest.get("source_stem") or "").strip()
+    if manifest_source and video_base_name and manifest_source.casefold() != str(video_base_name).casefold():
+        raise FrameIdentityError(
+            f"Frame-label manifest source {manifest_source!r} does not match video {video_base_name!r}."
+        )
+    frame_map = resolve_frame_label_indices(txt_files, source=video_base_name or manifest_source or None)
+    skipped_unparseable = sorted(set(txt_files) - set(frame_map))
+    if skipped_unparseable:
+        logger.warning(
+            "Skipping %s auxiliary/unparseable TXT file(s) in %s (e.g. %s).",
+            len(skipped_unparseable),
+            txt_dir,
+            ", ".join(skipped_unparseable[:3]),
+        )
+    if not frame_map:
+        logger.warning("No frame-indexed pose files matching base name '%s' found in %s.", video_base_name, txt_dir)
+        return pd.DataFrame()
+
+    for filename, frame_idx in sorted(frame_map.items(), key=lambda item: (item[1], item[0])):
         filepath = os.path.join(txt_dir, filename)
         try:
             with open(filepath, "r") as fh:
@@ -207,10 +227,19 @@ def load_yolo_data(txt_dir, video_width, video_height, keypoint_order, conf_thre
                     if not parts:
                         continue
                     try:
-                        class_id, bbox_norm, pose_norm, track_id, bbox_conf = _parse_pose_line(parts, num_keypoints)
+                        parsed = parse_yolo_pose_label(
+                            parts,
+                            keypoint_count=num_keypoints,
+                            schema=pose_schema,
+                        )
                     except ValueError as exc:
                         logger.warning("Skipping malformed line %s in %s: %s", line_num, filename, exc)
                         continue
+
+                    class_id = parsed.class_id
+                    bbox_norm = list(parsed.bbox) if parsed.bbox is not None else None
+                    track_id = parsed.track_id
+                    bbox_conf = parsed.bbox_confidence
 
                     confidence = bbox_conf if bbox_conf is not None else 1.0
                     if confidence < conf_threshold:
@@ -229,7 +258,7 @@ def load_yolo_data(txt_dir, video_width, video_height, keypoint_order, conf_thre
                         center_x_px = bbox_pixels[0]
                         center_y_px = bbox_pixels[1]
 
-                    pose_data = np.array(pose_norm, dtype=float).reshape(num_keypoints, 3)
+                    pose_data = np.asarray(parsed.keypoints_xyc(), dtype=float)
                     keypoints_px = pose_data[:, :2] * np.array([video_width, video_height])
                     keypoints_px[np.where((keypoints_px[:, 0] == 0) & (keypoints_px[:, 1] == 0))] = np.nan
 

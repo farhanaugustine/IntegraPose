@@ -11,13 +11,12 @@ from typing import TYPE_CHECKING
 
 from integra_pose.utils import command_builder
 from integra_pose.utils.overlay_presets import sanitize_order
+from integra_pose.utils.torch_backend import normalize_ultralytics_device
+from integra_pose.utils.operation_result import OperationResult
 
 if TYPE_CHECKING:
     from integra_pose.logic.supervision_runner import (
-        AdvancedOverlaySettings,
-        AnnotationOptions,
         InferenceSettings as SupervisionInferenceSettings,
-        SupervisionInferenceRunner,
     )
 else:
     SupervisionInferenceSettings = object  # runtime placeholder to avoid importing ultralytics/torch until needed
@@ -26,47 +25,29 @@ else:
 class InferenceController:
     """File inference and supervision overlay orchestration."""
 
+    _VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".mpg", ".mpeg", ".wmv"}
+
     def __init__(self, app: Any):
         self.app = app
 
     @staticmethod
     def _normalize_device(raw: str | None) -> str:
-        """Normalize a user-supplied device string and silently fall back
-        to CPU when CUDA isn't available or the index doesn't exist.
-        Also masks CUDA via ``CUDA_VISIBLE_DEVICES=""`` when torch
-        reports ``is_available() == True`` but ``device_count() == 0``,
-        so downstream Ultralytics subsystems don't crash enumerating
-        non-existent GPUs. Mirrors the helpers in batch_pipeline /
-        supervision_runner; keep the three in sync."""
-        text = str(raw or "").strip().lower()
-        if not text or text == "cpu":
-            return "cpu"
-        if text == "mps":
-            return "mps"
-        candidate_index: int | None = None
-        if text in ("cuda", "gpu"):
-            candidate_index = 0
-        elif text.isdigit():
-            candidate_index = int(text)
-        elif text.startswith("cuda:"):
-            tail = text.split(":", 1)[1].strip()
-            if tail.isdigit():
-                candidate_index = int(tail)
-        if candidate_index is None:
-            return text
-        try:
-            import os as _os  # noqa: PLC0415
-            import torch  # noqa: PLC0415
+        """Normalize GUI device input for CUDA, ROCm, MPS, or CPU."""
+        return normalize_ultralytics_device(raw, preserve_auto=True)
 
-            cuda_seen = bool(getattr(torch, "cuda", None) and torch.cuda.is_available())
-            n = int(torch.cuda.device_count()) if cuda_seen else 0
-            if (not cuda_seen) or n == 0 or candidate_index < 0 or candidate_index >= n:
-                if cuda_seen and n == 0:
-                    _os.environ["CUDA_VISIBLE_DEVICES"] = ""
-                return "cpu"
-        except Exception:
-            return "cpu"
-        return f"cuda:{candidate_index}"
+    @classmethod
+    def _is_multi_video_directory(cls, source: Path) -> bool:
+        if not source.is_dir():
+            return False
+        try:
+            video_count = sum(
+                1
+                for entry in source.iterdir()
+                if entry.is_file() and entry.suffix.lower() in cls._VIDEO_SUFFIXES
+            )
+        except OSError:
+            return False
+        return video_count > 1
 
     def _advanced_io_runner_required(self) -> bool:
         cfg = self.app.config.inference
@@ -514,8 +495,11 @@ class InferenceController:
             return False
         app._supervision_stop_event = stop_event
         app._active_supervision_runner = runner
-        app.inference_lifecycle.start(runner, on_finish)
-        return True
+        started = app.inference_lifecycle.start(runner, on_finish)
+        if not started:
+            app._active_supervision_runner = None
+            app._supervision_stop_event = None
+        return bool(started)
 
     def run_file_inference(self):
         app = self.app
@@ -545,6 +529,13 @@ class InferenceController:
         use_supervision = app._supervision_annotations_selected()
         single_animal_mode = bool(app.config.analytics.single_animal_analysis_var.get())
         show_flag = bool(app.config.inference.show_infer_var.get())
+        save_txt_enabled = bool(app.config.inference.infer_save_txt_var.get())
+        save_video_enabled = bool(app.config.inference.infer_save_var.get())
+        save_crop_enabled = bool(app.config.inference.infer_save_crop_var.get())
+        configured_source = Path(str(app.config.inference.video_infer_path.get() or "").strip())
+        verified_single_source_output = configured_source.is_file() and (
+            save_txt_enabled or save_video_enabled or save_crop_enabled
+        )
         advanced_io_runner_required = self._advanced_io_runner_required()
         guardrails_requested = bool(
             getattr(
@@ -558,10 +549,11 @@ class InferenceController:
             or metrics_enabled
             or single_animal_mode
             or show_flag
+            or verified_single_source_output
             or advanced_io_runner_required
         )
 
-        def finalize_ui():
+        def finalize_ui(result: OperationResult | None = None):
             if hasattr(app, 'run_inference_button'):
                 app.run_inference_button.config(state=tk.NORMAL)
                 app.log_message("Enabled Run Inference button.", "INFO")
@@ -577,10 +569,16 @@ class InferenceController:
                 app.set_performance_warning("")
             app._set_job_status("No active jobs")
             current_state = app._process_activity.get("inference", {}).get("state")
-            if current_state == "error":
-                app._toast("Inference failed.", level="error", duration_ms=6000)
-            elif app._consume_process_stop_requested("inference"):
+            stopped = app._consume_process_stop_requested("inference")
+            if stopped:
                 app._set_process_activity("inference", "idle")
+            elif result is not None and result.failed:
+                app._set_process_activity("inference", "error", result.error or result.message)
+                app.update_status("File inference failed.")
+                app.log_message(result.error or result.message, "ERROR")
+                app._toast("Inference failed. Open the Log tab for details.", level="error", duration_ms=6000)
+            elif current_state == "error":
+                app._toast("Inference failed.", level="error", duration_ms=6000)
             else:
                 app._set_process_activity("inference", "completed")
                 app._toast("Inference finished.", level="info", duration_ms=6000)
@@ -589,6 +587,18 @@ class InferenceController:
                     app.overlay_controller.restore_overlay_bools(overlay_snapshot_bools)
                 except Exception:
                     pass
+
+        if should_use_supervision_runner and self._is_multi_video_directory(configured_source):
+            error_message = (
+                "Multi-video folders cannot use live overlays, metrics, Single Animal Analysis, "
+                "or advanced per-frame outputs in the Inference tab because those outputs require "
+                "a separate timeline and tracker reset for each video. Use the Batch Processing "
+                "Wizard for this folder."
+            )
+            app.log_message(error_message, "ERROR")
+            messagebox.showerror("Use Batch Processing", error_message, parent=app.root)
+            finalize_ui(OperationResult.failure("Multi-video folder requires batch processing.", error=error_message))
+            return
 
         settings = None
         if should_use_supervision_runner or guardrails_requested:
@@ -600,7 +610,7 @@ class InferenceController:
             except ValueError as exc:
                 app.log_message(f"Overlay configuration error: {exc}", "ERROR")
                 messagebox.showerror("Configuration Error", str(exc), parent=app.root)
-                finalize_ui()
+                finalize_ui(OperationResult.failure("Inference configuration failed.", error=str(exc)))
                 return
 
         if guardrails_requested and settings is not None:
@@ -611,7 +621,7 @@ class InferenceController:
             except ValueError as exc:
                 app.log_message(f"Inference startup blocked by resource guardrails: {exc}", "ERROR")
                 messagebox.showerror("Inference Guardrail", str(exc), parent=app.root)
-                finalize_ui()
+                finalize_ui(OperationResult.failure("Inference resource guardrail blocked the run.", error=str(exc)))
                 return
             except Exception as exc:
                 app.log_message(f"Failed to evaluate inference resource guardrails: {exc}", "WARNING")
@@ -626,6 +636,12 @@ class InferenceController:
                 reasons.append("Single Animal Analysis enabled")
             if show_flag:
                 reasons.append("live preview enabled")
+            if save_txt_enabled:
+                reasons.append("canonical zero-based label export enabled")
+            if verified_single_source_output and save_video_enabled:
+                reasons.append("verified annotated-video output enabled")
+            if verified_single_source_output and save_crop_enabled:
+                reasons.append("verified crop output enabled")
             if advanced_io_runner_required:
                 reasons.append("advanced I/O controls enabled")
             if reasons:
@@ -643,7 +659,7 @@ class InferenceController:
                 app.log_message("Launching overlay runner for metrics capture only.", "INFO")
                 app.update_status("Recording motion metrics...")
             if not self.start_supervision_inference(settings, finalize_ui):
-                finalize_ui()
+                finalize_ui(OperationResult.failure("Inference runner failed to start."))
             return
 
         app.performance_metrics_var.set("Ultralytics run")

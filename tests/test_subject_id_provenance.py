@@ -1,12 +1,12 @@
-"""Tests for ADP-4 Commit A — subject_id end-to-end through:
+"""Tests for subject-ID provenance across the Tab 6-to-Tab 7 handoff.
 
-  batch_pipeline params  →  analytics manifest (schema v2)  →
-  Tab 7 _read_analytics_manifest  →  data_source dict  →
-  _collect_group_sources subject_id_map  →  read_detections row column
+Data path:
 
-The tests stay narrow on purpose — they don't need the GUI, they don't run
-the full analytics pipeline, they just verify the data contracts at each
-hand-off point.
+  batch parameters → analytics manifest → Tab 7 manifest reader →
+  data source → subject-ID map → detection rows
+
+The tests verify the data contracts without starting the GUI or full
+analytics pipeline.
 
 Two paths matter:
   1. Manifest v1 (legacy)  — reader extracts empty subject_id, the
@@ -60,8 +60,8 @@ def _write_manifest(tmpdir: Path, *, schema_version: int, provenance: dict | Non
 class TestManifestReader(unittest.TestCase):
     """Hand-roll a minimal stand-in for the BehaviorAnalysisApp method.
 
-    We can't instantiate the full Tk app inside a CI worker without a
-    display, but the manifest-reader logic is pure and we can inline it.
+    The full Tk app is not instantiated in the test environment. The
+    manifest-reader logic is reproduced here as a pure function.
     The body below tracks the implementation in
     ``integra_pose/hmm_vae_toolkit/main.py::_read_analytics_manifest``;
     when that drifts, this test breaks loudly.
@@ -121,9 +121,7 @@ class TestManifestReader(unittest.TestCase):
 
 
 class TestCollectGroupSourcesSubjectMap(unittest.TestCase):
-    """The basename-fallback rule in `_collect_group_sources`. Pure logic,
-    no Tk needed — we re-implement the loop body inline.
-    """
+    """Test the basename fallback used by ``_collect_group_sources``."""
 
     def _collect(self, groups: dict) -> dict[str, str]:
         """Mirror of the subject_id_map-building loop from main.py."""
@@ -155,7 +153,7 @@ class TestCollectGroupSourcesSubjectMap(unittest.TestCase):
 
     def test_basename_fallback_when_subject_id_blank_string(self) -> None:
         # The batch pipeline writes "" when no subject was assigned.
-        # We must NOT keep that "" — fall back to basename.
+        # A blank subject ID must fall back to the directory basename.
         with tempfile.TemporaryDirectory() as td:
             sub = Path(td) / "subject_X"
             sub.mkdir()

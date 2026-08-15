@@ -1,9 +1,13 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .scrollable import create_scrollable_tab
 from .workflow_nav import add_workflow_footer_grid
+
+if TYPE_CHECKING:
+    from integra_pose.main_gui_app import YoloApp
 
 
 def create_pose_clustering_tab(app: 'YoloApp') -> None:

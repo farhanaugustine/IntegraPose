@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import random
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -67,12 +68,78 @@ def _dir_has_any_files(path: Path) -> bool:
     return False
 
 
-def _ensure_empty_dir(path: Path, *, clear_existing: bool) -> None:
-    if path.exists() and _dir_has_any_files(path):
-        if not clear_existing:
-            raise FileExistsError(f"Directory is not empty: {path}")
-        shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
+def _resolved_path(path: Path) -> Path:
+    """Resolve existing parents so symlink/junction aliases are comparable."""
+    return path.expanduser().resolve(strict=False)
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    first_resolved = _resolved_path(first)
+    second_resolved = _resolved_path(second)
+    return (
+        first_resolved == second_resolved
+        or first_resolved in second_resolved.parents
+        or second_resolved in first_resolved.parents
+    )
+
+
+def _validate_split_paths(
+    *,
+    image_dir: Path,
+    label_dir: Path,
+    output_dirs: tuple[Path, ...],
+) -> None:
+    for source_name, source_path in (("image_dir", image_dir), ("label_dir", label_dir)):
+        for output_path in output_dirs:
+            if _paths_overlap(source_path, output_path):
+                raise ValueError(
+                    f"Unsafe split paths: {source_name} '{source_path}' overlaps output "
+                    f"directory '{output_path}'. Choose flat source folders outside the "
+                    "dataset images/train, images/val, labels/train, and labels/val folders."
+                )
+
+
+def _preflight_output_dirs(output_dirs: tuple[Path, ...], *, clear_existing: bool) -> None:
+    for output_path in output_dirs:
+        if output_path.exists() and not output_path.is_dir():
+            raise NotADirectoryError(f"Split output path is not a directory: {output_path}")
+        if output_path.exists() and _dir_has_any_files(output_path) and not clear_existing:
+            raise FileExistsError(f"Directory is not empty: {output_path}")
+
+
+def _commit_staged_split(
+    *,
+    dataset_root: Path,
+    staged_outputs: tuple[tuple[Path, Path], ...],
+) -> None:
+    """Replace all four split directories, restoring the old split on failure."""
+    backup_root = Path(tempfile.mkdtemp(prefix=".integrapose_split_backup_", dir=dataset_root))
+    backed_up: list[tuple[Path, Path]] = []
+    installed: list[Path] = []
+    try:
+        for _staged_path, output_path in staged_outputs:
+            if not output_path.exists():
+                continue
+            backup_path = backup_root / output_path.relative_to(dataset_root)
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(output_path), str(backup_path))
+            backed_up.append((backup_path, output_path))
+
+        for staged_path, output_path in staged_outputs:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(staged_path), str(output_path))
+            installed.append(output_path)
+    except Exception:
+        for output_path in reversed(installed):
+            if output_path.exists():
+                shutil.rmtree(output_path)
+        for backup_path, output_path in reversed(backed_up):
+            if backup_path.exists():
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(backup_path), str(output_path))
+        raise
+    finally:
+        shutil.rmtree(backup_root, ignore_errors=True)
 
 
 def _prefix_group_key(stem: str, delimiter: str) -> str:
@@ -172,6 +239,18 @@ def create_yolo_train_val_split(
     if not label_dir_path.is_dir():
         raise FileNotFoundError(f"Label directory does not exist: {label_dir_path}")
 
+    out_images_train = dataset_root_path / "images" / "train"
+    out_images_val = dataset_root_path / "images" / "val"
+    out_labels_train = dataset_root_path / "labels" / "train"
+    out_labels_val = dataset_root_path / "labels" / "val"
+    output_dirs = (out_images_train, out_images_val, out_labels_train, out_labels_val)
+    _validate_split_paths(
+        image_dir=image_dir_path,
+        label_dir=label_dir_path,
+        output_dirs=output_dirs,
+    )
+    _preflight_output_dirs(output_dirs, clear_existing=clear_existing)
+
     try:
         val_fraction = float(val_fraction)
     except Exception as exc:
@@ -220,36 +299,59 @@ def create_yolo_train_val_split(
     actual_val_count = max(1, min(len(ordered_pairs) - 1, len(val_pairs) if grouping_active else val_count))
     train_count = len(ordered_pairs) - actual_val_count
 
-    out_images_train = dataset_root_path / "images" / "train"
-    out_images_val = dataset_root_path / "images" / "val"
-    out_labels_train = dataset_root_path / "labels" / "train"
-    out_labels_val = dataset_root_path / "labels" / "val"
+    dataset_root_path.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(tempfile.mkdtemp(prefix=".integrapose_split_stage_", dir=dataset_root_path))
+    stage_images_train = staging_root / "images" / "train"
+    stage_images_val = staging_root / "images" / "val"
+    stage_labels_train = staging_root / "labels" / "train"
+    stage_labels_val = staging_root / "labels" / "val"
+    staged_output_pairs = (
+        (stage_images_train, out_images_train),
+        (stage_images_val, out_images_val),
+        (stage_labels_train, out_labels_train),
+        (stage_labels_val, out_labels_val),
+    )
+    for staged_path, _output_path in staged_output_pairs:
+        staged_path.mkdir(parents=True, exist_ok=True)
 
-    _ensure_empty_dir(out_images_train, clear_existing=clear_existing)
-    _ensure_empty_dir(out_images_val, clear_existing=clear_existing)
-    _ensure_empty_dir(out_labels_train, clear_existing=clear_existing)
-    _ensure_empty_dir(out_labels_val, clear_existing=clear_existing)
+    try:
+        for idx, (img_path, lbl_path) in enumerate(ordered_pairs):
+            split = "val" if idx < actual_val_count else "train"
+            if split == "val":
+                img_dest = stage_images_val / img_path.name
+                lbl_dest = stage_labels_val / f"{img_path.stem}.txt"
+            else:
+                img_dest = stage_images_train / img_path.name
+                lbl_dest = stage_labels_train / f"{img_path.stem}.txt"
 
-    copier = shutil.move if move_files else shutil.copy2
+            shutil.copy2(str(img_path), str(img_dest))
+            if lbl_path is None:
+                lbl_dest.write_text("", encoding="utf-8")
+            else:
+                shutil.copy2(str(lbl_path), str(lbl_dest))
 
-    def _write_empty_label(dest: Path) -> None:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text("", encoding="utf-8")
+        _commit_staged_split(
+            dataset_root=dataset_root_path,
+            staged_outputs=staged_output_pairs,
+        )
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
-    for idx, (img_path, lbl_path) in enumerate(ordered_pairs):
-        split = "val" if idx < actual_val_count else "train"
-        if split == "val":
-            img_dest = out_images_val / img_path.name
-            lbl_dest = out_labels_val / f"{img_path.stem}.txt"
-        else:
-            img_dest = out_images_train / img_path.name
-            lbl_dest = out_labels_train / f"{img_path.stem}.txt"
-
-        copier(str(img_path), str(img_dest))
-        if lbl_path is None:
-            _write_empty_label(lbl_dest)
-        else:
-            copier(str(lbl_path), str(lbl_dest))
+    if move_files:
+        removal_errors: list[str] = []
+        for img_path, lbl_path in ordered_pairs:
+            for source_path in (img_path, lbl_path):
+                if source_path is None:
+                    continue
+                try:
+                    source_path.unlink()
+                except Exception as exc:
+                    removal_errors.append(f"{source_path}: {exc}")
+        if removal_errors:
+            raise RuntimeError(
+                "The split was created safely, but some source files could not be removed: "
+                + "; ".join(removal_errors[:5])
+            )
 
     result = YoloSplitResult(
         dataset_root=str(dataset_root_path),

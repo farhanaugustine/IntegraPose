@@ -1,11 +1,11 @@
-"""ADP-4 Tab 7 — sub-cluster clip export (Commit I).
+"""Tab 7 sub-cluster clip export.
 
 Two modes, sharing helpers:
 
   * ``export_bout_clips`` (recommended) — one .mp4 per bout, contiguous
     frames, organized into folders by behavior name. Output is shaped
-    for downstream classifier training (BehaviorScope-style: each
-    behavior's folder is a class). Default since 2026-04-26.
+    for downstream classifier training (each behavior folder is a
+    class).
 
   * ``export_sub_cluster_clips`` (legacy) — one collated .mp4 per
     (class_id, sub_id) per source video, contains every frame matching
@@ -18,7 +18,7 @@ Both modes:
   - Late-import cv2. The module imports cleanly without OpenCV.
   - Accept the namespaced label format from ``per_class_clustering``
     (``"0:0"``, ``"1:2"``, etc.).
-  - Use ``state_names`` (Commit G) for human-readable folder/file
+  - Use ``state_names`` for human-readable folder and file
     names when supplied; fall back to ``class_name__subcluster_N``.
   - Are **always optional** — Tab 7's UI calls them only when the
     user clicks the explicit Export button.
@@ -33,17 +33,11 @@ Output layout (bout mode, recommended):
         video1__t0__f600-650.mp4
       clip_manifest.csv          # one row per clip, with metadata
 
-The manifest is the bridge into supervised training: a follow-up
-"Build BehaviorScope dataset" button can read it directly.
+The manifest is the bridge into supervised downstream-classifier
+training and can be consumed directly by a dataset-building workflow.
 
-Why a separate module:
-
-  - cv2 is a heavy import we don't want to drag into the rest of the
-    toolkit.
-  - Pure side-effect operations (write files), easy to skip in
-    headless runs.
-  - Clean module boundary keeps future BehaviorScope manifest export
-    a sibling function rather than an inline branch.
+OpenCV is imported only when an export starts, so the rest of the toolkit can
+load without that optional dependency.
 """
 
 from __future__ import annotations
@@ -147,7 +141,7 @@ def export_sub_cluster_clips(
         class_names: Optional ``{class_id: human_label}`` mapping.
             Used in filenames; falls back to the integer class id.
         state_names: Optional mapping of namespaced labels → user
-            names assigned via the cluster-naming UI (Commit G). Keys
+            names assigned via the cluster-naming UI. Keys
             are the same strings used in ``label_column`` (e.g.
             ``"0:1"``). When supplied, the file name uses the human
             name; otherwise it uses ``subcluster_0:1``.
@@ -377,9 +371,9 @@ def export_bout_clips(
     """Write one .mp4 per bout, organized by behavior name.
 
     This is the **recommended** export shape for downstream classifier
-    training (e.g., BehaviorScope): each behavior name owns a folder,
-    and inside each folder are the bout-clips that belong to that
-    behavior. A clip is a contiguous slice of the source video covering
+    training: each behavior name owns a folder, and inside each folder
+    are the bout-clips that belong to that behavior. A clip is a
+    contiguous slice of the source video covering
     ``[start_frame, end_frame]`` for one bout — distinct from the legacy
     ``export_sub_cluster_clips`` collated mode.
 

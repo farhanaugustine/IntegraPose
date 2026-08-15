@@ -54,6 +54,7 @@ class RoiBuilderRow:
     name: str = ""
     shape: str = SHAPE_RECTANGLE  # one of ALLOWED_SHAPES
     polygon_vertices: int = POLYGON_DEFAULT_VERTICES
+    size_px: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.shape not in ALLOWED_SHAPES:
@@ -67,6 +68,12 @@ class RoiBuilderRow:
         self.polygon_vertices = max(
             POLYGON_MIN_VERTICES, min(POLYGON_MAX_VERTICES, n)
         )
+        if self.size_px is not None:
+            try:
+                parsed_size = int(self.size_px)
+            except (TypeError, ValueError):
+                parsed_size = 2
+            self.size_px = max(2, parsed_size)
 
 
 @dataclass
@@ -76,7 +83,9 @@ class _RowWidgets:
     frame: ttk.Frame
     name_var: tk.StringVar
     shape_var: tk.StringVar
+    size_var: tk.StringVar
     vertex_var: tk.StringVar
+    size_entry: ttk.Entry
     vertex_entry: ttk.Entry
     name_entry: ttk.Entry
     shape_combo: ttk.Combobox
@@ -113,6 +122,8 @@ class RoiBuilderDialog(tk.Toplevel):
         existing_rows: Sequence[RoiBuilderRow] = (),
         existing_roi_names: Sequence[str] = (),
         title: str = "Build ROIs",
+        default_size_px: Optional[int] = None,
+        size_required: bool = False,
     ) -> None:
         super().__init__(parent)
         self.title(title)
@@ -123,6 +134,8 @@ class RoiBuilderDialog(tk.Toplevel):
 
         self._on_confirm = on_confirm
         self._existing_roi_names = {str(n).strip() for n in existing_roi_names if str(n).strip()}
+        self._default_size_px = max(2, int(default_size_px)) if default_size_px is not None else None
+        self._size_required = bool(size_required)
         self._rows: List[_RowWidgets] = []
         # Track row counter so default names don't collide on Add.
         self._next_default_index = 1
@@ -154,8 +167,9 @@ class RoiBuilderDialog(tk.Toplevel):
             outer,
             text=(
                 "Define the ROIs you want to draw. Each row becomes one shape "
-                "placed on the frame at a default position; you'll move and "
-                "resize them in the editor that opens next."
+                "placed on the frame at a default position. Enter a pixel size "
+                "now, or leave it blank for automatic sizing; you'll still be "
+                "able to move and resize shapes in the editor that opens next."
             ),
             wraplength=520,
             justify=tk.LEFT,
@@ -169,6 +183,7 @@ class RoiBuilderDialog(tk.Toplevel):
             (
                 ("Name", 1, 18),
                 ("Shape", 0, 12),
+                ("Size (px)", 0, 9),
                 ("Polygon vertices", 0, 14),
                 ("", 0, 4),
             )
@@ -253,7 +268,7 @@ class RoiBuilderDialog(tk.Toplevel):
                 self._next_default_index += 1
                 seed_name = f"ROI {self._next_default_index}"
             self._next_default_index += 1
-            initial = RoiBuilderRow(name=seed_name)
+            initial = RoiBuilderRow(name=seed_name, size_px=self._default_size_px)
         else:
             # Track default indexing past any seeded "ROI N" names.
             try:
@@ -271,6 +286,7 @@ class RoiBuilderDialog(tk.Toplevel):
         row_frame.columnconfigure(1, weight=0)
         row_frame.columnconfigure(2, weight=0)
         row_frame.columnconfigure(3, weight=0)
+        row_frame.columnconfigure(4, weight=0)
 
         name_var = tk.StringVar(value=initial.name)
         name_entry = ttk.Entry(row_frame, textvariable=name_var)
@@ -287,22 +303,28 @@ class RoiBuilderDialog(tk.Toplevel):
         )
         shape_combo.grid(row=0, column=1, sticky="w", padx=(0, 6))
 
+        size_var = tk.StringVar(value="" if initial.size_px is None else str(initial.size_px))
+        size_entry = ttk.Entry(row_frame, textvariable=size_var, width=8)
+        size_entry.grid(row=0, column=2, sticky="w", padx=(0, 6))
+
         vertex_var = tk.StringVar(value=str(initial.polygon_vertices))
         vertex_entry = ttk.Entry(row_frame, textvariable=vertex_var, width=6)
-        vertex_entry.grid(row=0, column=2, sticky="w", padx=(0, 6))
+        vertex_entry.grid(row=0, column=3, sticky="w", padx=(0, 6))
 
         remove_button = ttk.Button(
             row_frame,
             text="×",  # × multiplication sign
             width=3,
         )
-        remove_button.grid(row=0, column=3, sticky="e")
+        remove_button.grid(row=0, column=4, sticky="e")
 
         widgets = _RowWidgets(
             frame=row_frame,
             name_var=name_var,
             shape_var=shape_var,
+            size_var=size_var,
             vertex_var=vertex_var,
+            size_entry=size_entry,
             vertex_entry=vertex_entry,
             name_entry=name_entry,
             shape_combo=shape_combo,
@@ -372,12 +394,35 @@ class RoiBuilderDialog(tk.Toplevel):
             except ValueError:
                 vertices = POLYGON_DEFAULT_VERTICES
             vertices = max(POLYGON_MIN_VERTICES, min(POLYGON_MAX_VERTICES, vertices))
-            out.append(RoiBuilderRow(name=name, shape=shape, polygon_vertices=vertices))
+            raw_size = str(w.size_var.get() or "").strip()
+            try:
+                size_px = int(raw_size) if raw_size else None
+            except ValueError:
+                size_px = None
+            out.append(
+                RoiBuilderRow(
+                    name=name,
+                    shape=shape,
+                    polygon_vertices=vertices,
+                    size_px=size_px,
+                )
+            )
         return out
 
     def _validate(self, rows: List[RoiBuilderRow]) -> Optional[str]:
         seen_names: set[str] = set()
         for idx, row in enumerate(rows, start=1):
+            if idx <= len(self._rows):
+                raw_size = str(self._rows[idx - 1].size_var.get() or "").strip()
+                if raw_size:
+                    try:
+                        parsed_size = int(raw_size)
+                    except ValueError:
+                        return f"Row {idx}: size must be a whole number of pixels."
+                    if parsed_size < 2:
+                        return f"Row {idx}: size must be at least 2 px."
+                elif self._size_required:
+                    return f"Row {idx}: size is required for object placement."
             if not row.name:
                 return f"Row {idx}: name cannot be blank."
             if row.name in seen_names:

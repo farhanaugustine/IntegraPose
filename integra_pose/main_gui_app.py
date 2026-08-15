@@ -69,6 +69,13 @@ from integra_pose.gui.theme import (
 from integra_pose.gui.advanced_bout_analyzer import AdvancedBoutAnalyzer
 from integra_pose.gui.bout_confirmation_tool import BoutConfirmationTool
 from integra_pose.gui.roi_event_review_tool import ROIEventReviewTool, normalize_roi_event_dataframe
+from integra_pose.bout_reviewer.launcher import (
+    BEHAVIOR_MODE,
+    SPATIAL_MODE,
+    ReviewLaunchError,
+    launch_reviewer,
+)
+from integra_pose.bout_reviewer.models import BEHAVIOR, ROI_CONCURRENT
 from integra_pose.gui.skeleton_editor import SkeletonEditor
 from integra_pose.utils import (
     bout_analyzer,
@@ -80,6 +87,8 @@ from integra_pose.utils import (
     video_creator,
 )
 from integra_pose.utils.dataset_qc import format_dataset_qc_summary, run_dataset_qc
+from integra_pose.utils.bout_review import register_authoritative_review_in_manifest
+from integra_pose.utils.safe_io import safe_write_json
 from integra_pose.utils.roi_manager import ROIManager
 from integra_pose.utils.bout_analyzer import BoutAnalysisError
 from integra_pose.utils.roi_drawing_tool import draw_object_rois, draw_roi
@@ -183,6 +192,7 @@ class YoloApp:
         self._active_supervision_runner = None
         
         self.detailed_bouts_df = pd.DataFrame()
+        self.raw_detected_bouts_df = pd.DataFrame()
         self.summary_bouts_df = pd.DataFrame()
         self.additional_module_outputs: Dict[str, Dict[str, object]] = {}
         self.cluster_data = {}
@@ -1355,6 +1365,9 @@ class YoloApp:
     def _run_frame_transfer(self):
         self.data_preprocessing_controller.run_frame_transfer()
 
+    def _preview_frame_transfer(self):
+        self.data_preprocessing_controller.preview_frame_transfer()
+
     def run_pose_clustering(self):
         """
         Runs UMAP + HDBSCAN clustering on selected behavior poses for specified tracks.
@@ -1381,7 +1394,7 @@ class YoloApp:
                 return
             yolo_folder, video_path, keypoint_count, keypoint_names, skeleton = prereqs
 
-            frame_lookup = self._build_frame_file_lookup(yolo_folder)
+            frame_lookup = self._build_frame_file_lookup(yolo_folder, source=video_path)
             if frame_lookup is None:
                 self.update_status("Ready.")
                 return
@@ -1522,7 +1535,12 @@ class YoloApp:
             )
             return None
 
-        is_valid, keypoint_count, error_msg = self.yolo_parser.validate_yolo_files(yolo_folder)
+        expected_keypoints = len(self.keypoint_names) if getattr(self, 'keypoint_names', None) else None
+        is_valid, keypoint_count, error_msg = self.yolo_parser.validate_yolo_files(
+            yolo_folder,
+            source=video_path,
+            expected_keypoints=expected_keypoints,
+        )
         if not is_valid:
             self.log_message(f"YOLO validation failed: {error_msg}", "ERROR")
             self.root.after(
@@ -1562,22 +1580,21 @@ class YoloApp:
         self.log_message(f"Using {keypoint_count} keypoints: {self.keypoint_names}, skeleton: {skeleton}", "INFO")
         return yolo_folder, video_path, keypoint_count, self.keypoint_names, skeleton
 
-    def _build_frame_file_lookup(self, yolo_folder):
-        frame_to_file = {}
-        for fname in os.listdir(yolo_folder):
-            if not fname.endswith('.txt'):
-                continue
-            for pattern in [r'_(\d+)\.txt$', r'frame_(\d+)\.txt$', r'video_(\d+)\.txt$', r'(\d+)\.txt$']:
-                match = re.search(pattern, fname)
-                if match:
-                    frame_to_file[int(match.group(1))] = fname
-                    break
-
-        if not frame_to_file:
-            self.log_message("No valid YOLO files found.", "ERROR")
+    def _build_frame_file_lookup(self, yolo_folder, *, source=None):
+        try:
+            frame_to_file = self.yolo_parser.resolve_frame_files(
+                yolo_folder,
+                source=source,
+            )
+        except (OSError, ValueError) as exc:
+            self.log_message(f"Could not resolve YOLO frame labels: {exc}", "ERROR")
             self.root.after(
                 0,
-                lambda: messagebox.showerror("Error", "No valid YOLO .txt files found.", parent=self.root),
+                lambda detail=str(exc): messagebox.showerror(
+                    "Error",
+                    f"Could not resolve YOLO frame labels:\n{detail}",
+                    parent=self.root,
+                ),
             )
             return None
 
@@ -2260,6 +2277,7 @@ class YoloApp:
                     "Bundle exported successfully.\n\n"
                     f"Path: {path}\n"
                     f"Included model artifacts: {included}\n"
+                    "Machine-local paths and source URLs: redacted\n"
                     f"{env_file}: {'captured from conda env history' if env_exported else 'placeholder written (see traceability manifest)'}"
                 ),
                 parent=self.root,
@@ -2278,7 +2296,14 @@ class YoloApp:
             return
         proceed = messagebox.askyesno(
             "Import Reproducibility Bundle",
-            "Importing a bundle will apply its saved project configuration to the current GUI session.\n\nContinue?",
+            (
+                "Importing a bundle will validate its contents, apply its saved project "
+                "configuration to the current GUI session, and restore bundled artifacts "
+                "to a new local import directory. Existing project artifacts will not be overwritten.\n\n"
+                "Only continue for a bundle you trust. PyTorch model artifacts can execute "
+                "code when they are later loaded.\n\n"
+                "Continue?"
+            ),
             parent=self.root,
             icon=messagebox.WARNING,
         )
@@ -2287,12 +2312,23 @@ class YoloApp:
         try:
             result = repro_bundle.import_bundle(self, Path(path))
             imported_count = int(result.get("imported_model_count", 0))
-            self.log_message(f"Imported reproducibility bundle from {path} ({imported_count} model artifact(s) restored).", "INFO")
+            imported_artifact_count = len(result.get("imported_project_artifacts", []))
+            import_root = str(result.get("import_root") or "").strip()
+            self.log_message(
+                f"Imported reproducibility bundle from {path} ({imported_count} model artifact(s) "
+                f"and {imported_artifact_count} project artifact(s) restored to {import_root}).",
+                "INFO",
+            )
             self.update_status(f"Reproducibility bundle imported: {path}")
             self._refresh_model_registry_views()
             messagebox.showinfo(
                 "Reproducibility Bundle",
-                f"Bundle imported successfully.\n\nRestored model artifacts: {imported_count}",
+                (
+                    "Bundle imported successfully.\n\n"
+                    f"Restored model artifacts: {imported_count}\n"
+                    f"Restored project artifacts: {imported_artifact_count}\n"
+                    f"Import directory: {import_root}"
+                ),
                 parent=self.root,
             )
         except Exception as exc:
@@ -3655,20 +3691,28 @@ class YoloApp:
                     20,
                 ),
             )
+            interaction_distance_px = self._parse_nonnegative_float(
+                self.config.analytics.object_interaction_distance_px_var.get(),
+                "Object interaction distance threshold (px)",
+                0.0,
+            )
             shape = self._normalize_object_shape(self.config.analytics.object_roi_shape_var.get())
             object_names = self._prompt_object_roi_names(object_count)
             if object_names is None:
                 return
             frame, video_path = self._read_analytics_source_frame()
-            polygons = draw_object_rois(
+            polygons, roi_size_px = draw_object_rois(
                 frame,
                 object_count=object_count,
                 roi_size_px=roi_size_px,
                 shape=shape,
+                distance_threshold_px=interaction_distance_px,
                 object_names=object_names,
                 master=self.root,
                 title=f"Place Object ROIs ({shape}, {roi_size_px}px)",
+                return_size_px=True,
             )
+            self.config.analytics.object_roi_size_px_var.set(str(roi_size_px))
             if not polygons:
                 self.log_message("Object ROI placement cancelled or no clicks captured.", "INFO")
                 return
@@ -4114,9 +4158,159 @@ class YoloApp:
             self._refresh_roi_listbox()
             self.log_message(f"Deleted ROI: {roi_name}", "INFO")
 
+    def _reload_integrated_review_outputs(self, manifest_path):
+        """Refresh Tab 6 tables after an integrated reviewer export."""
+        manifest = json.loads(
+            Path(manifest_path).read_text(encoding="utf-8-sig")
+        )
+        outputs = (
+            manifest.get("outputs")
+            if isinstance(manifest.get("outputs"), dict)
+            else {}
+        )
+        detailed_path = str(
+            outputs.get("reviewed_bouts_csv")
+            or outputs.get("detailed_bouts_csv")
+            or ""
+        ).strip()
+        if detailed_path and os.path.isfile(detailed_path):
+            self.detailed_bouts_df = pd.read_csv(detailed_path)
+            self.authoritative_reviewed_bouts_df = (
+                self.detailed_bouts_df.copy(deep=True)
+            )
+            self.last_reviewed_bouts_path = detailed_path
+            summary_path = str(
+                outputs.get("reviewed_bouts_summary_csv")
+                or outputs.get("summary_csv")
+                or ""
+            ).strip()
+            self.summary_bouts_df = (
+                pd.read_csv(summary_path)
+                if summary_path and os.path.isfile(summary_path)
+                else pd.DataFrame()
+            )
+            self._display_analytics_results()
+            self._refresh_clustering_behaviors()
+
+        roi_files = (
+            outputs.get("roi_metrics_files")
+            if isinstance(outputs.get("roi_metrics_files"), dict)
+            else {}
+        )
+        if roi_files:
+            refreshed_metrics = (
+                dict(self.roi_metrics)
+                if isinstance(self.roi_metrics, dict)
+                else {}
+            )
+            for key, raw_path in roi_files.items():
+                csv_path = str(raw_path or "").strip()
+                if csv_path and csv_path.lower().endswith(".csv") and os.path.isfile(csv_path):
+                    try:
+                        refreshed_metrics[str(key)] = pd.read_csv(csv_path)
+                    except Exception:
+                        continue
+            self.roi_metrics = refreshed_metrics
+        self.last_tab6_manifest_path = str(manifest_path)
+
+    def _launch_integrated_review_workspace(self, *, mode, event_kind):
+        analytics_service = getattr(self, "analytics_service", None)
+        analytics_thread = getattr(analytics_service, "analytics_thread", None)
+        if analytics_thread is not None and analytics_thread.is_alive():
+            message = (
+                "Bout analytics is still running. Wait for the annotated video "
+                "to finish before opening the review workspace."
+            )
+            self.log_message(message, "WARNING")
+            messagebox.showwarning(
+                "Review Workspace",
+                message,
+                parent=self.root,
+            )
+            # The request was handled with a warning. Returning True prevents
+            # the caller from opening a legacy reviewer against in-progress files.
+            return True
+
+        manifest_path = self._get_last_tab6_manifest_path()
+        if not manifest_path:
+            return False
+
+        def _on_exit(return_code, status):
+            if return_code != 0:
+                self.log_message(
+                    "Integrated review workspace exited with code "
+                    f"{return_code}. The legacy reviewer remains available if "
+                    "the workspace cannot be reopened.",
+                    "ERROR",
+                )
+                messagebox.showerror(
+                    "Review Workspace",
+                    "The integrated review workspace closed unexpectedly "
+                    f"(exit code {return_code}). Review edits already committed "
+                    "to its SQLite workspace remain recoverable.",
+                    parent=self.root,
+                )
+                return
+            try:
+                self._reload_integrated_review_outputs(manifest_path)
+            except Exception as exc:
+                self.log_message(
+                    f"Review workspace closed, but Tab 6 refresh failed: {exc}",
+                    "WARNING",
+                )
+            if status:
+                self.log_message(
+                    "Integrated review workspace closed. "
+                    f"Behavior={status.get('behavior', 'not_applicable')}, "
+                    f"ROI={status.get('roi', 'not_applicable')}, "
+                    "Object="
+                    f"{status.get('object_interaction', 'not_applicable')}.",
+                    "INFO",
+                )
+            else:
+                self.log_message(
+                    "Integrated review workspace closed. Edits remain saved; "
+                    "no new export was activated during this launch.",
+                    "INFO",
+                )
+
+        try:
+            launch_reviewer(
+                self.root,
+                manifest_path,
+                mode=mode,
+                event_kind=event_kind,
+                on_exit=_on_exit,
+            )
+        except ReviewLaunchError as exc:
+            message = str(exc)
+            if "already open" in message.casefold():
+                messagebox.showwarning(
+                    "Review Workspace",
+                    message,
+                    parent=self.root,
+                )
+                return True
+            self.log_message(
+                f"Integrated reviewer unavailable; opening legacy reviewer: {exc}",
+                "WARNING",
+            )
+            return False
+        self.log_message(
+            "Opened the integrated IntegraPose review workspace. The existing "
+            "Tab 6 window remains responsive while the PySide6 reviewer runs.",
+            "INFO",
+        )
+        return True
+
     def _open_bout_confirmer(self):
         self.log_message("Attempting to open Bout Confirmer...", "INFO")
         try:
+            if self._launch_integrated_review_workspace(
+                mode=BEHAVIOR_MODE,
+                event_kind=BEHAVIOR,
+            ):
+                return
             video_path = self.config.get_setting('analytics.source_video_path_var')
             if not video_path:
                 raise FileNotFoundError("Please select a source video in the Bout Analytics tab.")
@@ -4124,8 +4318,59 @@ class YoloApp:
                 raise ValueError("No analysis results found. Please run analytics first in the Bout Analytics tab.")
             behaviors = self.config.get_setting('setup.behaviors_list')
             behavior_map = {b['name']: b['id'] for b in behaviors}
-            self.log_message(f"Opening Bout Confirmer with video: {video_path}, bouts: {len(self.detailed_bouts_df)}", "INFO")
-            BoutConfirmationTool(master=self.root, video_path=video_path, detected_bouts_df=self.detailed_bouts_df, behavior_map=behavior_map)
+            raw_bouts = getattr(self, "raw_detected_bouts_df", pd.DataFrame())
+            if not isinstance(raw_bouts, pd.DataFrame) or raw_bouts.empty:
+                raw_bouts = self.detailed_bouts_df.copy(deep=True)
+                self.raw_detected_bouts_df = raw_bouts.copy(deep=True)
+            run_folder = str(getattr(self, "last_tab6_run_folder", "") or "").strip()
+            review_folder = run_folder or os.path.dirname(video_path)
+            autosave_path = os.path.join(
+                review_folder,
+                f"{os.path.splitext(os.path.basename(video_path))[0]}_reviewed_bouts.csv",
+            )
+
+            def _on_review_saved(review_df):
+                self.bout_review_workspace_df = review_df.copy(deep=True)
+
+            def _on_save_result(result):
+                if not result.succeeded:
+                    level = "WARNING" if str(result.status.value) == "partial" else "ERROR"
+                    self.log_message(result.message or result.error, level)
+                    return
+                authoritative_path = str(result.artifacts.get("authoritative_path", "") or "")
+                summary_path = str(result.artifacts.get("summary_path", "") or "")
+                try:
+                    self.detailed_bouts_df = pd.read_csv(authoritative_path)
+                    self.summary_bouts_df = pd.read_csv(summary_path) if summary_path else pd.DataFrame()
+                    self.authoritative_reviewed_bouts_df = self.detailed_bouts_df.copy(deep=True)
+                    self.last_reviewed_bouts_path = authoritative_path
+                    self._display_analytics_results()
+                    self._refresh_clustering_behaviors()
+                    self.log_message(
+                        f"Review complete: downstream Tab 6 tables now use {authoritative_path}",
+                        "INFO",
+                    )
+                    manifest_path = str(getattr(self, "last_tab6_manifest_path", "") or "").strip()
+                    if manifest_path and os.path.isfile(manifest_path):
+                        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+                        manifest = register_authoritative_review_in_manifest(
+                            manifest,
+                            result.artifacts,
+                        )
+                        safe_write_json(manifest_path, manifest, indent=2)
+                except Exception as exc:
+                    self.log_message(f"Failed to load authoritative reviewed bouts: {exc}", "ERROR")
+
+            self.log_message(f"Opening Bout Confirmer with video: {video_path}, bouts: {len(raw_bouts)}", "INFO")
+            BoutConfirmationTool(
+                master=self.root,
+                video_path=video_path,
+                detected_bouts_df=raw_bouts,
+                behavior_map=behavior_map,
+                autosave_path=autosave_path,
+                on_review_saved=_on_review_saved,
+                on_save_result=_on_save_result,
+            )
             self.log_message("Bout Confirmer opened successfully.", "INFO")
         except Exception as e:
             self.log_message(f"Failed to open Bout Confirmer: {e}\n{traceback.format_exc()}", "ERROR")
@@ -4134,6 +4379,11 @@ class YoloApp:
     def _open_roi_event_reviewer(self):
         self.log_message("Attempting to open ROI Event Reviewer...", "INFO")
         try:
+            if self._launch_integrated_review_workspace(
+                mode=SPATIAL_MODE,
+                event_kind=ROI_CONCURRENT,
+            ):
+                return
             video_path = self.config.get_setting("analytics.source_video_path_var")
             if not video_path:
                 raise FileNotFoundError("Please select a source video in the Bout Analytics tab.")
@@ -4451,7 +4701,7 @@ class YoloApp:
             messagebox.showerror("Navigation Error", f"Could not open the Behavior Clustering tab:\n{exc}", parent=self.root)
 
     def _open_advanced_analyzer(self, initial_bout_details=None, video_path=None):
-        self.log_message("Attempting to open Advanced Bout Scorer...", "INFO")
+        self.log_message("Attempting to open Manual Bout Scorer...", "INFO")
         try:
             if initial_bout_details is None:
                 try:
@@ -4487,7 +4737,7 @@ class YoloApp:
                 except Exception:
                     pass
 
-            self.log_message(f"Opening Advanced Bout Scorer with video: {video_path}", "INFO")
+            self.log_message(f"Opening Manual Bout Scorer with video: {video_path}", "INFO")
             AdvancedBoutAnalyzer(
                 parent=self.root,
                 video_path=video_path,
@@ -4498,10 +4748,10 @@ class YoloApp:
                 on_scores_saved=_on_scores_saved,
                 log_fn=self.log_message,
             )
-            self.log_message("Advanced Bout Scorer opened successfully.", "INFO")
+            self.log_message("Manual Bout Scorer opened successfully.", "INFO")
         except Exception as e:
-            self.log_message(f"Failed to open Advanced Bout Scorer: {e}\n{traceback.format_exc()}", "ERROR")
-            messagebox.showerror("Error", f"Failed to open Advanced Bout Scorer: {e}", parent=self.root)
+            self.log_message(f"Failed to open Manual Bout Scorer: {e}\n{traceback.format_exc()}", "ERROR")
+            messagebox.showerror("Error", f"Failed to open Manual Bout Scorer: {e}", parent=self.root)
 
     def _start_training(self):
         self.training_controller.start_training()

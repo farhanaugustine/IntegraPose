@@ -19,11 +19,28 @@ If you are doing a detection-only workflow, the file-based `Inference` tab is us
 | Area | What it covers |
 | --- | --- |
 | Model Artifact | Live model selection, including Model Registry |
-| Webcam Index | Camera device selection |
+| Webcam Device | Camera discovery and device selection |
 | Mode | Predict vs track behavior |
-| Thresholds | Confidence, IoU, image size, max detections |
-| Save options | Annotated video, YOLO text, raw capture |
-| ROI metrics | Live zone-aware summaries when enabled |
+| Inference Options | Confidence, IoU, device, image size, target FPS, frame skip, max detections, and tracker configuration |
+| Output Location | Project directory and run name |
+| Presets | Save or reload a webcam configuration |
+| Saving Options | Annotated video, always-on backup text labels, raw capture, CSV columns, rollover, and cleanup |
+| Real-time ROI Metrics | Reuse Tab 6 ROIs or maintain webcam-specific ROIs and export a CSV snapshot |
+
+The Detections CSV controls independently include track IDs, bounding boxes,
+class IDs, and keypoints. Long recordings can roll over at the configured
+maximum segment duration; automatic cleanup is optional and off by default.
+
+### ROI source modes
+
+| Mode | Use it when |
+| --- | --- |
+| `Tab 6 ROIs` | The live view should reuse the current Bout Analytics ROI definitions |
+| `Webcam-specific ROIs` | The camera needs its own ROI library; use Draw ROI, Rename, and Delete in this mode |
+
+Enable **Live ROI analytics** only after confirming that the selected ROI
+source matches the current camera framing. Use **Export Snapshot to CSV...**
+to save the current live summary.
 
 ## Typical live workflow
 
@@ -47,4 +64,7 @@ Select live pose model
 
 - Use `track` mode when identity continuity matters.
 - Keep image size and device settings realistic for your hardware.
+- Leave the device at `-1` for automatic CUDA/ROCm, MPS, or CPU selection; use an explicit value only when you need to pin a backend.
+- Use Preview Webcam before starting a saved run.
+- Check raw/annotated recording and rollover choices before a long session; text labels remain enabled as the backup record.
 - Use the Zone Counter plugin when you need a live region-entry counter on top of the webcam workflow.

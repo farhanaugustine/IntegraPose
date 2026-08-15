@@ -90,6 +90,7 @@ def build_inference_metadata(
     model_path: PathLike,
     conf_threshold: Optional[float] = None,
     iou_threshold: Optional[float] = None,
+    max_det: Optional[int] = None,
     use_tracker: bool = False,
     tracker_config: Optional[PathLike] = None,
     extra: Optional[dict[str, Any]] = None,
@@ -135,6 +136,11 @@ def build_inference_metadata(
         payload["conf_threshold"] = float(conf_threshold)
     if iou_threshold is not None:
         payload["iou_threshold"] = float(iou_threshold)
+    if max_det is not None:
+        parsed_max_det = int(max_det)
+        if parsed_max_det < 1:
+            raise ValueError("max_det must be at least 1 when recorded in inference metadata.")
+        payload["max_det"] = parsed_max_det
     if extra:
         payload.update(extra)
     return payload

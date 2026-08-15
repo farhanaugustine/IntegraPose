@@ -13,10 +13,6 @@ from integra_pose.gui.scrollable import create_scrollable_section
 try:
     from . import config as config_defaults
     from .main import run as run_single_video_analysis
-    from .compare_gait import main as compare_gait_main
-    from .advanced_behavioral_analysis import main as advanced_behavioral_main
-    from .decision_dynamics_analysis import main as decision_dynamics_main
-    from .compare_ccm import main as compare_ccm_main
 except ImportError as e:
     messagebox.showerror(
         "Missing Script Error",
@@ -244,7 +240,9 @@ class AnalysisGUI(tk.Toplevel):
             "Run Convergent Cross-Mapping (CCM)"
         ]
         for i, step in enumerate(steps):
-            var = tk.BooleanVar(value=True)
+            var = tk.BooleanVar(
+                value=step in {"Run Individual Video Analysis", "Compare Gait Metrics"}
+            )
             self.analysis_vars[step] = var
             ttk.Checkbutton(steps_frame, text=step, variable=var).pack(anchor=tk.W)
         control_frame = ttk.Frame(parent)
@@ -429,7 +427,8 @@ class AnalysisGUI(tk.Toplevel):
             filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")],
             title="Save Configuration As"
         )
-        if not filepath: return
+        if not filepath:
+            return
         config_dict = self.gather_current_config()
         try:
             with open(filepath, 'w') as f:
@@ -443,7 +442,8 @@ class AnalysisGUI(tk.Toplevel):
             filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")],
             title="Load Configuration File"
         )
-        if not filepath: return
+        if not filepath:
+            return
         try:
             with open(filepath, 'r') as f:
                 config_dict = json.load(f)
@@ -487,7 +487,10 @@ class AnalysisGUI(tk.Toplevel):
                         'output_dir': output_dir,
                         'yolo_dir': video_info['yolo_dir']
                     })()
-                    run_single_video_analysis(args, self.pipeline_config)
+                    result = run_single_video_analysis(args, self.pipeline_config)
+                    if not result.succeeded:
+                        detail = f" ({result.error})" if result.error else ""
+                        raise RuntimeError(f"{video_name}: {result.message}{detail}")
                     self.logger.info(f"--- Successfully completed analysis for: {video_name} ---\n")
             
             self.logger.info("\n--- Aggregating gait data... ---")
@@ -499,15 +502,23 @@ class AnalysisGUI(tk.Toplevel):
             ]
             if self.analysis_vars["Compare Gait Metrics"].get():
                 self.logger.info("\n--- Comparing gait metrics... ---")
+                from .compare_gait import main as compare_gait_main
+
                 compare_gait_main(self.base_results_dir, group_config, self.pipeline_config)
             if self.analysis_vars["Run Advanced Behavioral Analysis (UMAP)"].get():
                 self.logger.info("\n--- Running advanced behavioral analysis (UMAP)... ---")
+                from .advanced_behavioral_analysis import main as advanced_behavioral_main
+
                 advanced_behavioral_main(self.base_results_dir, group_config, self.pipeline_config)
             if self.analysis_vars["Run Decision Dynamics Analysis"].get():
                 self.logger.info("\n--- Analyzing decision dynamics... ---")
+                from .decision_dynamics_analysis import main as decision_dynamics_main
+
                 decision_dynamics_main(self.base_results_dir, group_config, self.pipeline_config)
             if self.analysis_vars["Run Convergent Cross-Mapping (CCM)"].get():
                 self.logger.info("\n--- Running Convergent Cross-Mapping (CCM) analysis... ---")
+                from .compare_ccm import main as compare_ccm_main
+
                 compare_ccm_main(self.base_results_dir, group_config, self.pipeline_config)
             self.logger.info("="*20 + " ALL SELECTED ANALYSES COMPLETE! " + "="*20)
         except Exception as e:

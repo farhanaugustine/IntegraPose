@@ -1,180 +1,248 @@
-import os
-import pandas as pd
+from __future__ import annotations
+
+from pathlib import Path
+
 import numpy as np
+
+from integra_pose.utils.frame_identity import (
+    FrameIdentityError,
+    resolve_frame_label_indices,
+)
+from integra_pose.utils.yolo_pose_labels import (
+    load_pose_label_schema,
+    parse_yolo_pose_label,
+)
+
 
 class YoloParser:
     def __init__(self, app):
         self.app = app
 
-    def validate_yolo_files(self, yolo_folder, sample_size=10):
-        """
-        Accepts YOLO-Pose txt with:
-          - 5 meta cols (class, x, y, w, h) OR 6 meta cols (class, x, y, w, h, conf)
-          - optional trailing track_id column
-        Ensures the remaining keypoint block is divisible by 3.
-        """
+    @staticmethod
+    def resolve_frame_files(yolo_folder, *, source=None):
+        """Return a unique zero-based ``frame -> filename`` lookup."""
+        directory = Path(yolo_folder)
+        if not directory.is_dir():
+            raise FileNotFoundError(f"YOLO output directory does not exist: {directory}")
+
+        filenames = sorted(
+            entry.name
+            for entry in directory.iterdir()
+            if entry.is_file()
+            and not entry.name.startswith(".")
+            and entry.suffix.lower() == ".txt"
+        )
+        frame_by_filename = resolve_frame_label_indices(filenames, source=source)
+        if not frame_by_filename:
+            raise FrameIdentityError(
+                "No frame-indexed detection TXT files were found. "
+                "Files such as classes.txt and notes.txt are not inference frames."
+            )
+        return {
+            frame_index: filename
+            for filename, frame_index in sorted(
+                frame_by_filename.items(),
+                key=lambda item: (item[1], item[0].casefold()),
+            )
+        }
+
+    @staticmethod
+    def _read_nonempty_rows(path: Path) -> list[list[str]]:
         try:
-            txt_files = [f for f in os.listdir(yolo_folder) if f.endswith('.txt')]
-            if not txt_files:
-                return False, 0, "No .txt files found in YOLO folder."
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"Could not read {path.name}: {exc}") from exc
+        return [line.split() for line in lines if line.strip()]
+
+    @staticmethod
+    def _infer_legacy_keypoint_count(values: list[str]) -> int:
+        """Infer a legacy pose count, preferring 3D rows with short suffixes."""
+        value_count = len(values)
+        candidates: list[tuple[int, int, int]] = []
+        for suffix_count in (0, 1, 2):
+            pose_value_count = value_count - 5 - suffix_count
+            if pose_value_count <= 0:
+                continue
+            for dimensions in (3, 2):
+                if pose_value_count % dimensions == 0:
+                    keypoint_count = pose_value_count // dimensions
+                    candidates.append((suffix_count, -dimensions, keypoint_count))
+        if not candidates:
+            raise ValueError(
+                f"Could not infer a pose layout from a {value_count}-column row."
+            )
+        return min(candidates)[2]
+
+    def validate_yolo_files(
+        self,
+        yolo_folder,
+        sample_size=10,
+        *,
+        source=None,
+        expected_keypoints=None,
+    ):
+        """Validate frame labels and return their consistent keypoint count."""
+        try:
+            frame_lookup = self.resolve_frame_files(yolo_folder, source=source)
+            try:
+                schema = load_pose_label_schema(
+                    yolo_folder,
+                    expected_keypoint_count=expected_keypoints,
+                )
+            except ValueError as exc:
+                return False, 0, str(exc)
+
+            detected_keypoint_count = schema.keypoint_count if schema is not None else None
+            if expected_keypoints is not None:
+                detected_keypoint_count = int(expected_keypoints)
+
+            ordered_files = list(frame_lookup.values())
             if sample_size > 0:
-                txt_files = txt_files[:min(sample_size, len(txt_files))]
+                ordered_files = ordered_files[: min(sample_size, len(ordered_files))]
 
-            def looks_like_track_col(series):
-                s = series.dropna()
-                if s.empty: return False
-                try:
-                    s_vals = s.to_numpy(dtype=float)
-                except Exception:
-                    return False
-                if not (s_vals == s_vals.round()).all():
-                    return False
-                if not ((s_vals >= 0) & (s_vals <= 1e9)).all():
-                    return False
-                return True
+            parsed_rows = 0
+            for filename in ordered_files:
+                rows = self._read_nonempty_rows(Path(yolo_folder) / filename)
+                for line_number, values in enumerate(rows, start=1):
+                    row_keypoint_count = detected_keypoint_count
+                    if row_keypoint_count is None:
+                        row_keypoint_count = self._infer_legacy_keypoint_count(values)
+                    try:
+                        parsed = parse_yolo_pose_label(
+                            values,
+                            keypoint_count=row_keypoint_count,
+                            schema=schema,
+                        )
+                    except ValueError as exc:
+                        return (
+                            False,
+                            0,
+                            f"Invalid pose row in {filename}:{line_number}: {exc}",
+                        )
+                    if detected_keypoint_count is None:
+                        detected_keypoint_count = len(parsed.keypoints)
+                    elif len(parsed.keypoints) != detected_keypoint_count:
+                        return (
+                            False,
+                            0,
+                            "Inconsistent keypoint counts across inference labels: "
+                            f"{filename}:{line_number} has {len(parsed.keypoints)}, "
+                            f"expected {detected_keypoint_count}.",
+                        )
+                    parsed_rows += 1
 
-            detected_counts = []
-            for filename in txt_files:
-                filepath = os.path.join(yolo_folder, filename)
-                try:
-                    df_raw = pd.read_csv(filepath, sep=' ', header=None, dtype=str)
-                    df = df_raw.apply(pd.to_numeric, errors='coerce')
-                except Exception as e:
-                    return False, 0, f"Invalid data in {filename}: {e}"
-                total_cols = len(df.columns)
-                if total_cols < 6:
-                    return False, 0, f"Invalid format in {filename}: {total_cols} columns."
+            if detected_keypoint_count is None or parsed_rows == 0:
+                return False, 0, "No pose detections were found in the frame label files."
+            return True, detected_keypoint_count, ""
+        except (FileNotFoundError, FrameIdentityError, ValueError) as exc:
+            return False, 0, f"Validation error: {exc}"
 
-                has_track = looks_like_track_col(df.iloc[:, -1])
-                track_col = (total_cols - 1) if has_track else None
-
-                kp_count = None
-                for meta_len in (6, 5):
-                    kp_end = track_col if track_col is not None else total_cols
-                    kp_vals = kp_end - meta_len
-                    if kp_vals > 0 and kp_vals % 3 == 0:
-                        kp_count = kp_vals // 3
-                        break
-                if kp_count is None:
-                    return False, 0, f"Could not infer keypoints in {filename} (cols={total_cols}, track_id={has_track})."
-                detected_counts.append(kp_count)
-
-            uniq = set(detected_counts)
-            if len(uniq) != 1:
-                return False, 0, f"Inconsistent keypoint counts across files: {sorted(uniq)}"
-            return True, detected_counts[0], ""
-        except Exception as e:
-            return False, 0, f"Validation error: {e}"
-
-    def get_pose_from_frame(self, frame_num, filename=None, track_id=None, expected_keypoints=None):
-        """
-        Extracts pose data from a YOLO output file for a given frame and (optional) track ID.
-        Handles both 5-meta (no conf) and 6-meta (with conf) layouts, and optional trailing track_id.
-        Returns: (pose_xy_flat: np.ndarray shape (2K,), detected_keypoints: int) or (None, None)
-        """
+    def _configured_source(self):
         try:
-            yolo_folder = self.app.config.get_setting('analytics.yolo_output_path_var')
+            return self.app.config.get_setting("analytics.source_video_path_var") or None
+        except Exception:
+            return None
+
+    def get_pose_from_frame(
+        self,
+        frame_num,
+        filename=None,
+        track_id=None,
+        expected_keypoints=None,
+    ):
+        """Extract normalized XY pose data for one frame and optional track."""
+        try:
+            yolo_folder = self.app.config.get_setting("analytics.yolo_output_path_var")
             if not yolo_folder:
                 self.app.log_message("YOLO output folder not set.", "ERROR")
                 return None, None
+
             if filename is None:
-                filename = f"frame_{frame_num}.txt"
-            filepath = os.path.join(yolo_folder, filename)
-            if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
-                self.app.log_message(f"YOLO output file not found or empty: {filepath}", "WARNING")
+                try:
+                    frame_lookup = self.resolve_frame_files(
+                        yolo_folder,
+                        source=self._configured_source(),
+                    )
+                except (FileNotFoundError, FrameIdentityError) as exc:
+                    self.app.log_message(f"Could not resolve YOLO frame files: {exc}", "ERROR")
+                    return None, None
+                filename = frame_lookup.get(int(frame_num))
+                if filename is None:
+                    self.app.log_message(
+                        f"No YOLO output file maps to frame {frame_num}.",
+                        "WARNING",
+                    )
+                    return None, None
+
+            filepath = Path(yolo_folder) / filename
+            if not filepath.is_file():
+                self.app.log_message(f"YOLO output file not found: {filepath}", "WARNING")
                 return None, None
 
             try:
-                df_raw = pd.read_csv(filepath, sep=' ', header=None, dtype=str)
-                df = df_raw.apply(pd.to_numeric, errors='coerce')
-            except Exception as e:
-                self.app.log_message(f"Failed to load {filename}: {e}", "ERROR")
+                schema = load_pose_label_schema(
+                    yolo_folder,
+                    expected_keypoint_count=expected_keypoints,
+                )
+                rows = self._read_nonempty_rows(filepath)
+            except ValueError as exc:
+                self.app.log_message(str(exc), "ERROR")
                 return None, None
+            if not rows:
+                return None, schema.keypoint_count if schema is not None else expected_keypoints
 
-            total_cols = len(df.columns)
-            if total_cols < 6:
-                self.app.log_message(f"Invalid YOLO format in {filename}: {total_cols} columns", "ERROR")
-                return None, None
+            keypoint_count = (
+                schema.keypoint_count
+                if schema is not None
+                else int(expected_keypoints)
+                if expected_keypoints is not None
+                else self._infer_legacy_keypoint_count(rows[0])
+            )
 
-            def looks_like_track_col(series):
-                s = series.dropna()
-                if s.empty: return False
+            saw_untracked_detection = False
+            for line_number, values in enumerate(rows, start=1):
                 try:
-                    s_vals = s.to_numpy(dtype=float)
-                except Exception:
-                    return False
-                if not (s_vals == s_vals.round()).all():
-                    return False
-                if not ((s_vals >= 0) & (s_vals <= 1e9)).all():
-                    return False
-                return True
-
-            has_track = looks_like_track_col(df.iloc[:, -1])
-            track_col = (total_cols - 1) if has_track else None
-
-            chosen_meta_len = None
-            for meta_len in (6, 5):
-                kp_end = track_col if track_col is not None else total_cols
-                kp_vals = kp_end - meta_len
-                if kp_vals > 0 and kp_vals % 3 == 0:
-                    chosen_meta_len = meta_len
-                    break
-            if chosen_meta_len is None:
-                self.app.log_message(f"Could not infer keypoint layout for {filename}", "ERROR")
-                return None, None
-
-            keypoint_start = chosen_meta_len
-            keypoint_end = track_col if track_col is not None else total_cols
-            detected_keypoints = (keypoint_end - keypoint_start) // 3
-
-            if expected_keypoints is not None and detected_keypoints != expected_keypoints:
-                self.app.log_message(
-                    f"Keypoint count mismatch in {filename}: found {detected_keypoints}, expected {expected_keypoints}",
-                    "WARNING"
-                )
-
-            detection_series = None
-            if track_id is not None:
-                if has_track:
-                    try:
-                        track_series = df.iloc[:, -1].round().astype("Int64")
-                        mask = track_series == int(track_id)
-                        df_track = df[mask]
-                    except Exception:
-                        df_track = pd.DataFrame()
-                    if df_track.empty:
-                        self.app.log_message(
-                            f"No detection for track {track_id} in frame file {filename}",
-                            "DEBUG"
-                        )
-                        return None, detected_keypoints
-                    detection_series = df_track.iloc[0]
-                else:
-                    self.app.log_message(
-                        f"Track ID {track_id} requested but {filename} lacks tracking data; skipping frame.",
-                        "WARNING",
+                    parsed = parse_yolo_pose_label(
+                        values,
+                        keypoint_count=keypoint_count,
+                        schema=schema,
                     )
-                    return None, detected_keypoints
-            else:
-                detection_series = df.iloc[0]
+                except ValueError as exc:
+                    self.app.log_message(
+                        f"Invalid pose row in {filename}:{line_number}: {exc}",
+                        "ERROR",
+                    )
+                    return None, None
 
-            kp_slice = detection_series.iloc[keypoint_start:keypoint_end].to_numpy()
-            if kp_slice.size != detected_keypoints * 3:
-                self.app.log_message(
-                    f"Keypoint slice size mismatch in {filename}: got {kp_slice.size}, expected {detected_keypoints*3}",
-                    "DEBUG"
-                )
-                return None, None
+                if track_id is not None:
+                    if parsed.track_id is None:
+                        saw_untracked_detection = True
+                        continue
+                    if parsed.track_id != int(track_id):
+                        continue
 
-            kp_triplets = kp_slice.reshape(-1, 3)
-            keypoints_xy = kp_triplets[:, :2].astype(float).flatten()
+                keypoints_xy = np.asarray(
+                    [(point[0], point[1]) for point in parsed.keypoints],
+                    dtype=float,
+                ).reshape(-1)
+                if not np.all(np.isfinite(keypoints_xy)):
+                    self.app.log_message(
+                        f"Non-finite keypoint values in {filename}:{line_number}",
+                        "ERROR",
+                    )
+                    return None, None
+                return keypoints_xy, len(parsed.keypoints)
 
-            if not np.all(np.isfinite(keypoints_xy)):
-                self.app.log_message(f"Non-finite values in keypoints for {filename}", "DEBUG")
-                return None, None
-
-            return keypoints_xy, detected_keypoints
-
-        except Exception as e:
-            self.app.log_message(f"Error extracting pose for track {track_id} in {filename}: {e}", "ERROR")
+            if track_id is not None:
+                if saw_untracked_detection:
+                    detail = f"{filename} lacks tracking data"
+                else:
+                    detail = f"no detection matched track {track_id} in {filename}"
+                self.app.log_message(f"Could not extract track {track_id}: {detail}.", "WARNING")
+            return None, keypoint_count
+        except Exception as exc:
+            self.app.log_message(
+                f"Error extracting pose for track {track_id} in {filename}: {exc}",
+                "ERROR",
+            )
             return None, None

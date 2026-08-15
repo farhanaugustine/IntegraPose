@@ -70,8 +70,10 @@ import argparse
 import csv
 import json
 import os
+import queue
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
@@ -93,19 +95,132 @@ TEMPORAL_SPLITTER_CONFIG_KEY = "temporal_splitter"
 LEGACY_V25_SPLITTER_CONFIG_KEY = "v25_splitter"
 
 
-def safe_torch_load(path: Path | str, *, map_location=None):
-    """Load local checkpoints without unsafe pickle execution when supported."""
-    try:
-        return torch.load(str(path), map_location=map_location, weights_only=True)
-    except TypeError:
-        # PyTorch versions before weights_only support.
-        return torch.load(str(path), map_location=map_location)
+class _AsyncVideoWriter:
+    """Encode ordered frames off the inference thread without dropping any."""
+
+    _STOP = object()
+
+    def __init__(
+        self,
+        path: str,
+        fourcc: int,
+        fps: float,
+        frame_size: tuple[int, int],
+        *,
+        queue_depth: int = 32,
+    ) -> None:
+        self._path = str(path)
+        self._fourcc = int(fourcc)
+        self._fps = float(fps)
+        self._frame_size = tuple(int(v) for v in frame_size)
+        self._queue: queue.Queue[object] = queue.Queue(maxsize=max(1, int(queue_depth)))
+        self._ready = threading.Event()
+        self._opened = False
+        self._released = False
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._worker,
+            name="TandemYTC-video-writer",
+            daemon=True,
+        )
+        self._thread.start()
+        if not self._ready.wait(timeout=10.0):
+            raise RuntimeError(f"Timed out opening VideoWriter at {self._path}")
+        self._raise_if_failed()
+
+    def _worker(self) -> None:
+        writer = None
+        try:
+            writer = cv2.VideoWriter(
+                self._path,
+                self._fourcc,
+                self._fps,
+                self._frame_size,
+            )
+            self._opened = bool(writer.isOpened())
+            self._ready.set()
+            if not self._opened:
+                return
+            while True:
+                item = self._queue.get()
+                try:
+                    if item is self._STOP:
+                        return
+                    writer.write(item)
+                finally:
+                    self._queue.task_done()
+        except BaseException as exc:  # surfaced on write/release in main thread
+            self._error = exc
+            self._ready.set()
+        finally:
+            if writer is not None:
+                writer.release()
+
+    def _raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise RuntimeError(f"VideoWriter failed for {self._path}") from self._error
+
+    def isOpened(self) -> bool:  # match the small cv2.VideoWriter API we use
+        return self._opened and self._error is None and not self._released
+
+    def write(self, frame: np.ndarray) -> None:
+        if self._released:
+            raise RuntimeError("Cannot write after VideoWriter.release()")
+        while True:
+            self._raise_if_failed()
+            try:
+                self._queue.put(frame, timeout=0.1)
+                return
+            except queue.Full:
+                if not self._thread.is_alive():
+                    self._raise_if_failed()
+                    raise RuntimeError(f"VideoWriter thread stopped for {self._path}")
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        if self._thread.is_alive():
+            while True:
+                self._raise_if_failed()
+                try:
+                    self._queue.put(self._STOP, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+            self._thread.join()
+        self._raise_if_failed()
+
+
+def _poll_preview_key() -> int:
+    """Poll OpenCV GUI events without Windows' waitKey timer delay."""
+    poll_key = getattr(cv2, "pollKey", None)
+    if callable(poll_key):
+        return int(poll_key()) & 0xFF
+    return int(cv2.waitKey(1)) & 0xFF
+
+
+try:  # pragma: no cover - package/script dual use
+    from safe_checkpoint_io import safe_torch_load
+except ImportError:  # pragma: no cover
+    from .safe_checkpoint_io import safe_torch_load
 
 
 try:
     from torch.amp import autocast as _autocast
 except ImportError:  # torch < 2.0
     from torch.cuda.amp import autocast as _autocast  # type: ignore[no-redef]
+
+try:  # pragma: no cover - package/script dual use
+    from integra_pose.utils.torch_backend import (
+        detect_torch_backend,
+        enable_cudnn_benchmark_if_available,
+        resolve_amp_dtype,
+    )
+except Exception:  # pragma: no cover
+    detect_torch_backend = None
+    enable_cudnn_benchmark_if_available = None
+    resolve_amp_dtype = None
 
 
 # ----------------------------------------------------------------------------
@@ -184,6 +299,8 @@ def _resolve_amp_dtype(requested: str) -> str:
     whatever dtype the checkpoint was trained with.
     """
     if requested == "auto":
+        if resolve_amp_dtype is not None:
+            return resolve_amp_dtype(requested)
         return "bf16" if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else "fp16"
     return requested
 
@@ -474,6 +591,19 @@ def detections_to_window_batch(
         pose_self_feats = np.zeros((T, n_animals, D), dtype=np.float32)
 
     rel_pose_conf = (pose_conf[:, :, None] * pose_conf[:, None, :]).astype(np.float32)
+    reliability = np.stack(
+        [pose_conf, crop_conf, track_conf, track_age],
+        axis=-1,
+    ).astype(np.float32, copy=False)
+    pose_input = np.concatenate([pose_self_feats, reliability], axis=-1)
+    relation_input = np.concatenate(
+        [
+            rel_features,
+            rel_pose_conf[..., None],
+            rel_present[..., None].astype(np.float32),
+        ],
+        axis=-1,
+    )
 
     out = {
         "animal_mask": torch.from_numpy(animal_mask).unsqueeze(0),
@@ -487,6 +617,11 @@ def detections_to_window_batch(
         "relation_pose_mask": torch.from_numpy(rel_pose_mask).unsqueeze(0),
         "relation_pose_conf": torch.from_numpy(rel_pose_conf).unsqueeze(0),
         "relation_present": torch.from_numpy(rel_present).unsqueeze(0),
+        # Inference-only preassembled inputs reduce many tiny host-to-device
+        # transfers and concatenation kernels. model_y keeps the original-key
+        # fallback for training batches and external callers.
+        "pose_input": torch.from_numpy(pose_input).unsqueeze(0),
+        "relation_input": torch.from_numpy(relation_input).unsqueeze(0),
     }
     return out
 
@@ -498,7 +633,7 @@ def detections_to_window_batch(
 def load_model_from_checkpoint(
     checkpoint_path: Path | str,
     config_json: Path | str | None,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    device: str = "auto",
     yolo_weights_fallback: str | None = None,
 ):
     """Reconstruct the trained TandemYTC model from a checkpoint.
@@ -508,6 +643,7 @@ def load_model_from_checkpoint(
     key; passing the CLI value here makes the function self-contained
     instead of relying on a free `args` reference at module scope.
     """
+    device = normalize_device(device)
     checkpoint = safe_torch_load(checkpoint_path, map_location="cpu")
     checkpoint_cfg = None
     if isinstance(checkpoint, dict):
@@ -849,6 +985,9 @@ def _detection_stream(
     fps: float,
     yolo_batch: int,
     yield_orig_frame: bool = False,
+    yolo_imgsz: int = 640,
+    yolo_half: bool = False,
+    yolo_tracker: str = "bytetrack.yaml",
 ):
     yield from iterate_yolo_n_crops(
         model_yolo,
@@ -865,6 +1004,12 @@ def _detection_stream(
         fps=fps,
         batch_size=yolo_batch,
         yield_orig_frame=yield_orig_frame,
+        imgsz=yolo_imgsz,
+        half=yolo_half,
+        tracker=yolo_tracker,
+        # Live streams should discard stale frames rather than building a
+        # latency-producing queue. This is also the low-memory offline default.
+        stream_buffer=False,
     )
 
 
@@ -903,12 +1048,17 @@ def run_inference_on_source(
     train_window_stride: Optional[int] = None,
     amp_enabled: bool = False,
     amp_dtype_torch=None,
+    autocast_device_type: str = "cuda",
     threshold_decoder: Optional[dict] = None,
     v25_splitter_config: Optional[dict] = None,
     export_pose: bool = False,
     csv_flush_interval: int = 1,
     preview: bool = False,
     preview_window_name: str = "TandemYTC Live Preview",
+    yolo_imgsz: int = 640,
+    yolo_half: bool = False,
+    yolo_tracker: str = "bytetrack.yaml",
+    max_frames: int = 0,
 ) -> dict:
     output_csv = Path(output_csv)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -953,9 +1103,12 @@ def run_inference_on_source(
     buffer: List[NCropDetection] = []
     window_idx = 0
     n_windows_written = 0
+    frames_processed = 0
     csv_flush_interval = max(1, int(csv_flush_interval))
     t0 = time.time()
     last_log = t0
+    last_realtime_log = 0.0
+    next_stop_flag_poll = 0.0
     stopped_early = False
     # Accumulated for post-loop smoothed frame-level CSV. Each entry is
     # (start_frame, end_frame_inclusive, probs_array). Populated whenever
@@ -973,10 +1126,11 @@ def run_inference_on_source(
             pass
 
     current_label: Optional[str] = None
+    current_class_id: Optional[int] = None
     current_conf: Optional[float] = None
     current_probs: Optional[np.ndarray] = None
     n_frames_written_video = 0
-    video_writer: Optional[cv2.VideoWriter] = None
+    video_writer: Optional[_AsyncVideoWriter] = None
     want_video = output_video is not None
     want_preview = bool(preview)
     want_overlay = want_video or want_preview
@@ -986,7 +1140,7 @@ def run_inference_on_source(
             return True
         try:
             cv2.imshow(str(preview_window_name or "TandemYTC Live Preview"), frame_bgr)
-            key = cv2.waitKey(1) & 0xFF
+            key = _poll_preview_key()
             if key in (27, ord("q"), ord("Q")):
                 _request_stop("live preview close requested")
                 return False
@@ -1025,10 +1179,21 @@ def run_inference_on_source(
             animal_scale_factor, group_scale_factor, body_length_px,
             device, keep_last_box, pose_conf_threshold, fps, yolo_batch,
             yield_orig_frame=want_overlay,
+            yolo_imgsz=yolo_imgsz,
+            yolo_half=yolo_half,
+            yolo_tracker=yolo_tracker,
         ):
+            if max_frames > 0 and frames_processed >= int(max_frames):
+                break
+            frames_processed += 1
             metrics.frame_seen()
             # ---- graceful stop check ----
-            if _STOP_REQUESTED or stop_flag_file.exists():
+            stop_flag_seen = False
+            poll_now = time.monotonic()
+            if poll_now >= next_stop_flag_poll:
+                stop_flag_seen = stop_flag_file.exists()
+                next_stop_flag_poll = poll_now + 0.10
+            if _STOP_REQUESTED or stop_flag_seen:
                 stopped_early = True
                 if not _STOP_REQUESTED:
                     _request_stop(f"sentinel file {stop_flag_file}")
@@ -1054,7 +1219,9 @@ def run_inference_on_source(
                         "bbox_y2":    round(float(_bbox[3]), 2),
                         "bbox_conf":  round(float(det.crop_conf[_ai]) if _ai < len(det.crop_conf) else float("nan"), 4),
                         "predicted_class":    current_label if current_label is not None else "",
-                        "predicted_class_id": int(pred_id) if "pred_id" in locals() else -1,
+                        "predicted_class_id": (
+                            int(current_class_id) if current_class_id is not None else -1
+                        ),
                         "class_conf":         round(float(current_conf), 4) if current_conf is not None else float("nan"),
                     }
                     for _ki in range(num_keypoints):
@@ -1066,7 +1233,7 @@ def run_inference_on_source(
             if want_video and video_writer is None and det.orig_frame_bgr is not None:
                 h, w = det.orig_frame_bgr.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*video_fourcc)
-                video_writer = cv2.VideoWriter(
+                video_writer = _AsyncVideoWriter(
                     str(output_video), fourcc, float(fps), (int(w), int(h))
                 )
                 if not video_writer.isOpened():
@@ -1078,7 +1245,11 @@ def run_inference_on_source(
                     print(f"[infer] writing annotated video -> {output_video}  "
                           f"({w}x{h} @ {fps:.2f} fps, fourcc={video_fourcc})", flush=True)
 
-            if want_overlay and det.orig_frame_bgr is not None:
+            if (
+                want_overlay
+                and det.orig_frame_bgr is not None
+                and not (realtime and not smooth_bouts)
+            ):
                 if not smooth_bouts:
                     # "latest wins" path: write the frame immediately with
                     # whatever the most recent window predicted.
@@ -1094,6 +1265,10 @@ def run_inference_on_source(
                         draw_keypoints=draw_keypoints,
                         draw_header=draw_header,
                     )
+                    # The temporal buffer only needs compact detection arrays.
+                    # Release the full-resolution frame as soon as its overlay
+                    # has been produced so it is not retained for num_frames.
+                    det.orig_frame_bgr = None
                     if annotated is not None:
                         if video_writer is not None:
                             video_writer.write(annotated)
@@ -1140,6 +1315,7 @@ def run_inference_on_source(
                             draw_keypoints=draw_keypoints,
                             draw_header=draw_header,
                         )
+                        d0.orig_frame_bgr = None
                         if annotated is not None:
                             if video_writer is not None:
                                 video_writer.write(annotated)
@@ -1159,7 +1335,7 @@ def run_inference_on_source(
                 )
                 _infer_dtype = amp_dtype_torch if amp_dtype_torch is not None else torch.float16
                 with metrics.stage("classify"):
-                    with torch.inference_mode(), _autocast("cuda", dtype=_infer_dtype, enabled=amp_enabled):
+                    with torch.inference_mode(), _autocast(autocast_device_type, dtype=_infer_dtype, enabled=amp_enabled):
                         logits = model(batch).detach().cpu()
                 probs = softmax(logits.float()).squeeze(0).numpy()
                 pred_id = int(apply_threshold_decoder_probs(probs, threshold_decoder))
@@ -1189,6 +1365,7 @@ def run_inference_on_source(
                     window_records.append((start_frame, end_frame, probs.copy()))
 
                 current_label = idx_to_class.get(pred_id, str(pred_id))
+                current_class_id = pred_id
                 current_conf = float(probs[pred_id])
                 current_probs = probs
 
@@ -1200,15 +1377,48 @@ def run_inference_on_source(
                             pending_prob_sum[f] = pending_prob_sum[f] + probs.astype(np.float64)
                             pending_prob_count[f] = pending_prob_count.get(f, 0) + 1
 
-                if realtime or print_each_window:
+                now_for_log = time.monotonic()
+                if print_each_window or (realtime and now_for_log - last_realtime_log >= 1.0):
                     print(
                         f"[infer] win {window_idx:5d}  f{start_frame:6d}-{end_frame:6d}  "
                         f"-> {idx_to_class.get(pred_id, str(pred_id))}  ({probs[pred_id]:.2f})",
                         flush=True,
                     )
+                    last_realtime_log = now_for_log
 
                 window_idx += 1
                 buffer = buffer[window_stride:]
+
+            # In the low-latency path, render after classifying the window
+            # ending at this frame. The previous order displayed yesterday's
+            # label for one extra frame even when inference stride was one.
+            if (
+                realtime
+                and want_overlay
+                and not smooth_bouts
+                and det.orig_frame_bgr is not None
+            ):
+                annotated = annotate_frame_n(
+                    det,
+                    label=current_label,
+                    confidence=current_conf,
+                    fps=fps,
+                    class_probs=(
+                        current_probs.tolist() if current_probs is not None else None
+                    ),
+                    class_names=class_names,
+                    draw_bboxes=draw_bboxes,
+                    draw_keypoints=draw_keypoints,
+                    draw_header=draw_header,
+                )
+                det.orig_frame_bgr = None
+                if annotated is not None:
+                    if video_writer is not None:
+                        video_writer.write(annotated)
+                        n_frames_written_video += 1
+                    if not _preview_frame(annotated):
+                        stopped_early = True
+                        break
 
             if not realtime and not print_each_window:
                 now = time.time()
@@ -1271,6 +1481,7 @@ def run_inference_on_source(
                         draw_keypoints=draw_keypoints,
                         draw_header=draw_header,
                     )
+                    d0.orig_frame_bgr = None
                     if annotated is not None:
                         if video_writer is not None:
                             video_writer.write(annotated)
@@ -1284,8 +1495,8 @@ def run_inference_on_source(
         if video_writer is not None:
             try:
                 video_writer.release()
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[warn] asynchronous VideoWriter close failed: {exc}", flush=True)
         if want_preview:
             try:
                 cv2.destroyWindow(str(preview_window_name or "TandemYTC Live Preview"))
@@ -1331,7 +1542,11 @@ def run_inference_on_source(
                 print(f"[warn] failed to write smoothed frames CSV: {_e}", flush=True)
 
     elapsed = time.time() - t0
-    summary_parts = [f"windows={n_windows_written}", f"csv={output_csv}"]
+    summary_parts = [
+        f"frames={frames_processed}",
+        f"windows={n_windows_written}",
+        f"csv={output_csv}",
+    ]
     if want_video and output_video is not None:
         summary_parts.append(f"video={output_video} ({n_frames_written_video} frames)")
     if want_preview:
@@ -1339,7 +1554,7 @@ def run_inference_on_source(
     if stopped_early:
         summary_parts.append("[stopped early]")
     print(f"[infer] done in {elapsed:.1f}s  " + "  ".join(summary_parts), flush=True)
-    summary = {"windows": n_windows_written, "elapsed_s": elapsed,
+    summary = {"windows": n_windows_written, "frames": frames_processed, "elapsed_s": elapsed,
                "csv": str(output_csv), "stopped_early": stopped_early}
     if want_video and output_video is not None:
         summary["video"] = str(output_video)
@@ -1353,6 +1568,25 @@ def run_inference_on_source(
 # ----------------------------------------------------------------------------
 
 VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv", ".seq")
+
+
+def resolve_source_fps(source: str | int, fallback_fps: float) -> float:
+    """Use container FPS for ordinary video files and a fallback for live/SEQ sources."""
+    fallback = max(float(fallback_fps), 1e-6)
+    if isinstance(source, int):
+        return fallback
+    source_text = str(source)
+    path = Path(source_text)
+    if "://" in source_text or path.suffix.lower() == ".seq" or not path.is_file():
+        return fallback
+    cap = cv2.VideoCapture(source_text)
+    try:
+        detected = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) if cap.isOpened() else 0.0
+    finally:
+        cap.release()
+    if np.isfinite(detected) and 0.1 <= detected <= 1000.0:
+        return detected
+    return fallback
 
 
 def resolve_sources(source: str) -> List[Tuple]:
@@ -1390,6 +1624,9 @@ def parse_args():
     p.add_argument("--print_each_window", action="store_true")
     p.add_argument("--num_frames", type=int, default=0)
     p.add_argument("--window_stride", type=int, default=0)
+    p.add_argument("--max_frames", type=int, default=0,
+                   help="Stop after N processed source frames (0 = all). Useful for "
+                        "repeatable performance/compatibility benchmarks.")
     p.add_argument("--crop_size", type=int, default=224)
     p.add_argument("--animal_scale_factor", type=float, default=4.0)
     p.add_argument("--group_scale_factor", type=float, default=8.0)
@@ -1411,8 +1648,22 @@ def parse_args():
     p.add_argument("--keep_last_box", action="store_true", default=True)
     p.add_argument("--pose_conf_threshold", type=float, default=0.3)
     p.add_argument("--yolo_batch", type=int, default=25)
+    p.add_argument("--yolo_imgsz", type=int, default=640,
+                   help="YOLO inference image size. Smaller values improve FPS at an "
+                        "accuracy cost; use a multiple of the model stride.")
+    p.add_argument(
+        "--yolo_half",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use FP16 for YOLO on CUDA. By default this follows --amp, so the "
+             "GUI's Inference AMP switch accelerates both YOLO and the temporal head.",
+    )
+    p.add_argument("--yolo_tracker", default="bytetrack.yaml",
+                   help="Ultralytics tracker config. ByteTrack is the fast default for "
+                        "fixed-camera animal video; use botsort.yaml when camera-motion "
+                        "compensation is required.")
     p.add_argument("--fps", type=float, default=30.0)
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default="auto")
     # ---- Annotated video export ----
     p.add_argument("--output_video", default=None,
                    help="Annotated MP4 path (single-source mode).")
@@ -1463,8 +1714,8 @@ def parse_args():
                         "predictions output.")
     p.add_argument("--metrics_log_interval", type=int, default=30,
                    help="Number of windows between metrics CSV rows. "
-                        "Default 30 ~= 1 second of source video at 30 fps "
-                        "with stride 16.")
+                        "With real-time stride 1, the default corresponds to "
+                        "about one second of source video at 30 fps.")
     p.add_argument("--csv_flush_interval", type=int, default=1,
                    help="Flush prediction CSV every N windows. Default 1 preserves "
                         "the most conservative crash-recovery behavior. Higher values "
@@ -1519,9 +1770,9 @@ def parse_args():
                    type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     # ---- Inference AMP (independent of training AMP) ----
     p.add_argument("--amp", action="store_true", default=False,
-                   help="Enable mixed-precision for the classifier forward pass during "
-                        "inference. Independent of the training --amp flag. "
-                        "Inference AMP precision is recorded in the infer_meta JSON.")
+                   help="Enable mixed-precision for the classifier forward pass and, "
+                        "unless overridden by --no-yolo_half, FP16 YOLO inference. "
+                        "Independent of the training --amp flag.")
     p.add_argument("--amp_dtype", choices=["auto", "fp16", "bf16"], default="auto",
                    help="Inference AMP dtype. 'auto' selects bf16 on Ampere+, fp16 elsewhere.")
     return p.parse_args()
@@ -1589,10 +1840,12 @@ def main():
             config_path = str(candidate)
             print(f"[infer] auto-detected model_config={config_path}", flush=True)
 
-    device = normalize_device(args.device) if args.device else (
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
-    if device.startswith("cuda") and torch.cuda.is_available():
+    yolo_backend_info = detect_torch_backend(args.device) if detect_torch_backend is not None else None
+    device = yolo_backend_info.device if yolo_backend_info is not None else normalize_device(args.device)
+    if enable_cudnn_benchmark_if_available is not None:
+        if yolo_backend_info is not None:
+            enable_cudnn_benchmark_if_available(yolo_backend_info)
+    elif device.startswith("cuda") and torch.cuda.is_available():
         try:
             torch.backends.cudnn.benchmark = True
         except Exception:
@@ -1623,7 +1876,15 @@ def main():
         checkpoint=checkpoint,
     )
     num_frames = int(args.num_frames or cfg.get("num_frames", 32))
-    window_stride = int(args.window_stride or cfg.get("window_stride", max(num_frames // 2, 1)))
+    # A live viewer needs a new decision whenever a new frame arrives. Keep
+    # the training/config stride for offline work, but make --realtime dense
+    # by default. An explicit positive --window_stride always wins.
+    if int(args.window_stride) > 0:
+        window_stride = int(args.window_stride)
+    elif bool(args.realtime):
+        window_stride = 1
+    else:
+        window_stride = int(cfg.get("window_stride", max(num_frames // 2, 1)))
     if num_frames <= 0:
         raise SystemExit(f"num_frames={num_frames}; expected a positive integer.")
     if window_stride <= 0:
@@ -1640,9 +1901,17 @@ def main():
         )
 
     # Inference AMP — resolved independently of training AMP.
-    _infer_amp_active = bool(args.amp) and torch.cuda.is_available()
+    supports_cuda_api = yolo_backend_info.supports_cuda_api if yolo_backend_info is not None else (
+        device.startswith("cuda") and torch.cuda.is_available()
+    )
+    autocast_device_type = (
+        yolo_backend_info.autocast_device_type
+        if yolo_backend_info is not None
+        else "cuda"
+    )
+    _infer_amp_active = bool(args.amp) and supports_cuda_api
     if args.amp and not _infer_amp_active:
-        print("[warn] --amp requested but CUDA not available; inference AMP disabled.", flush=True)
+        print("[warn] --amp requested but the resolved backend does not support CUDA API AMP; inference AMP disabled.", flush=True)
     _infer_amp_dtype_resolved = _resolve_amp_dtype(args.amp_dtype) if _infer_amp_active else None
     _infer_amp_dtype_torch = (
         (torch.bfloat16 if _infer_amp_dtype_resolved == "bf16" else torch.float16)
@@ -1651,8 +1920,18 @@ def main():
     if _infer_amp_active:
         print(f"[infer] AMP enabled  dtype_resolved={_infer_amp_dtype_resolved}", flush=True)
 
+    _yolo_half_requested = bool(args.amp) if args.yolo_half is None else bool(args.yolo_half)
+    _yolo_half_active = _yolo_half_requested and device.startswith("cuda")
+    if _yolo_half_requested and not _yolo_half_active:
+        print("[warn] YOLO FP16 requested on a non-CUDA device; YOLO will use FP32.", flush=True)
+
     print(f"[infer] feature_source=pose_social  classes={list(idx_to_class.values())}", flush=True)
     print(f"[infer] num_frames={num_frames}  stride={window_stride}  N={n_animals}  K={num_keypoints}", flush=True)
+    print(
+        f"[infer] device={device}  yolo_imgsz={int(args.yolo_imgsz)}  "
+        f"yolo_half={_yolo_half_active}  yolo_tracker={args.yolo_tracker}",
+        flush=True,
+    )
     if int(args.temporal_smoothing_window) > 0 or int(args.bout_min_duration_frames) > 0:
         print(
             f"[infer] post-processing: smoothing_window={args.temporal_smoothing_window}  "
@@ -1677,7 +1956,7 @@ def main():
                 )
 
     model_yolo = load_yolo_model(args.yolo_weights, device=device, task=args.yolo_task)
-    yolo_num_keypoints = inspect_yolo_keypoint_count(args.yolo_weights)
+    yolo_num_keypoints = inspect_yolo_keypoint_count(model=model_yolo)
     if yolo_num_keypoints is None:
         print(
             "[infer] WARNING: could not inspect YOLO pose keypoint count. "
@@ -1802,6 +2081,14 @@ def main():
                     flush=True,
                 )
 
+        per_source_fps = resolve_source_fps(src, float(args.fps))
+        if abs(per_source_fps - float(args.fps)) > 1e-6:
+            print(
+                f"[infer] {src_label}: detected source FPS={per_source_fps:.6g} "
+                f"(GUI/CLI fallback was {float(args.fps):.6g})",
+                flush=True,
+            )
+
         s = run_inference_on_source(
             model=model,
             model_yolo=model_yolo,
@@ -1822,7 +2109,7 @@ def main():
             yolo_batch=int(args.yolo_batch),
             realtime=bool(args.realtime),
             print_each_window=bool(args.print_each_window),
-            fps=float(args.fps),
+            fps=per_source_fps,
             output_video=out_video,
             draw_bboxes=not bool(args.no_bboxes),
             draw_keypoints=not bool(args.no_keypoints),
@@ -1836,12 +2123,17 @@ def main():
             train_window_stride=train_window_stride,
             amp_enabled=_infer_amp_active,
             amp_dtype_torch=_infer_amp_dtype_torch,
+            autocast_device_type=autocast_device_type,
             threshold_decoder=threshold_decoder,
             v25_splitter_config=v25_splitter_config,
             export_pose=bool(getattr(args, "export_pose", False)),
             csv_flush_interval=int(args.csv_flush_interval),
             preview=bool(args.preview),
             preview_window_name=str(args.preview_window_name),
+            yolo_imgsz=int(args.yolo_imgsz),
+            yolo_half=_yolo_half_active,
+            yolo_tracker=str(args.yolo_tracker),
+            max_frames=max(0, int(args.max_frames)),
         )
         # Write per-source inference metadata alongside the predictions CSV so
         # held-out evaluation runs are fully reproducible (stride, smoothing
@@ -1852,6 +2144,7 @@ def main():
                 "model_path": str(args.model_path),
                 "feature_source": "pose_social",
                 "num_frames": num_frames,
+                "source_fps": per_source_fps,
                 "train_window_stride": train_window_stride,
                 "infer_window_stride": window_stride,
                 "num_keypoints": num_keypoints,
@@ -1893,6 +2186,11 @@ def main():
                 "v25_splitter": v25_splitter_config,
                 "amp_enabled": _infer_amp_active,
                 "amp_dtype_resolved": _infer_amp_dtype_resolved,
+                "yolo_device": device,
+                "yolo_imgsz": int(args.yolo_imgsz),
+                "yolo_half": _yolo_half_active,
+                "yolo_tracker": str(args.yolo_tracker),
+                "max_frames": max(0, int(args.max_frames)),
                 "csv_flush_interval": int(args.csv_flush_interval),
                 "classes": list(idx_to_class[i] for i in sorted(idx_to_class)),
             }

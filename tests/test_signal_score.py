@@ -1,4 +1,4 @@
-"""Tests for ADP-4 Commit F — sub-cluster signal scoring.
+"""Tests for sub-cluster signal scoring.
 
 Pure-logic tests. The function takes already-computed bouts and result
 objects (no clustering, no UMAP), so these run without any ML deps.
@@ -10,7 +10,7 @@ Coverage:
   - Sort order is descending by score.
   - Noise bouts are excluded.
   - Bins map to verdicts at the documented cut-points.
-  - Notes describe the weak spots.
+  - Notes describe low-scoring signals.
 """
 
 from __future__ import annotations

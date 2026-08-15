@@ -1,43 +1,31 @@
-"""ADP-4 Commit C — Auto train/val/test split for Tab 7.
+"""Subject-level train/validation/test splitting for Tab 7.
 
-The goal — restated from the user's locked mission for Tab 7 (2026-04-26):
-
-    Cluster keypoint/class-id data into a reusable, defensible model with
-    as little user effort as possible.
-
-Defensibility means held-out evaluation. To do held-out evaluation
-honestly we need to split *subjects* across partitions, never frames or
-bouts of one subject — otherwise the model trains and evaluates on the
-same animal and the metrics are inflated. To minimise user effort we
-auto-pick the regime from the subject count:
+Held-out evaluation requires subjects to remain in separate partitions.
+Splitting frames or bouts from the same subject across partitions would
+inflate the reported metrics. The split regime is selected from the
+smallest group-level subject count:
 
     min subjects per group ≥ 5  →  60 / 20 / 20  (train / val / test)
     2 ≤ min subjects per group ≤ 4  →  80 / 20         (train / val, no test)
     min subjects per group == 1  →  100 / 0 / 0       (full data, warning)
 
-"min over groups" so the smaller cohort dictates the regime; mismatched
-group sizes degrade gracefully but the report panel quotes the limiting
-group so the researcher can rebalance.
+The smallest cohort determines the regime. The result records the limiting
+group so imbalanced cohorts can be identified from the report.
 
 
-### Critical contracts (do not break)
+### Required invariants
 
-1. **Split BEFORE HMM training. Segment bouts AFTER inference,
-   per-partition.** Reordering this — e.g., "let's pre-segment bouts for
-   caching" — leaks bout boundaries that cross partitions and makes the
-   held-out metrics meaningless. The whole defensibility story rests on
-   keeping these in order.
+1. **Split before HMM training. Segment bouts after inference within each
+   partition.** Pre-segmenting bouts can leak boundaries across partitions.
 
 2. **Composite `(group, subject_id)` key.** Two groups can independently
-   produce a `subject_id` of `"video_01"` (basename collision from the
-   fallback in Commit A). Dedup on (group, subject_id), not subject_id
+   produce a `subject_id` of `"video_01"` through basename fallback.
+   Deduplicate on `(group, subject_id)`, not `subject_id`
    alone, or two distinct subjects collapse into one and end up in the
    same partition.
 
-3. **Local randomness with `random_state=42`. Never `np.random.seed(42)`.**
-   The split seed must NOT pollute global RNG state — HMM init, UMAP,
-   torch, etc., need their own seeds tracked separately in the
-   defensibility report's ``seeds_used`` field.
+3. **Use local randomness with `random_state=42`.** The split must not
+   modify global random-number state used by HMM, UMAP, or torch.
 
 4. **Subjects are atomic.** All frames from a given (group, subject_id)
    stay in one partition. No frame-level shuffling.
@@ -45,15 +33,9 @@ group so the researcher can rebalance.
 
 ### Return shape
 
-Single dataframe (the same df the runner already has) with a new
-``partition`` column added — one of ``"train"`` / ``"val"`` / ``"test"``.
-Plus a :class:`SplitResult` metadata object describing what happened so
-the report panel can quote the regime, seed, and per-group subject lists
-verbatim.
-
-This shape is cheaper than returning three separate dfs (no copy), and
-the partition column propagates naturally through
-``aggregate_states_into_bouts`` so bout-level evaluation Just Works.
+A dataframe with a new ``partition`` column (``"train"``, ``"val"``, or
+``"test"``) and a :class:`SplitResult` object containing the regime, seed,
+and per-group subject assignments.
 """
 
 from __future__ import annotations
@@ -62,9 +44,8 @@ from dataclasses import dataclass, field
 from typing import Tuple
 
 
-# Fixed split seed. Anyone wanting a different seed edits this constant —
-# no UI knob (per user, 2026-04-26). The seed travels into SplitResult.seed
-# so the report panel can quote it.
+# Fixed split seed. The value is recorded in SplitResult.seed and is not
+# exposed as a GUI control.
 DEFAULT_SPLIT_SEED = 42
 
 # Regime labels — referenced from the report panel and from tests, so they
@@ -82,9 +63,8 @@ _REQUIRED_COLUMNS = ("group", "subject_id")
 class SplitResult:
     """Metadata describing what auto_split decided.
 
-    The fields here are everything the held-out report panel (Commit D)
-    needs to quote verbatim. Keep this shape stable — it is part of the
-    public contract between Commit C and Commit D.
+    These fields are consumed by the held-out report panel. Keep the shape
+    stable for report and export compatibility.
     """
 
     regime: str  # one of REGIME_* constants above
@@ -225,7 +205,7 @@ def auto_split(detections_df, *, seed: int = DEFAULT_SPLIT_SEED):
         raise ValueError(
             f"auto_split: detections_df is missing required column(s) {missing}. "
             "These should be populated by `_collect_group_sources` + "
-            "`read_detections` (ADP-4 Commit A). Check that the runner "
+            "`read_detections`. Check that the runner "
             "calls auto_split AFTER `_read_runtime_detections` and BEFORE "
             "any HMM training (see contract #1 in splits.py module docstring)."
         )

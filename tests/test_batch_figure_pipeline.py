@@ -301,6 +301,30 @@ def test_render_video_quicklook_bundle_creates_individual_figures(tmp_path):
         "track_id,mean_speed_px_per_frame,turn_count\n1,2.4,14\n2,2.1,11\n",
         encoding="utf-8",
     )
+    trajectory_csv = tmp_path / "mouse_a_metrics.csv"
+    trajectory_csv.write_text(
+        "frame,object_id,anchor_x_px,anchor_y_px,movement_speed_px_per_frame,total_path_length_px\n"
+        "0,1,10,12,0.0,0.0\n1,1,18,20,11.31,11.31\n2,1,27,29,12.73,24.04\n3,1,35,38,12.04,36.08\n",
+        encoding="utf-8",
+    )
+    roi_dwell_csv = tmp_path / "mouse_a_roi_dwell.csv"
+    roi_dwell_csv.write_text(
+        "Track ID,ROI Name,Start Frame,End Frame,Duration (Frames),Duration (s)\n"
+        "1,Center,0,1,2,0.067\n1,Periphery,2,3,2,0.067\n",
+        encoding="utf-8",
+    )
+    object_csv = tmp_path / "mouse_a_objects.csv"
+    object_csv.write_text(
+        "Object ROI,Time Interacting (s),Time Contact (s),Time Proximity Only (s)\n"
+        "Petri A,1.5,0.5,1.0\nPetri B,2.0,0.75,1.25\n",
+        encoding="utf-8",
+    )
+    object_dwell_csv = tmp_path / "mouse_a_object_dwell.csv"
+    object_dwell_csv.write_text(
+        "Track ID,Object ROI,Start Frame,End Frame,Duration (Frames),Duration (s)\n"
+        "1,Petri A,0,1,2,0.067\n1,Petri B,2,3,2,0.067\n",
+        encoding="utf-8",
+    )
     video_result = {
         "video_id": "vid_001",
         "video_name": "Mouse A Day 1",
@@ -309,12 +333,26 @@ def test_render_video_quicklook_bundle_creates_individual_figures(tmp_path):
         "time_point": "1",
         "summary_bouts_csv": str(summary_csv),
         "roi_overview_csv": str(roi_csv),
+        "roi_dwell_events_csv": str(roi_dwell_csv),
+        "object_interactions_csv": str(object_csv),
+        "object_dwell_events_csv": str(object_dwell_csv),
+        "metrics_csv": str(trajectory_csv),
         "metrics_summary_by_track_csv": str(metrics_csv),
+        "roi_polygons": {"Center": {"polygons": [[[5, 5], [25, 5], [25, 25], [5, 25]]]}},
+        "object_roi_polygons": {"Petri A": {"polygons": [[[20, 20], [26, 20], [26, 26], [20, 26]]]}},
+        "object_interaction_distance_px": 12.0,
     }
 
     records = render_video_quicklook_bundle(video_result, output_dir=tmp_path / "quicklooks")
     assert records
-    assert {row["figure_type"] for row in records} == {"video_quicklook"}
+    assert {row["figure_type"] for row in records} == {
+        "video_quicklook",
+        "path_trace",
+        "path_speed_trace",
+        "kinematic_timeseries",
+        "roi_dwell_profile",
+        "object_interaction_profile",
+    }
     assert all(Path(row["path"]).is_file() for row in records)
 
 

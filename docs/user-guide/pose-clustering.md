@@ -59,6 +59,10 @@ Each pose source can be assigned to a group (`Control`, `Treatment`, `WT`,
 
 ## Quick start
 
+Tab 7 checks its optional clustering dependencies before embedding the toolkit.
+Install the recommended full desktop profile with `pip install ".[plugins]"`
+if the tab reports missing `sklearn`, `hmmlearn`, `umap`, or `hdbscan`.
+
 ### Option A - Continue from Bout Analytics
 
 1. Finish a pose-based Bout Analytics run on Tab 6.
@@ -98,7 +102,7 @@ clustering settings.
 
 ### 1. State Summary (always shown)
 
-The Sub-Behavior Summary panel on Tab 3 shows, per class:
+The embedded toolkit's **Sub-Behavior Summary** panel shows, per class:
 
 - frame count
 - number of sub-behaviors found
@@ -174,7 +178,7 @@ needs.
 ### Clustering parameters
 
 - **Min Bout Duration** (frames) - bouts shorter than this are dropped from the bouts table.
-- **UMAP Neighbors** - `n_neighbors` for UMAP. Larger values preserve global structure.
+- **UMAP Neighbors** - `n_neighbors` for UMAP. Larger values preserve global structure. Set this to `0` to skip UMAP and cluster normalized features directly; enabled values must be at least `2`.
 - **UMAP Components** - number of UMAP dimensions HDBSCAN clusters in.
 - **HDBSCAN Min Cluster Size** - smallest sub-cluster HDBSCAN will return.
 - **Stability seeds (N)** - additional clusterings used for the optional audit.

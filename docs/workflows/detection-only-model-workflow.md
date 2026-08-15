@@ -41,7 +41,7 @@ Use `Inference` with these settings:
 
 | Setting | Recommendation |
 | --- | --- |
-| Model artifact | Your existing YOLO detection checkpoint |
+| Model file | Your existing YOLO detection checkpoint |
 | Inference task | `detect` or `auto` when the model name clearly indicates detection |
 | Save Results (.txt) | On |
 | Use Tracker | On for multi-animal work, optional for single-animal work |
@@ -62,6 +62,7 @@ Open `Bout Analytics` and set:
 | Source Video | The video used for inference |
 | YOLO Output Folder | The folder containing the detection `.txt` outputs |
 | ROI settings | Your arena zones and thresholds |
+| Behavior Bout Classes | Mutually exclusive or multi-label construction |
 
 ### What works with detection-only labels
 
@@ -69,7 +70,8 @@ Open `Bout Analytics` and set:
 - ROI entries and exits
 - Dwell time
 - Zone transitions
-- Reviewed bout exports
+- Video-synchronized behavior and ROI bout review
+- Reviewed tables, agreement metrics, and audit exports
 - Batch analytics output manifests
 
 ### What changes without pose keypoints
@@ -86,9 +88,15 @@ If you have many recordings:
 2. Queue videos
 3. Reuse shared ROI settings when appropriate
 4. Run inference + analytics in one pass
-5. Review selected videos or exports after completion
+5. Select a completed video and open **Review Behavior Bouts** or
+   **Review ROI / Object Bouts**
+6. Complete and export the required scopes
+7. Choose **Finalize Reviewed Results** when the batch workbook should use the
+   reviewed outputs
 
 See the [Batch Processing Wizard](../user-guide/batch-processing-wizard.md) guide for the detailed UI.
+See [Bout Review Workspace](../user-guide/bout-confirmation.md) for correction,
+completion, and scoring guidance.
 
 ## Step 5. Optional tools
 
@@ -108,4 +116,7 @@ See the [Plugin Catalog](../plugins/plugin-catalog.md) for the full list.
 - Save YOLO text results
 - Enable tracking for multi-animal recordings
 - Point `Bout Analytics` to the same video and output folder
+- Select multi-label behavior bouts before analysis when different classes can
+  co-occur
+- Archive the complete analytics folder after review
 - Expect Tab 6 to be the main endpoint for analysis

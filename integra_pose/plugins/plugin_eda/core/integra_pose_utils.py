@@ -1,10 +1,29 @@
-import tkinter as tk
+import json  # For exporting dictionary and lists
 import os
-import pandas as pd
-import numpy as np
 import re
+import tkinter as tk
 from tkinter import filedialog, messagebox
-import json # For exporting dictionary and lists
+
+import numpy as np
+import pandas as pd
+
+from integra_pose.utils.frame_identity import parse_frame_index
+
+
+def frame_file_matches_source(filename, source_stem):
+    """Return whether a frame artifact belongs to the declared source."""
+    stem = os.path.splitext(os.path.basename(str(filename)))[0]
+    if stem.isdigit() or re.fullmatch(r"(?i)(?:frame|frm|image|img)[_-]?\d+", stem):
+        return True
+    source_text = str(source_stem or "").strip()
+    if not source_text:
+        return True
+    if stem.casefold() == source_text.casefold():
+        return True
+    if not stem.casefold().startswith(source_text.casefold()):
+        return False
+    return stem[len(source_text):].startswith(("_", "-", "."))
+
 
 class ToolTip:
     """
@@ -57,7 +76,14 @@ class ToolTip:
         finally:
             self.tooltip_window = None
 
-def parse_inference_output(file_path, keypoint_names_list, assume_visible_if_missing, behavior_id_to_name_map=None):
+def parse_inference_output(
+    file_path,
+    keypoint_names_list,
+    assume_visible_if_missing,
+    behavior_id_to_name_map=None,
+    *,
+    frame_index=None,
+):
     """
     Parses a single YOLO-format inference output file (typically .txt).
 
@@ -76,19 +102,11 @@ def parse_inference_output(file_path, keypoint_names_list, assume_visible_if_mis
     if behavior_id_to_name_map is None:
         behavior_id_to_name_map = {}
 
-    extracted_frame_id_from_filename = -1 # Default frame ID if not found in filename
     basename = os.path.basename(file_path)
-    name_without_ext, _ = os.path.splitext(basename)
-
-    match_frame = re.search(r'(?:_|[Ff](?:rame)?)(\d+)$', name_without_ext)
-    if not match_frame: # Fallback if no prefix, just look for numbers at the end
-        match_frame = re.search(r'(\d+)$', name_without_ext)
-
-    if match_frame:
-        try:
-            extracted_frame_id_from_filename = int(match_frame.group(1))
-        except ValueError:
-            print(f"Warning: Could not parse '{match_frame.group(1)}' as frame ID in '{basename}'. Using -1.")
+    extracted_frame_id_from_filename = parse_frame_index(basename) if frame_index is None else int(frame_index)
+    if extracted_frame_id_from_filename is None:
+        print(f"Warning: Skipping auxiliary/unparseable inference file without a frame identity: {basename}")
+        return pd.DataFrame()
 
     try:
         with open(file_path, 'r') as f:

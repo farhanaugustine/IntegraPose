@@ -25,6 +25,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cpu")
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--batch", type=int, default=1)
+    p.add_argument("--half", action="store_true", help="Use FP16 for CUDA YOLO inference.")
+    p.add_argument("--tracker", default="bytetrack.yaml",
+                   help="Ultralytics tracker config (fast default: bytetrack.yaml).")
     p.add_argument("--pose_conf_threshold", type=float, default=0.3)
     p.add_argument("--keep_last_box", action="store_true")
     return p.parse_args()
@@ -60,6 +63,8 @@ def main() -> None:
         fps=args.fps,
         batch_size=max(1, int(args.batch)),
         yield_orig_frame=True,
+        half=bool(args.half),
+        tracker=str(args.tracker),
     ):
         frame_indices.append(int(det.frame_idx))
         bboxes.append(det.bbox_xyxy_animals.astype(np.float32, copy=False))
@@ -84,6 +89,8 @@ def main() -> None:
         "video": str(args.video),
         "yolo_weights": str(args.yolo_weights),
         "n_animals": int(args.n_animals),
+        "yolo_half": bool(args.half),
+        "yolo_tracker": str(args.tracker),
         "width": int(width),
         "height": int(height),
         "status_vocab": status_vocab,

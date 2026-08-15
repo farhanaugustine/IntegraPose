@@ -16,7 +16,6 @@ _DEFAULT_TRUSTED = {
     "plugin_fura_imaging_lab",
     "plugin_gait_kinematics",
     "plugin_tandem_yolo_toolkit",
-    "plugin_behavior_scope",
     "plugin_zone_counter",
 }
 _MANIFEST_FILENAME = "plugin.json"

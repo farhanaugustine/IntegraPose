@@ -19,13 +19,18 @@ from PIL import Image, ImageTk
 from tkinter import filedialog, messagebox, ttk
 
 from integra_pose.data_preprocessing.dataset_split import YoloSplitResult, create_yolo_train_val_split
-from integra_pose.data_preprocessing.frame_extractor import extract_frames, frame_filename
+from integra_pose.data_preprocessing.frame_extractor import extract_frames
 from integra_pose.gui.scrollable import create_scrollable_section
 from integra_pose.utils import model_registry
+from integra_pose.utils.detection_contract import (
+    DetectionContractError,
+    enforce_ultralytics_max_det,
+)
 
 from .core import (
     ACTIVE_LEARNING_CONTEXT_SCALE,
     ACTIVE_LEARNING_CSV_FILENAME,
+    ACTIVE_LEARNING_SCORING_MAX_DET,
     ACTIVE_LEARNING_WEIGHT_DIVERSITY,
     ACTIVE_LEARNING_WEIGHT_TRANSITION,
     ACTIVE_LEARNING_WEIGHT_UNCERTAINTY,
@@ -43,12 +48,12 @@ from .core import (
     VISIBILITY_MISSING,
     VISIBILITY_OCCLUDED,
     VISIBILITY_VISIBLE,
+    active_learning_frame_filename,
     clone_pose,
     blend_memory_pose_into_assist_pose,
     cosine_distance,
     compute_bbox_transition_score,
     crop_image_to_bbox,
-    deserialize_pose_points,
     decode_pose_label_line,
     derive_review_provenance,
     encode_pose_label_line,
@@ -65,6 +70,7 @@ from .core import (
     sanitize_skeleton_edges,
     summarize_pose_uncertainty,
     summarize_curation_manifest_records,
+    source_video_identity,
     write_active_learning_candidates_csv,
     write_dataset_yaml,
 )
@@ -78,6 +84,23 @@ LOGGER = logging.getLogger(__name__)
 
 class AssistedPoseCurationUIError(RuntimeError):
     """Raised when assisted pose curation input is invalid."""
+
+
+class AnnotationIntegrityError(AssistedPoseCurationUIError):
+    """Raised when an existing annotation cannot be loaded losslessly."""
+
+
+def _enforce_assist_max_det(result: object, max_det: int) -> object:
+    """Apply the detection limit before any assist result is parsed or rendered."""
+    outcome = enforce_ultralytics_max_det(result, max_det)
+    if outcome.dropped_count:
+        LOGGER.warning(
+            "Pose assist backend returned %d detections with max_det=%d; retained the %d highest-confidence rows.",
+            outcome.original_count,
+            int(max_det),
+            outcome.retained_count,
+        )
+    return outcome.result
 
 
 def _open_path(path: Path) -> None:
@@ -206,6 +229,7 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         self._active_instance_index = 0
         self._split_result: Optional[YoloSplitResult] = None
         self._dirty = False
+        self._label_integrity_error: Optional[str] = None
         self._curation_manifest: dict[str, object] = {}
         self._active_learning_candidates: list[ActiveLearningCandidate] = []
 
@@ -2212,6 +2236,8 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         self._render_scene()
 
     def _accept_assist_and_save(self) -> bool:
+        if self._block_for_annotation_integrity("accept an assist result", show_dialog=True):
+            return False
         if self._assist_instances:
             self._use_assist_pose()
             return self._save_current_pose()
@@ -2402,7 +2428,10 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         total_frames = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
         batch_frames: list[np.ndarray] = []
         batch_indices: list[int] = []
-        max_det = max(1, _safe_int(self._assist_max_det_var.get(), 1))
+        # Candidate scoring has one uncertainty/transition value per frame, so
+        # it deliberately evaluates only the highest-confidence detection.
+        max_det = ACTIVE_LEARNING_SCORING_MAX_DET
+        source_id = source_video_identity(video_path)
 
         def _flush_batch(current_prev_bbox: tuple[int, int, int, int] | None) -> tuple[list[ActiveLearningCandidate], tuple[int, int, int, int] | None]:
             if not batch_frames:
@@ -2439,8 +2468,13 @@ class AssistedPoseCurationWindow(tk.Toplevel):
                 crop, cropped_bbox = crop_image_to_bbox(frame, context_bbox)
                 candidate = ActiveLearningCandidate(
                     frame_index=sampled_frame_index,
-                    image_name=frame_filename(sampled_frame_index, video_path=video_path),
+                    image_name=active_learning_frame_filename(
+                        sampled_frame_index,
+                        video_path=video_path,
+                        source_id=source_id,
+                    ),
                     source_video_path=str(video_path),
+                    source_video_id=source_id,
                     bbox_xyxy=bbox_xyxy,
                     context_bbox_xyxy=cropped_bbox,
                     detection_conf=detection_conf,
@@ -2545,13 +2579,54 @@ class AssistedPoseCurationWindow(tk.Toplevel):
             candidates,
             key=lambda candidate: (str(candidate.source_video_path or ""), int(candidate.frame_index)),
         )
+        destination_provenance: dict[Path, tuple[str, int]] = {}
+        for candidate in selected_candidates:
+            source_video_path = str(candidate.source_video_path or "").strip()
+            if not source_video_path:
+                raise AssistedPoseCurationUIError(
+                    f"Selected frame {candidate.frame_index} has no source-video provenance."
+                )
+            current_source_id = source_video_identity(source_video_path)
+            declared_source_id = str(candidate.source_video_id or "").strip().lower()
+            if declared_source_id != current_source_id:
+                raise AssistedPoseCurationUIError(
+                    "A source video changed after candidate scoring; refusing to extract a frame "
+                    f"with stale provenance: {source_video_path}"
+                )
+            expected_name = active_learning_frame_filename(
+                candidate.frame_index,
+                video_path=source_video_path,
+                source_id=current_source_id,
+            )
+            if candidate.image_name != expected_name:
+                raise AssistedPoseCurationUIError(
+                    f"Candidate filename does not match its source provenance: {candidate.image_name!r}."
+                )
+            destination = image_dir / expected_name
+            provenance = (str(Path(source_video_path).expanduser().resolve(strict=False)), int(candidate.frame_index))
+            previous = destination_provenance.get(destination)
+            if previous is not None and previous != provenance:
+                raise AssistedPoseCurationUIError(
+                    f"Two selected frames target the same output image: {destination.name}."
+                )
+            destination_provenance[destination] = provenance
+
         capture_cache: dict[str, cv2.VideoCapture] = {}
         saved_images: list[str] = []
         try:
             total_selected = max(1, len(selected_candidates))
             for idx, candidate in enumerate(selected_candidates, start=1):
                 source_video_path = str(candidate.source_video_path or "").strip()
-                if not source_video_path:
+                out_path = image_dir / candidate.image_name
+                if out_path.is_file():
+                    saved_images.append(out_path.name)
+                    self.after(
+                        0,
+                        lambda index=idx, total=total_selected: self._update_task_progress(
+                            90.0 + ((float(index) / float(total)) * 10.0),
+                            message=f"Reusing selected frames... {index}/{total}",
+                        ),
+                    )
                     continue
                 cap = capture_cache.get(source_video_path)
                 if cap is None:
@@ -2562,10 +2637,14 @@ class AssistedPoseCurationWindow(tk.Toplevel):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, int(candidate.frame_index))
                 ok, frame = cap.read()
                 if not ok:
-                    continue
-                out_path = image_dir / candidate.image_name
+                    raise AssistedPoseCurationUIError(
+                        f"Could not read frame {candidate.frame_index} from {source_video_path}."
+                    )
                 out_path.parent.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(out_path), frame)
+                if not cv2.imwrite(str(out_path), frame):
+                    raise AssistedPoseCurationUIError(
+                        f"Could not write selected frame image: {out_path}"
+                    )
                 saved_images.append(out_path.name)
                 self.after(
                     0,
@@ -2735,9 +2814,17 @@ class AssistedPoseCurationWindow(tk.Toplevel):
             "min_frame_gap": int(min_gap),
             "context_crop_scale": float(ACTIVE_LEARNING_CONTEXT_SCALE),
             "assist_conf_threshold": float(conf),
+            "scoring_max_det": int(ACTIVE_LEARNING_SCORING_MAX_DET),
             "reviewed_reference_count": int(reviewed_reference_count),
             "source_video_count": int(len(video_paths)),
             "source_video_paths": [str(path) for path in video_paths],
+            "source_videos": [
+                {
+                    "path": str(path),
+                    "source_video_id": source_video_identity(path),
+                }
+                for path in video_paths
+            ],
         }
 
     def _embedding_to_numpy(self, embedding) -> Optional[np.ndarray]:
@@ -2805,14 +2892,31 @@ class AssistedPoseCurationWindow(tk.Toplevel):
                 batch=max(1, min(int(batch_size), len(images))),
             )
             if isinstance(results, list) and len(results) == len(images):
-                return [pose_from_ultralytics_result(result, keypoint_names) for result in results]
+                return [
+                    pose_from_ultralytics_result(
+                        _enforce_assist_max_det(result, safe_max_det),
+                        keypoint_names,
+                    )
+                    for result in results
+                ]
+        except DetectionContractError:
+            raise
         except Exception:
             pass
         suggestions: list[tuple[list[PosePoint], tuple[int, int, int, int] | None, dict[str, object]] | None] = []
         for image in images:
             try:
                 results = model.predict(source=image, conf=conf, max_det=safe_max_det, verbose=False)
-                suggestions.append(pose_from_ultralytics_result(results[0], keypoint_names) if results else None)
+                suggestions.append(
+                    pose_from_ultralytics_result(
+                        _enforce_assist_max_det(results[0], safe_max_det),
+                        keypoint_names,
+                    )
+                    if results
+                    else None
+                )
+            except DetectionContractError:
+                raise
             except Exception:
                 suggestions.append(None)
         return suggestions
@@ -2985,6 +3089,13 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         section["last_candidates_csv"] = str(csv_path)
         section["source_video_path"] = str(video_paths[0]) if len(video_paths) == 1 else ""
         section["source_video_paths"] = [str(path) for path in video_paths]
+        section["source_videos"] = [
+            {
+                "path": str(path),
+                "source_video_id": source_video_identity(path),
+            }
+            for path in video_paths
+        ]
         section["source_video_count"] = int(len(video_paths))
         section["stride"] = int(stride)
         section["target_count"] = int(target_count)
@@ -2995,6 +3106,7 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         section["selected_items"] = [
             {
                 "source_video_path": str(candidate.source_video_path or ""),
+                "source_video_id": str(candidate.source_video_id or ""),
                 "frame_index": int(candidate.frame_index),
                 "image_name": str(candidate.image_name or ""),
             }
@@ -3014,6 +3126,7 @@ class AssistedPoseCurationWindow(tk.Toplevel):
                 "selected_items": [
                     {
                         "source_video_path": str(candidate.source_video_path or ""),
+                        "source_video_id": str(candidate.source_video_id or ""),
                         "frame_index": int(candidate.frame_index),
                         "image_name": str(candidate.image_name or ""),
                     }
@@ -3038,7 +3151,13 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         self._reset_viewport = True
         self._dragging_kp_index = None
         self._load_curation_manifest()
-        loaded_instances = self._load_instances_for_path(path, image.shape[1], image.shape[0])
+        self._label_integrity_error = None
+        try:
+            loaded_instances = self._load_instances_for_path(path, image.shape[1], image.shape[0])
+        except AnnotationIntegrityError as exc:
+            self._label_integrity_error = str(exc)
+            loaded_instances = []
+            self._append_error(self._label_integrity_error)
         self._assist_instances = []
         if loaded_instances:
             self._replace_frame_instances(loaded_instances)
@@ -3085,8 +3204,17 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         self._write_classes_txt()
         self._refresh_review_counts()
 
+        if self._label_integrity_error:
+            detail = self._label_integrity_error
+            self._status_var.set("Annotation error: assist and save are blocked for this frame.")
+            messagebox.showerror(
+                "Annotation Integrity Error",
+                f"{detail}\n\nFix this label file, then reload the images before assisting or saving this frame.",
+                parent=self,
+            )
+
         has_existing = bool(loaded_instances and any(pose_has_any_labels(instance.get("pose", [])) for instance in loaded_instances))
-        if self._assist_enabled_var.get() and self._model_path_var.get().strip():
+        if not self._label_integrity_error and self._assist_enabled_var.get() and self._model_path_var.get().strip():
             if (not has_existing) or self._assist_refresh_existing_var.get():
                 self._schedule_assist_for_current_image()
 
@@ -3096,9 +3224,10 @@ class AssistedPoseCurationWindow(tk.Toplevel):
             return []
         try:
             lines = [line.strip() for line in label_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        except Exception as exc:
-            self._append_error(f"Failed to read label file {label_path}: {exc}")
-            return []
+        except (OSError, UnicodeError) as exc:
+            raise AnnotationIntegrityError(
+                f"Could not read existing annotation {label_path}: {exc}"
+            ) from exc
         if not lines:
             return []
         instances: list[dict[str, Any]] = []
@@ -3107,12 +3236,28 @@ class AssistedPoseCurationWindow(tk.Toplevel):
                 class_id, pose, _bbox = decode_pose_label_line(line, self._keypoint_names, img_w, img_h)
                 instances.append(self._make_instance(pose=pose, class_id=class_id))
             except Exception as exc:
-                self._append_error(f"Failed to parse {label_path.name} line {line_index}: {exc}")
+                raise AnnotationIntegrityError(
+                    f"Malformed annotation in {label_path.name}, line {line_index}: {exc}"
+                ) from exc
         self._extend_class_names_for_ids([int(instance.get("class_id", 0) or 0) for instance in instances])
         return instances
 
     def _label_path_for(self, image_path: Path) -> Path:
         return Path(self._label_dir_var.get().strip()) / f"{image_path.stem}.txt"
+
+    def _block_for_annotation_integrity(self, action: str, *, show_dialog: bool) -> bool:
+        detail = str(self._label_integrity_error or "").strip()
+        if not detail:
+            return False
+        message = (
+            f"Cannot {action} because the existing annotation could not be loaded losslessly.\n\n"
+            f"{detail}\n\nFix the label file, then reload the images."
+        )
+        self._append_error(message.replace("\n", " "))
+        self._status_var.set("Annotation error: assist and save are blocked for this frame.")
+        if show_dialog:
+            messagebox.showerror("Annotation Integrity Error", message, parent=self)
+        return True
 
     def _write_classes_txt(self) -> None:
         self._sync_session_layout_defaults(create_dirs=True)
@@ -3130,6 +3275,8 @@ class AssistedPoseCurationWindow(tk.Toplevel):
     def _save_current_pose(self) -> bool:
         if self._current_path is None or self._current_image is None:
             return True
+        if self._block_for_annotation_integrity("save this frame", show_dialog=True):
+            return False
         self._sync_session_layout_defaults(create_dirs=True)
         label_path = self._label_path_for(self._current_path)
         label_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3238,7 +3385,13 @@ class AssistedPoseCurationWindow(tk.Toplevel):
             return
         img_h, img_w = self._current_image.shape[:2]
         for idx in range(self._current_index - 1, -1, -1):
-            instances = self._load_instances_for_path(self._image_paths[idx], img_w, img_h)
+            try:
+                instances = self._load_instances_for_path(self._image_paths[idx], img_w, img_h)
+            except AnnotationIntegrityError as exc:
+                self._append_error(
+                    f"Cannot copy annotations from {self._image_paths[idx].name}: {exc}"
+                )
+                continue
             if instances and any(pose_has_any_labels(instance.get("pose", [])) for instance in instances):
                 copied_instances: list[dict[str, Any]] = []
                 for instance in instances:
@@ -3259,6 +3412,8 @@ class AssistedPoseCurationWindow(tk.Toplevel):
         self._append_log("No previous labeled frame available to copy.")
 
     def _use_assist_pose(self) -> None:
+        if self._block_for_annotation_integrity("apply an assist result", show_dialog=True):
+            return
         if not self._assist_instances:
             if not pose_has_any_labels(self._assist_pose):
                 self._append_log("No assist pose is available for this frame.")
@@ -3333,6 +3488,8 @@ class AssistedPoseCurationWindow(tk.Toplevel):
     def _schedule_assist_for_current_image(self, *, replace_existing: bool = False) -> None:
         if self._current_image is None or self._current_path is None:
             return
+        if self._block_for_annotation_integrity("run pose assist", show_dialog=False):
+            return
         model_path = self._model_path_var.get().strip()
         if not model_path:
             return
@@ -3358,7 +3515,8 @@ class AssistedPoseCurationWindow(tk.Toplevel):
                 results = pose_model.predict(source=image, conf=conf, max_det=max_det, verbose=False)
                 suggestions = []
                 if results:
-                    suggestions = poses_from_ultralytics_result(results[0], keypoint_names)
+                    limited_result = _enforce_assist_max_det(results[0], max_det)
+                    suggestions = poses_from_ultralytics_result(limited_result, keypoint_names)
                 if suggestions and self._memory_assist_enabled_var.get():
                     embed_model = self._get_embed_model(model_path)
                     refined_suggestions = []

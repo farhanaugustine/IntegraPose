@@ -6,10 +6,12 @@ Use this page as a quick map to the most practical guided paths in the manual.
 
 | Goal | Best place to start |
 | --- | --- |
+| Install and verify the full UI | [Installation and Sanity Check](getting-started/installation.md) |
 | Learn the layout quickly | [Quick Start](getting-started/quick-start.md) |
 | Run a detection-only workflow | [Detection-Only Model Workflow](workflows/detection-only-model-workflow.md) |
 | Run a full pose workflow | [Pose Model Workflow](workflows/pose-model-workflow.md) |
 | Process many videos at once | [Batch Processing Wizard](user-guide/batch-processing-wizard.md) |
+| Review predicted events before reporting | [Bout Review Workspace](user-guide/bout-confirmation.md) |
 
 ## Workflow-oriented reading
 
@@ -27,5 +29,6 @@ Use this page as a quick map to the most practical guided paths in the manual.
 | --- | --- |
 | Faster pose labeling | [Assisted Pose Curation](plugins/assisted-pose-curation.md) |
 | Live zone counting | [Zone Counter](plugins/zone-counter.md) |
+| Fura-2 calcium-imaging analysis | [Fura Imaging Lab](plugins/fura-imaging-lab.md) |
 | CSV and plot exploration | [EDA Tool](plugins/eda-plugin.md) |
 | Other shipped plugins | [Plugin Catalog](plugins/plugin-catalog.md) |

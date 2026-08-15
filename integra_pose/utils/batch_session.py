@@ -6,14 +6,18 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 import uuid
 
 # PR 2B coherence-pass 2e: bumped from 3 → 4 when relative-path storage
 # (project root anchored) was introduced. Old (v≤3) sessions load
 # transparently because absolute paths pass through resolve_storage_path
-# unchanged.
-CURRENT_SCHEMA_VERSION = 4
+# unchanged. Schema 5 adds the session-owned max_det snapshot. Schema 6
+# snapshots the validated pose-keypoint schema used to name inference output.
+# Schema 7 adds time-based bout/ROI thresholds while retaining legacy frames.
+# Schema 8 separates mixed-effects and KPSS controls, adds automatic
+# study-design detection, and records metadata-inference provenance.
+CURRENT_SCHEMA_VERSION = 8
 
 # Top-level path-bearing fields on BatchSession. Extracted so save / load
 # share the same source of truth — adding a new path field means adding
@@ -26,6 +30,7 @@ _SESSION_PATH_FIELDS = (
     "tracker_config_path",
     "existing_labels_root",
     "keybind_profile_path",
+    "keypoint_schema_path",
 )
 
 VIDEO_EXTENSIONS = {
@@ -76,6 +81,8 @@ class BatchVideoItem:
     group: str = ""
     subject_id: str = ""
     time_point: str = ""
+    metadata_sources: dict[str, str] = field(default_factory=dict)
+    metadata_warnings: list[str] = field(default_factory=list)
     roi_status: str = "pending"
     inference_status: str = "pending"
     analytics_status: str = "pending"
@@ -100,6 +107,12 @@ class BatchVideoItem:
         review_status = str(payload.get("review_status", "pending")).strip() or "pending"
         bout_review_status = str(payload.get("bout_review_status", "")).strip()
         roi_review_status = str(payload.get("roi_review_status", "")).strip()
+        raw_metadata_sources = payload.get("metadata_sources", {})
+        if not isinstance(raw_metadata_sources, dict):
+            raw_metadata_sources = {}
+        raw_metadata_warnings = payload.get("metadata_warnings", ())
+        if not isinstance(raw_metadata_warnings, (list, tuple)):
+            raw_metadata_warnings = ()
         if not bout_review_status:
             bout_review_status = review_status
         if not roi_review_status:
@@ -112,6 +125,16 @@ class BatchVideoItem:
             group=str(payload.get("group", "")).strip(),
             subject_id=str(payload.get("subject_id", "")).strip(),
             time_point=str(payload.get("time_point", "")).strip(),
+            metadata_sources={
+                str(key): str(value)
+                for key, value in raw_metadata_sources.items()
+                if str(key).strip() and str(value).strip()
+            },
+            metadata_warnings=[
+                str(value).strip()
+                for value in raw_metadata_warnings
+                if str(value).strip()
+            ],
             roi_status=str(payload.get("roi_status", "pending")).strip() or "pending",
             inference_status=str(payload.get("inference_status", "pending")).strip() or "pending",
             analytics_status=str(payload.get("analytics_status", "pending")).strip() or "pending",
@@ -138,6 +161,9 @@ class BatchModelCapabilities:
     task: str = "unknown"
     has_keypoints: bool = False
     keypoint_count: int = 0
+    keypoint_names: list[str] = field(default_factory=list)
+    keypoint_names_source: str = "unresolved"
+    keypoint_schema_path: str = ""
     class_count: int = 0
     class_names: list[str] = field(default_factory=list)
     supports_multiclass_stats: bool = False
@@ -153,6 +179,9 @@ class BatchModelCapabilities:
             task=str(payload.get("task", "unknown")).strip() or "unknown",
             has_keypoints=bool(payload.get("has_keypoints", False)),
             keypoint_count=int(payload.get("keypoint_count", 0) or 0),
+            keypoint_names=[str(name).strip() for name in (payload.get("keypoint_names") or []) if str(name).strip()],
+            keypoint_names_source=str(payload.get("keypoint_names_source", "unresolved")).strip() or "unresolved",
+            keypoint_schema_path=str(payload.get("keypoint_schema_path", "")).strip(),
             class_count=int(payload.get("class_count", 0) or 0),
             class_names=[str(name) for name in (payload.get("class_names") or []) if str(name).strip()],
             supports_multiclass_stats=bool(payload.get("supports_multiclass_stats", False)),
@@ -184,25 +213,37 @@ class BatchSession:
     use_existing_labels: bool = False
     existing_labels_root: str = ""
     model_path: str = ""
+    keypoint_names: list[str] = field(default_factory=list)
+    keypoint_names_source: str = "unresolved"
+    keypoint_schema_path: str = ""
     inference_device: str = ""
     inference_batch_size: int = 25
+    max_det: int = 300
     output_path: str = ""
     tracker_enabled: bool = True
     tracker_config_path: str = ""
     min_bout_frames: int = 3
     max_gap_frames: int = 5
+    behavior_bout_class_mode: str = "mutually_exclusive"
     roi_min_dwell_frames: int = 3
     roi_max_gap_frames: int = 5
+    temporal_threshold_unit: str = "seconds"
+    min_bout_seconds: float = 0.10
+    max_gap_seconds: float = 0.17
+    roi_min_dwell_seconds: float = 0.10
+    roi_max_gap_seconds: float = 0.17
     video_fps: float = 0.0
     save_annotated_video: bool = False
     save_confidence: bool = False
     review_policy: str = "after_all"
     stats_correction: str = "fdr_bh"
     stats_categorical_factors: list[str] = field(default_factory=list)
+    stats_auto_detect_design: bool = True
     analytics_assay_preset: str = "custom"
     analytics_enabled_metrics: list[str] = field(default_factory=list)
     analytics_enabled_modules: list[str] = field(default_factory=list)
-    include_kpss: bool = True
+    include_mixed_effects: bool = True
+    include_kpss: bool = False
     figure_output_preset: str = "publication_dashboard"
     export_publication_figures: bool = True
     export_batch_dashboard: bool = True
@@ -210,7 +251,7 @@ class BatchSession:
     export_individual_profiles: bool = False
     export_module_archive: bool = False
     figure_export_mode: str = "assay_shortlist"
-    generate_video_quicklooks: bool = False
+    generate_video_quicklooks: bool = True
     single_animal_mode: bool = False
     yaml_path: str = ""
     keybind_profile_path: str = ""
@@ -243,24 +284,38 @@ class BatchSession:
             "use_existing_labels": bool(self.use_existing_labels),
             "existing_labels_root": str(self.existing_labels_root),
             "model_path": str(self.model_path),
+            "keypoint_names": [str(name) for name in (self.keypoint_names or []) if str(name).strip()],
+            "keypoint_names_source": str(self.keypoint_names_source or "unresolved"),
+            "keypoint_schema_path": str(self.keypoint_schema_path or ""),
             "inference_device": str(self.inference_device),
             "inference_batch_size": int(self.inference_batch_size),
+            "max_det": int(self.max_det),
             "output_path": str(self.output_path),
             "tracker_enabled": bool(self.tracker_enabled),
             "tracker_config_path": str(self.tracker_config_path),
             "min_bout_frames": int(self.min_bout_frames),
             "max_gap_frames": int(self.max_gap_frames),
+            "behavior_bout_class_mode": str(
+                self.behavior_bout_class_mode or "mutually_exclusive"
+            ),
             "roi_min_dwell_frames": int(self.roi_min_dwell_frames),
             "roi_max_gap_frames": int(self.roi_max_gap_frames),
+            "temporal_threshold_unit": str(self.temporal_threshold_unit),
+            "min_bout_seconds": float(self.min_bout_seconds),
+            "max_gap_seconds": float(self.max_gap_seconds),
+            "roi_min_dwell_seconds": float(self.roi_min_dwell_seconds),
+            "roi_max_gap_seconds": float(self.roi_max_gap_seconds),
             "video_fps": float(self.video_fps),
             "save_annotated_video": bool(self.save_annotated_video),
             "save_confidence": bool(self.save_confidence),
             "review_policy": str(self.review_policy),
             "stats_correction": str(self.stats_correction),
             "stats_categorical_factors": [str(name) for name in (self.stats_categorical_factors or [])],
+            "stats_auto_detect_design": bool(self.stats_auto_detect_design),
             "analytics_assay_preset": str(self.analytics_assay_preset or "custom"),
             "analytics_enabled_metrics": [str(name) for name in (self.analytics_enabled_metrics or []) if str(name).strip()],
             "analytics_enabled_modules": [str(name) for name in (self.analytics_enabled_modules or []) if str(name).strip()],
+            "include_mixed_effects": bool(self.include_mixed_effects),
             "include_kpss": bool(self.include_kpss),
             "figure_output_preset": str(self.figure_output_preset or "publication_dashboard"),
             "export_publication_figures": bool(self.export_publication_figures),
@@ -283,7 +338,11 @@ class BatchSession:
 
     @classmethod
     def create(cls) -> "BatchSession":
-        return cls(schema_version=1, session_id=uuid.uuid4().hex, created_at=_utc_now_iso())
+        return cls(
+            schema_version=CURRENT_SCHEMA_VERSION,
+            session_id=uuid.uuid4().hex,
+            created_at=_utc_now_iso(),
+        )
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "BatchSession":
@@ -332,6 +391,21 @@ class BatchSession:
         raw_max_gap_frames = payload.get("max_gap_frames", 5)
         raw_roi_min_dwell_frames = payload.get("roi_min_dwell_frames", raw_min_bout_frames)
         raw_roi_max_gap_frames = payload.get("roi_max_gap_frames", raw_max_gap_frames)
+        # Sessions predating schema 7 expressed temporal thresholds only in
+        # frames. Preserve that behavior exactly; only newly-created sessions
+        # default to seconds.
+        raw_temporal_unit = str(
+            payload.get("temporal_threshold_unit", "frames") or "frames"
+        ).strip().lower()
+        temporal_threshold_unit = (
+            "seconds" if raw_temporal_unit == "seconds" else "frames"
+        )
+        try:
+            parsed_max_det = int(300 if payload.get("max_det") is None else payload.get("max_det"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Batch session max_det must be an integer.") from exc
+        if parsed_max_det < 1:
+            raise ValueError("Batch session max_det must be at least 1.")
         legacy_figure_mode = str(payload.get("figure_export_mode", "assay_shortlist")).strip() or "assay_shortlist"
         raw_figure_preset = str(payload.get("figure_output_preset", "")).strip()
         if raw_figure_preset:
@@ -341,7 +415,12 @@ class BatchSession:
             export_group_stats_overview = bool(payload.get("export_group_stats_overview", True))
             export_individual_profiles = bool(payload.get("export_individual_profiles", False))
             export_module_archive = bool(payload.get("export_module_archive", False))
-            generate_video_quicklooks = bool(payload.get("generate_video_quicklooks", False))
+            generate_video_quicklooks = bool(
+                payload.get(
+                    "generate_video_quicklooks",
+                    raw_figure_preset in {"publication_dashboard", "full_analysis_archive"},
+                )
+            )
         elif legacy_figure_mode == "disabled":
             figure_output_preset = "custom"
             export_publication_figures = False
@@ -365,20 +444,31 @@ class BatchSession:
             export_group_stats_overview = True
             export_individual_profiles = False
             export_module_archive = False
-            generate_video_quicklooks = bool(payload.get("generate_video_quicklooks", False))
+            generate_video_quicklooks = bool(payload.get("generate_video_quicklooks", True))
+
+        source_schema_version = int(payload.get("schema_version", 1) or 1)
+        legacy_combined_trend_setting = bool(payload.get("include_kpss", True))
 
         return cls(
-            schema_version=int(payload.get("schema_version", 1) or 1),
+            schema_version=source_schema_version,
             session_id=str(payload.get("session_id", "")).strip() or uuid.uuid4().hex,
             created_at=str(payload.get("created_at", "")).strip() or _utc_now_iso(),
             source_path=str(payload.get("source_path", "")).strip(),
             roi_strategy=str(payload.get("roi_strategy", "single")).strip() or "single",
             roi_event_mode=str(payload.get("roi_event_mode", "bbox_only")).strip() or "bbox_only",
-            roi_entry_threshold=float(payload.get("roi_entry_threshold", 0.75) or 0.75),
-            roi_exit_threshold=float(payload.get("roi_exit_threshold", 0.25) or 0.25),
+            roi_entry_threshold=float(
+                0.75 if payload.get("roi_entry_threshold") is None else payload.get("roi_entry_threshold")
+            ),
+            roi_exit_threshold=float(
+                0.25 if payload.get("roi_exit_threshold") is None else payload.get("roi_exit_threshold")
+            ),
             keypoint_entry_index=int(payload.get("keypoint_entry_index", 0) or 0),
             keypoint_entry_indices=[int(idx) for idx in (payload.get("keypoint_entry_indices") or [])],
-            keypoint_entry_ratio_threshold=float(payload.get("keypoint_entry_ratio_threshold", 0.5) or 0.5),
+            keypoint_entry_ratio_threshold=float(
+                0.5
+                if payload.get("keypoint_entry_ratio_threshold") is None
+                else payload.get("keypoint_entry_ratio_threshold")
+            ),
             object_interaction_enabled=bool(payload.get("object_interaction_enabled", False)),
             object_count=int(payload.get("object_count", 0) or 0),
             object_roi_size_px=int(payload.get("object_roi_size_px", 20) or 20),
@@ -388,25 +478,70 @@ class BatchSession:
             use_existing_labels=bool(payload.get("use_existing_labels", False)),
             existing_labels_root=str(payload.get("existing_labels_root", "")).strip(),
             model_path=str(payload.get("model_path", "")).strip(),
+            keypoint_names=[str(name).strip() for name in (payload.get("keypoint_names") or []) if str(name).strip()],
+            keypoint_names_source=str(payload.get("keypoint_names_source", "unresolved")).strip() or "unresolved",
+            keypoint_schema_path=str(payload.get("keypoint_schema_path", "")).strip(),
             inference_device=str(payload.get("inference_device", "")).strip(),
             inference_batch_size=int(payload.get("inference_batch_size", 25) or 25),
+            max_det=parsed_max_det,
             output_path=str(payload.get("output_path", "")).strip(),
             tracker_enabled=bool(payload.get("tracker_enabled", True)),
             tracker_config_path=str(payload.get("tracker_config_path", "")).strip(),
             min_bout_frames=int(raw_min_bout_frames or 3),
             max_gap_frames=int(raw_max_gap_frames if raw_max_gap_frames is not None else 5),
+            behavior_bout_class_mode=(
+                "multi_label"
+                if str(
+                    payload.get(
+                        "behavior_bout_class_mode",
+                        "mutually_exclusive",
+                    )
+                    or "mutually_exclusive"
+                )
+                .strip()
+                .casefold()
+                in {"multi_label", "multi-label", "multilabel", "concurrent"}
+                else "mutually_exclusive"
+            ),
             roi_min_dwell_frames=int(raw_roi_min_dwell_frames or 3),
             roi_max_gap_frames=int(raw_roi_max_gap_frames if raw_roi_max_gap_frames is not None else 5),
+            temporal_threshold_unit=temporal_threshold_unit,
+            min_bout_seconds=float(payload.get("min_bout_seconds", 0.10) or 0.10),
+            max_gap_seconds=float(
+                0.0
+                if payload.get("max_gap_seconds") == 0
+                else payload.get("max_gap_seconds", 0.17) or 0.17
+            ),
+            roi_min_dwell_seconds=float(
+                payload.get("roi_min_dwell_seconds", 0.10) or 0.10
+            ),
+            roi_max_gap_seconds=float(
+                0.0
+                if payload.get("roi_max_gap_seconds") == 0
+                else payload.get("roi_max_gap_seconds", 0.17) or 0.17
+            ),
             video_fps=float(payload.get("video_fps", 0.0) or 0.0),
             save_annotated_video=bool(payload.get("save_annotated_video", False)),
             save_confidence=bool(payload.get("save_confidence", False)),
             review_policy=str(payload.get("review_policy", "after_all")).strip() or "after_all",
             stats_correction=str(payload.get("stats_correction", "fdr_bh")).strip() or "fdr_bh",
             stats_categorical_factors=[str(name).strip() for name in raw_factors if str(name).strip()],
+            stats_auto_detect_design=bool(payload.get("stats_auto_detect_design", True)),
             analytics_assay_preset=str(payload.get("analytics_assay_preset", "custom")).strip() or "custom",
             analytics_enabled_metrics=[str(name).strip() for name in raw_enabled_metrics if str(name).strip()],
             analytics_enabled_modules=[str(name).strip() for name in raw_enabled_modules if str(name).strip()],
-            include_kpss=bool(payload.get("include_kpss", True)),
+            include_mixed_effects=bool(
+                payload.get(
+                    "include_mixed_effects",
+                    legacy_combined_trend_setting,
+                )
+            ),
+            include_kpss=bool(
+                payload.get(
+                    "include_kpss",
+                    False if source_schema_version >= 8 else legacy_combined_trend_setting,
+                )
+            ),
             figure_output_preset=figure_output_preset,
             export_publication_figures=export_publication_figures,
             export_batch_dashboard=export_batch_dashboard,

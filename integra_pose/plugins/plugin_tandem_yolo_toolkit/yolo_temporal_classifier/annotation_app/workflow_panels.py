@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import unquote, urlparse
 
-from PySide6.QtCore import QProcess, QProcessEnvironment
+from PySide6.QtCore import QProcess, QProcessEnvironment, Signal
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -331,12 +331,18 @@ class ProcessRunner(QWidget):
 
 
 class WorkflowPanel(QWidget):
+    state_changed = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.form = QFormLayout()
         self.form.setLabelAlignment(self.form.labelAlignment())
         self.extra_args = QLineEdit()
         self.extra_args.setPlaceholderText("Optional raw CLI flags, e.g. --some_flag value")
+        self.extra_args.textChanged.connect(self._notify_state_changed)
+
+    def _notify_state_changed(self, *_args) -> None:
+        self.state_changed.emit()
 
     def _path_row(
         self,
@@ -362,6 +368,7 @@ class WorkflowPanel(QWidget):
                 edit.setText(_local_path_text(path))
 
         button.clicked.connect(browse)
+        edit.textChanged.connect(self._notify_state_changed)
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -374,6 +381,7 @@ class WorkflowPanel(QWidget):
         spin = QSpinBox()
         spin.setRange(minimum, maximum)
         spin.setValue(value)
+        spin.valueChanged.connect(self._notify_state_changed)
         self.form.addRow(label, spin)
         return spin
 
@@ -383,6 +391,7 @@ class WorkflowPanel(QWidget):
         spin.setDecimals(decimals)
         spin.setValue(value)
         spin.setSingleStep(0.01)
+        spin.valueChanged.connect(self._notify_state_changed)
         self.form.addRow(label, spin)
         return spin
 
@@ -392,19 +401,108 @@ class WorkflowPanel(QWidget):
         idx = combo.findText(current)
         if idx >= 0:
             combo.setCurrentIndex(idx)
+        combo.currentTextChanged.connect(self._notify_state_changed)
         self.form.addRow(label, combo)
+        return combo
+
+    def _tracker_row(self, label: str = "YOLO tracker") -> QComboBox:
+        """Create an editable tracker selector with a custom-YAML browser."""
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.addItems(["bytetrack.yaml", "botsort.yaml"])
+        combo.setCurrentText("bytetrack.yaml")
+        combo.setToolTip(
+            "ByteTrack is fastest for fixed-camera videos. BoT-SORT adds camera-motion "
+            "compensation. You can type an Ultralytics tracker YAML name or browse to "
+            "a custom YAML file."
+        )
+        combo.currentTextChanged.connect(self._notify_state_changed)
+        browse = QPushButton("Browse")
+
+        def choose_yaml() -> None:
+            current = _local_path_text(combo.currentText())
+            start_path = current if current and Path(current).exists() else str(REPO_ROOT)
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Ultralytics tracker YAML",
+                start_path,
+                "YAML (*.yaml *.yml);;All files (*.*)",
+            )
+            if path:
+                combo.setEditText(_local_path_text(path))
+
+        browse.clicked.connect(choose_yaml)
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(combo, 1)
+        layout.addWidget(browse)
+        self.form.addRow(label, row)
         return combo
 
     def _line_row(self, label: str, default: str = "") -> QLineEdit:
         edit = QLineEdit(default)
+        edit.textChanged.connect(self._notify_state_changed)
         self.form.addRow(label, edit)
         return edit
 
     def _checkbox_row(self, label: str, checked: bool = False) -> QCheckBox:
         check = QCheckBox(label)
         check.setChecked(checked)
+        check.toggled.connect(self._notify_state_changed)
         self.form.addRow("", check)
         return check
+
+    def settings_state(self) -> dict[str, object]:
+        """Return the user-editable panel state in a JSON-safe form."""
+        fields: dict[str, dict[str, object]] = {}
+        for name, widget in vars(self).items():
+            if isinstance(widget, QLineEdit):
+                fields[name] = {"kind": "text", "value": widget.text()}
+            elif isinstance(widget, QComboBox):
+                fields[name] = {"kind": "combo", "value": widget.currentText()}
+            elif isinstance(widget, QSpinBox):
+                fields[name] = {"kind": "int", "value": int(widget.value())}
+            elif isinstance(widget, QDoubleSpinBox):
+                fields[name] = {"kind": "float", "value": float(widget.value())}
+            elif isinstance(widget, QCheckBox):
+                fields[name] = {"kind": "bool", "value": bool(widget.isChecked())}
+        return {"version": 1, "fields": fields}
+
+    def restore_settings_state(self, state: object) -> None:
+        """Restore a state produced by settings_state, ignoring stale fields."""
+        if not isinstance(state, dict):
+            return
+        fields = state.get("fields")
+        if not isinstance(fields, dict):
+            return
+        for name, entry in fields.items():
+            widget = getattr(self, str(name), None)
+            if widget is None or not isinstance(entry, dict):
+                continue
+            value = entry.get("value")
+            was_blocked = widget.blockSignals(True)
+            try:
+                if isinstance(widget, QLineEdit):
+                    widget.setText("" if value is None else str(value))
+                elif isinstance(widget, QComboBox):
+                    text = "" if value is None else str(value)
+                    if widget.isEditable():
+                        widget.setEditText(text)
+                    else:
+                        index = widget.findText(text)
+                        if index >= 0:
+                            widget.setCurrentIndex(index)
+                elif isinstance(widget, QSpinBox):
+                    widget.setValue(int(value))
+                elif isinstance(widget, QDoubleSpinBox):
+                    widget.setValue(float(value))
+                elif isinstance(widget, QCheckBox):
+                    widget.setChecked(bool(value))
+            except (TypeError, ValueError):
+                continue
+            finally:
+                widget.blockSignals(was_blocked)
 
     def _wrap(self, title: str, runner: ProcessRunner) -> None:
         outer = QVBoxLayout(self)
@@ -455,6 +553,12 @@ _YOLO_WEIGHTS_TOOLTIP = (
     "See README for details."
 )
 
+_YOLO_FILE_FILTER = (
+    "YOLO models (*.pt *.pth *.onnx *.engine *.xml *.tflite);;"
+    "PyTorch (*.pt *.pth);;ONNX (*.onnx);;TensorRT (*.engine);;"
+    "OpenVINO (*.xml);;All files (*.*)"
+)
+
 
 class PrepareFullVideoDatasetPanel(WorkflowPanel):
     def __init__(self, parent: QWidget | None = None, on_success: Callable[[list[str]], None] | None = None) -> None:
@@ -473,7 +577,7 @@ class PrepareFullVideoDatasetPanel(WorkflowPanel):
             mode="file",
             file_filter="Text (*.txt);;All files (*.*)",
         )
-        self.yolo_weights = self._path_row("YOLO pose weights", mode="file", file_filter="PyTorch (*.pt);;All files (*.*)")
+        self.yolo_weights = self._path_row("YOLO pose weights", mode="file", file_filter=_YOLO_FILE_FILTER)
         self.yolo_weights.setPlaceholderText("Required")
         self.yolo_weights.setToolTip(_YOLO_WEIGHTS_TOOLTIP)
         self.output_root = self._path_row("Output dataset root", mode="dir")
@@ -494,6 +598,8 @@ class PrepareFullVideoDatasetPanel(WorkflowPanel):
         self.crop_size = self._spin_row("Pose window size", 224, 16)
         self.yolo_imgsz = self._spin_row("YOLO image size", 640, 32)
         self.yolo_batch = self._spin_row("YOLO batch", 64, 1)
+        self.yolo_tracker = self._tracker_row()
+        self.yolo_half = self._checkbox_row("YOLO FP16 on CUDA", False)
         self.storage_mode = self._combo_row("Storage mode", ["hdf5", "npz"], "hdf5")
         self.storage_mode.setToolTip(
             "hdf5 is the compact default: one per-video pose/social store with manifest windows. "
@@ -539,6 +645,8 @@ class PrepareFullVideoDatasetPanel(WorkflowPanel):
             str(self.yolo_imgsz.value()),
             "--yolo_batch",
             str(self.yolo_batch.value()),
+            "--yolo_tracker",
+            self.yolo_tracker.currentText().strip() or "bytetrack.yaml",
             "--storage_mode",
             self.storage_mode.currentText(),
             "--hdf5_compresslevel",
@@ -562,6 +670,8 @@ class PrepareFullVideoDatasetPanel(WorkflowPanel):
         manifest_path = self._optional_path(self.manifest_path)
         if manifest_path:
             cmd.extend(["--manifest_path", manifest_path])
+        if self.yolo_half.isChecked():
+            cmd.append("--yolo_half")
         if self.skip_existing.isChecked():
             cmd.append("--skip_existing")
         if self.validate_manifest.isChecked():
@@ -576,7 +686,7 @@ class TrainPanel(WorkflowPanel):
     def __init__(self, parent: QWidget | None = None, on_success: Callable[[list[str]], None] | None = None) -> None:
         super().__init__(parent)
         self.manifest_path = self._path_row("Training manifest JSON", mode="file", file_filter="JSON (*.json);;All files (*.*)")
-        self.yolo_weights = self._path_row("YOLO pose weights", mode="file", file_filter="PyTorch (*.pt);;All files (*.*)")
+        self.yolo_weights = self._path_row("YOLO pose weights", mode="file", file_filter=_YOLO_FILE_FILTER)
         self.yolo_weights.setPlaceholderText("Required — see README 'Getting YOLO weights'")
         self.yolo_weights.setToolTip(_YOLO_WEIGHTS_TOOLTIP)
         self.project = self._path_row("Run project folder", mode="dir", default=str(THIS_DIR / "runs"))
@@ -967,14 +1077,25 @@ class InferencePanel(WorkflowPanel):
         self.output_dir = self._path_row("Output CSV directory", mode="dir")
         self.output_video = self._path_row("Output MP4 (single video)", mode="file", file_filter="MP4 (*.mp4);;All files (*.*)", save=True)
         self.output_video_dir = self._path_row("Output MP4 directory", mode="dir")
-        self.device = self._line_row("Device", "cuda")
+        self.device = self._line_row("YOLO device", "cuda")
+        self.yolo_imgsz = self._spin_row("YOLO image size", 640, 32)
+        self.yolo_imgsz.setToolTip(
+            "The main speed/accuracy control. 640 preserves the existing path; 512 or 384 can "
+            "substantially increase FPS but must be validated for pose accuracy."
+        )
         self.yolo_batch = self._spin_row("YOLO batch", 64, 1)
+        self.yolo_tracker = self._tracker_row()
+        self.yolo_half = self._checkbox_row("YOLO FP16 on CUDA", False)
+        self.yolo_half.setToolTip(
+            "Often improves NVIDIA GPU throughput and reduces memory use. It is ignored on CPU; "
+            "benchmark it on your exact YOLO model because small models can be launch-bound."
+        )
         self.fps = self._double_row("Fallback FPS", 30.0, 0.1, 1000.0, 3)
         self.num_frames = self._spin_row("Window frames (0 = model config)", 0, 0)
         self.window_stride = self._spin_row("Window stride (0 = model config)", 0, 0)
         self.temporal_smoothing_window = self._spin_row("Median smoothing window", 0, 0)
         self.bout_min_duration = self._spin_row("Bout min duration frames", 0, 0)
-        self.csv_flush_interval = self._spin_row("CSV flush interval", 1, 1)
+        self.csv_flush_interval = self._spin_row("CSV flush interval", 30, 1)
         self.metrics_interval = self._spin_row("Metrics interval windows", 30, 1)
         self.realtime = self._checkbox_row("Real-time source", False)
         self.realtime.setToolTip(
@@ -989,6 +1110,8 @@ class InferencePanel(WorkflowPanel):
             "Improves annotated MP4/frame-level display by averaging overlapping windows. "
             "Disable for the lowest-latency live preview path."
         )
+        if not batch_mode:
+            self.realtime.toggled.connect(self._apply_realtime_defaults)
         self.live_preview = self._checkbox_row("Live preview", False)
         self.live_preview.setToolTip(
             "Show a live annotated playback window during inference. Press q or Esc "
@@ -1002,7 +1125,11 @@ class InferencePanel(WorkflowPanel):
         self.log_metrics.setToolTip(
             "Writes a sidecar metrics CSV and updates the live telemetry strip while inference runs."
         )
-        self.amp = self._checkbox_row("Inference AMP", True)
+        self.amp = self._checkbox_row("Inference AMP", False)
+        self.amp.setToolTip(
+            "Uses mixed precision for the temporal classifier. YOLO precision is controlled "
+            "separately by YOLO FP16 so each stage can be benchmarked independently."
+        )
         self.export_pose = self._checkbox_row("Export pose CSV (keypoints + bbox per frame)", False)
         self.no_bboxes = self._checkbox_row("Hide boxes in review MP4", False)
         self.no_keypoints = self._checkbox_row("Hide keypoints in review MP4", False)
@@ -1013,6 +1140,19 @@ class InferencePanel(WorkflowPanel):
         )
         title = "Batch process videos with TandemYTC" if batch_mode else "Run TandemYTC inference"
         self._wrap(title, runner)
+
+    def _apply_realtime_defaults(self, enabled: bool) -> None:
+        if enabled:
+            # Overlap smoothing intentionally buffers roughly one temporal
+            # window, which conflicts with the user's bounded-latency choice.
+            self.smooth_bouts.setChecked(False)
+            # Dense windows update the behavior label on every new frame.
+            # Batch one avoids a queue on camera/stream sources.
+            self.window_stride.setValue(1)
+            self.yolo_batch.setValue(1)
+            # This model benchmarks faster in FP32 than classifier AMP.
+            self.amp.setChecked(False)
+            self.csv_flush_interval.setValue(max(30, self.csv_flush_interval.value()))
 
     def build_command(self) -> list[str]:
         script = _script_path("infer_y.py")
@@ -1029,8 +1169,12 @@ class InferencePanel(WorkflowPanel):
             self._require(self.source, "Source"),
             "--device",
             self.device.text().strip() or "cuda",
+            "--yolo_imgsz",
+            str(self.yolo_imgsz.value()),
             "--yolo_batch",
             str(self.yolo_batch.value()),
+            "--yolo_tracker",
+            self.yolo_tracker.currentText().strip() or "bytetrack.yaml",
             "--fps",
             str(self.fps.value()),
             "--num_frames",
@@ -1071,6 +1215,7 @@ class InferencePanel(WorkflowPanel):
             cmd.append("--log_metrics")
         if self.amp.isChecked():
             cmd.append("--amp")
+        cmd.append("--yolo_half" if self.yolo_half.isChecked() else "--no-yolo_half")
         if self.export_pose.isChecked():
             cmd.append("--export_pose")
         if self.no_bboxes.isChecked():

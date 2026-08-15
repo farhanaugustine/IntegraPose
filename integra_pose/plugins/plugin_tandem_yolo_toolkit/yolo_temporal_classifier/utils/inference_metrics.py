@@ -76,6 +76,11 @@ except ImportError:
     torch = None  # type: ignore
     _TORCH_OK = False
 
+try:  # pragma: no cover - package/script dual use
+    from integra_pose.utils.torch_backend import detect_torch_backend
+except Exception:  # pragma: no cover
+    detect_torch_backend = None
+
 
 # ---- main class ---------------------------------------------------------
 
@@ -179,7 +184,11 @@ class MetricsLogger:
                 # Match torch's active CUDA device so we don't sample the
                 # idle integrated GPU when the dGPU is doing the work.
                 gpu_idx = 0
-                if _TORCH_OK and torch.cuda.is_available():
+                if detect_torch_backend is not None:
+                    backend = detect_torch_backend("auto", torch_module=torch if _TORCH_OK else None)
+                    if backend.supports_cuda_api and backend.device_index is not None:
+                        gpu_idx = int(backend.device_index)
+                elif _TORCH_OK and torch.cuda.is_available():
                     try:
                         gpu_idx = int(torch.cuda.current_device())
                     except Exception:
@@ -273,7 +282,20 @@ class MetricsLogger:
                 out["cpu_rss_mb"] = round(self._proc.memory_info().rss / (1024 * 1024), 1)
             except Exception:
                 pass
-        if _TORCH_OK and torch.cuda.is_available():
+        torch_backend = (
+            detect_torch_backend("auto", torch_module=torch)
+            if detect_torch_backend is not None and _TORCH_OK
+            else None
+        )
+        if torch_backend is not None and torch_backend.supports_cuda_api:
+            try:
+                out["gpu_mem_allocated_mb"] = round(
+                    torch.cuda.memory_allocated() / (1024 * 1024), 1)
+                out["gpu_mem_reserved_mb"] = round(
+                    torch.cuda.memory_reserved() / (1024 * 1024), 1)
+            except Exception:
+                pass
+        elif _TORCH_OK and detect_torch_backend is None and torch.cuda.is_available():
             try:
                 out["gpu_mem_allocated_mb"] = round(
                     torch.cuda.memory_allocated() / (1024 * 1024), 1)

@@ -1,6 +1,5 @@
 import os
 from pathlib import Path
-import re
 
 
 def _looks_like_weight_alias(path: str) -> bool:
@@ -62,26 +61,9 @@ def _normalize_inference_task(raw_value: str | None) -> str:
     return "auto"
 
 
-def _guess_task_from_model_path(model_path: str) -> str:
-    stem = Path(model_path or "").stem.lower()
-    if not stem:
-        return "pose"
-    tokens = [tok for tok in re.split(r"[^a-z0-9]+", stem) if tok]
-    if "pose" in tokens or "pose" in stem:
-        return "pose"
-    detect_tokens = {"detect", "det", "bbox", "box"}
-    if any(tok in detect_tokens for tok in tokens) or "detect" in stem or "bbox" in stem:
-        return "detect"
-    # Keep historical behavior as the fallback for legacy pose checkpoints (e.g., "best.pt").
-    return "pose"
-
-
 def _resolve_inference_task(cfg) -> str:
     task_var = getattr(cfg, "inference_task_var", None)
-    selected = _normalize_inference_task(task_var.get() if hasattr(task_var, "get") else "auto")
-    if selected != "auto":
-        return selected
-    return _guess_task_from_model_path(cfg.trained_model_path_infer.get())
+    return _normalize_inference_task(task_var.get() if hasattr(task_var, "get") else "auto")
 
 
 def build_training_command(app):
@@ -199,7 +181,10 @@ def build_inference_command(app):
     """Builds the YOLO file inference command with validation."""
     cfg = app.config.inference
     task = _resolve_inference_task(cfg)
-    cmd = ["yolo", task, "predict"]
+    # Omitting a task is Ultralytics' supported auto-detection path. Inferring
+    # from filenames is unreliable because trained checkpoints are commonly
+    # named best.pt for both detection and pose models.
+    cmd = ["yolo", "predict"] if task == "auto" else ["yolo", task, "predict"]
     errors = []
 
     err = _validate_path(
@@ -368,4 +353,3 @@ def build_webcam_command(app):
     cmd.append('show=True')
 
     return cmd, None
-

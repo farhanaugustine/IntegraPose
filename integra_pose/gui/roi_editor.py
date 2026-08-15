@@ -36,9 +36,9 @@ Design decisions
   click Save once. (Commit 5 is the file that wires this end-to-end;
   the editor itself is unaware of where the rois come from.)
 
-* **Object ROIs do NOT use this editor.** The ``_ObjectROIDialog``
-  click-center-with-fixed-size workflow stays. This editor is
-  exclusively for arena ROIs that the new builder dialog produces.
+* **Object ROIs can opt into object mode.** The single-frame fixed-size
+  placement dialog remains available, while the Batch Wizard's across-video
+  queue uses this editor with an edge-distance activation overlay.
 """
 
 from __future__ import annotations
@@ -338,6 +338,8 @@ class RoiEditor(tk.Toplevel):
         on_cancel: Optional[Callable[[], None]] = None,
         on_skip: Optional[Callable[[], None]] = None,
         loop_position: Optional[Tuple[int, int]] = None,
+        object_mode: bool = False,
+        interaction_distance_px: float = 0.0,
         max_display_size: Tuple[int, int] = _DEFAULT_MAX_DISPLAY,
         title: str = "ROI Editor",
     ) -> None:
@@ -366,6 +368,8 @@ class RoiEditor(tk.Toplevel):
         self._on_save = on_save
         self._on_cancel = on_cancel
         self._on_skip = on_skip
+        self._object_mode = bool(object_mode)
+        self._interaction_distance_px = max(0.0, float(interaction_distance_px or 0.0))
         self._reference_frame_index = int(reference_frame_index)
         self._existing_outside_names = {str(n).strip() for n in existing_roi_names}
 
@@ -473,6 +477,17 @@ class RoiEditor(tk.Toplevel):
         ttk.Label(toolbar, textvariable=self._status_var, style="Subtle.TLabel").grid(
             row=0, column=1, sticky="e", padx=(8, 0)
         )
+        if self._object_mode:
+            ttk.Label(
+                toolbar,
+                text=(
+                    "Orange dotted outline = selected-keypoint activation boundary "
+                    f"(+{self._interaction_distance_px:g} px outward from the nearest object edge)"
+                    if self._interaction_distance_px > 0
+                    else "Interaction threshold = 0 px (selected keypoint must touch or be inside the object ROI)"
+                ),
+                foreground="#b45309",
+            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 0))
 
         # Canvas (centre).
         canvas_frame = ttk.Frame(outer)
@@ -635,6 +650,9 @@ class RoiEditor(tk.Toplevel):
         line_width = 3 if selected else 2
         shape = roi["shape"]
 
+        if self._object_mode and self._interaction_distance_px > 0:
+            self._render_interaction_zone(roi)
+
         if shape == SHAPE_CIRCLE:
             cx, cy = self._src_to_display(float(roi["cx"]), float(roi["cy"]))
             r_disp = float(roi["r"]) * self._scale
@@ -680,6 +698,59 @@ class RoiEditor(tk.Toplevel):
 
         if selected:
             self._render_handles(roi)
+
+    def _render_interaction_zone(self, roi: dict) -> None:
+        """Draw the outward edge-distance boundary as an orange dotted line."""
+        distance_display = self._interaction_distance_px * self._scale
+        if distance_display <= 0:
+            return
+        shape = roi["shape"]
+        if shape == SHAPE_CIRCLE:
+            cx, cy = self._src_to_display(float(roi["cx"]), float(roi["cy"]))
+            outer_radius = (float(roi["r"]) + self._interaction_distance_px) * self._scale
+            self._canvas.create_oval(
+                cx - outer_radius,
+                cy - outer_radius,
+                cx + outer_radius,
+                cy + outer_radius,
+                outline="#ff8c00",
+                width=2,
+                dash=(8, 5),
+                tags="overlay",
+            )
+            return
+        if shape in (SHAPE_RECTANGLE, SHAPE_SQUARE):
+            points_src = rectangle_corners(roi)
+        else:
+            points_src = polygon_vertices_rotated(roi)
+        try:
+            from integra_pose.utils.object_interaction_geometry import (  # noqa: PLC0415
+                interaction_boundary_contours,
+            )
+
+            frame_width, frame_height = self._original_size
+            contours = interaction_boundary_contours(
+                [points_src],
+                frame_width=frame_width,
+                frame_height=frame_height,
+                distance_px=self._interaction_distance_px,
+            )
+        except Exception:
+            contours = []
+        for contour in contours:
+            points = [self._src_to_display(x, y) for x, y in contour]
+            if len(points) < 3:
+                continue
+            flat = [coord for point in (points + [points[0]]) for coord in point]
+            self._canvas.create_line(
+                *flat,
+                fill="#ff8c00",
+                width=2,
+                dash=(8, 5),
+                capstyle=tk.ROUND,
+                joinstyle=tk.ROUND,
+                tags="overlay",
+            )
 
     def _render_handles(self, roi: dict) -> None:
         shape = roi["shape"]

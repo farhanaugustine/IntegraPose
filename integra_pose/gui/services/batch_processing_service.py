@@ -7,11 +7,18 @@ from pathlib import Path
 from typing import Any, Callable
 
 from integra_pose.logic.batch_pipeline import BatchPipeline
+from integra_pose.logic.batch_design import apply_design_metadata_inference
+from integra_pose.utils.operation_result import OperationStatus
 from integra_pose.utils.batch_session import (
     BatchModelCapabilities,
     BatchSession,
     discover_videos,
     make_batch_items,
+)
+from integra_pose.utils.keypoint_schema import resolve_model_keypoint_schema, validate_keypoint_names
+from integra_pose.utils.frame_identity import (
+    extract_model_class_metadata,
+    normalize_class_name_metadata,
 )
 
 ProgressCallback = Callable[[BatchSession, str, float], None]
@@ -31,7 +38,22 @@ class BatchProcessingService:
 
     def discover_queue(self, source_path: str, *, recursive: bool = False):
         videos = discover_videos(source_path, recursive=recursive)
-        return make_batch_items(videos)
+        items = make_batch_items(videos)
+        apply_design_metadata_inference(items, source_path=source_path)
+        return items
+
+    @staticmethod
+    def infer_queue_design_metadata(
+        items,
+        *,
+        source_path: str = "",
+        overwrite: bool = False,
+    ) -> dict[str, int]:
+        return apply_design_metadata_inference(
+            list(items or []),
+            source_path=source_path,
+            overwrite=overwrite,
+        )
 
     @staticmethod
     def _normalize_task(task: str | None) -> str:
@@ -42,19 +64,7 @@ class BatchProcessingService:
 
     @staticmethod
     def _extract_class_names(names_obj: Any) -> list[str]:
-        if isinstance(names_obj, dict):
-            rows: list[tuple[int | None, str]] = []
-            for key, value in names_obj.items():
-                try:
-                    key_idx: int | None = int(key)
-                except Exception:
-                    key_idx = None
-                rows.append((key_idx, str(value)))
-            rows.sort(key=lambda row: (row[0] is None, row[0] if row[0] is not None else 0))
-            return [name for _idx, name in rows if name.strip()]
-        if isinstance(names_obj, (list, tuple)):
-            return [str(name) for name in names_obj if str(name).strip()]
-        return []
+        return normalize_class_name_metadata(names_obj, context="model.names")
 
     def preflight_model_capabilities(self, model_path: str) -> BatchModelCapabilities:
         path = str(model_path or "").strip()
@@ -68,9 +78,8 @@ class BatchProcessingService:
         from ultralytics import YOLO
 
         model = YOLO(str(resolved))
-        task = self._normalize_task(getattr(model, "task", None))
-
-        names = self._extract_class_names(getattr(model, "names", None))
+        names, raw_task = extract_model_class_metadata(model)
+        task = self._normalize_task(raw_task)
         class_count = len(names)
         if class_count <= 0:
             try:
@@ -98,6 +107,15 @@ class BatchProcessingService:
             task = "pose" if has_keypoints else "detect"
 
         warnings: list[str] = []
+        keypoint_names: list[str] = []
+        keypoint_names_source = "unresolved"
+        keypoint_schema_path = ""
+        if has_keypoints:
+            schema = resolve_model_keypoint_schema(model, resolved, keypoint_count)
+            keypoint_names = list(schema.names)
+            keypoint_names_source = str(schema.source or "unresolved")
+            keypoint_schema_path = str(schema.source_path or "")
+            warnings.extend(schema.warnings)
         if not has_keypoints:
             warnings.append(
                 "No keypoints detected for this model. Batch analytics will use bbox/center fallback for ROI entry and kinematic limits."
@@ -112,6 +130,9 @@ class BatchProcessingService:
             task=task,
             has_keypoints=has_keypoints,
             keypoint_count=max(0, keypoint_count),
+            keypoint_names=keypoint_names,
+            keypoint_names_source=keypoint_names_source,
+            keypoint_schema_path=keypoint_schema_path,
             class_count=max(0, class_count),
             class_names=names,
             supports_multiclass_stats=class_count > 1,
@@ -145,22 +166,31 @@ class BatchProcessingService:
         use_existing_labels: bool = False,
         existing_labels_root: str = "",
         inference_batch_size: int = 25,
+        max_det: int = 300,
         tracker_enabled: bool = True,
         tracker_config_path: str = "",
         min_bout_frames: int = 3,
         max_gap_frames: int = 5,
+        behavior_bout_class_mode: str = "mutually_exclusive",
         roi_min_dwell_frames: int = 3,
         roi_max_gap_frames: int = 5,
+        temporal_threshold_unit: str = "frames",
+        min_bout_seconds: float = 0.10,
+        max_gap_seconds: float = 0.17,
+        roi_min_dwell_seconds: float = 0.10,
+        roi_max_gap_seconds: float = 0.17,
         video_fps: float = 0.0,
         save_annotated_video: bool = False,
         save_confidence: bool = False,
         review_policy: str = "after_all",
         stats_correction: str = "fdr_bh",
         stats_categorical_factors: list[str] | None = None,
+        stats_auto_detect_design: bool = True,
         analytics_assay_preset: str = "custom",
         analytics_enabled_metrics: list[str] | None = None,
         analytics_enabled_modules: list[str] | None = None,
-        include_kpss: bool = True,
+        include_mixed_effects: bool = True,
+        include_kpss: bool = False,
         figure_output_preset: str = "publication_dashboard",
         export_publication_figures: bool = True,
         export_batch_dashboard: bool = True,
@@ -168,12 +198,15 @@ class BatchProcessingService:
         export_individual_profiles: bool = False,
         export_module_archive: bool = False,
         figure_export_mode: str = "assay_shortlist",
-        generate_video_quicklooks: bool = False,
+        generate_video_quicklooks: bool = True,
         single_animal_mode: bool = False,
         yaml_path: str = "",
         keybind_profile_path: str = "",
         roi_name_templates: list[str] | None = None,
         object_name_templates: list[str] | None = None,
+        keypoint_names: list[str] | None = None,
+        keypoint_names_source: str = "",
+        keypoint_schema_path: str = "",
     ) -> BatchSession:
         session = BatchSession.create()
         session.source_path = str(source_path or "").strip()
@@ -185,6 +218,25 @@ class BatchProcessingService:
         session.shared_rois = dict(shared_rois or {})
         session.shared_object_rois = dict(shared_object_rois or {})
         session.model_capabilities = model_capabilities or BatchModelCapabilities()
+        expected_keypoints = max(0, int(session.model_capabilities.keypoint_count or 0))
+        selected_names = list(keypoint_names or session.model_capabilities.keypoint_names or [])
+        model_task = str(session.model_capabilities.task or "unknown").strip().lower()
+        if model_task == "detect":
+            selected_names = []
+            keypoint_names_source = "not_applicable"
+            keypoint_schema_path = ""
+        elif expected_keypoints:
+            selected_names, schema_error = validate_keypoint_names(selected_names, expected_keypoints)
+            if schema_error:
+                raise ValueError(f"Invalid batch keypoint schema: {schema_error}.")
+        session.keypoint_names = selected_names
+        session.keypoint_names_source = (
+            str(keypoint_names_source or session.model_capabilities.keypoint_names_source or "unresolved").strip()
+            or "unresolved"
+        )
+        session.keypoint_schema_path = str(
+            keypoint_schema_path or session.model_capabilities.keypoint_schema_path or ""
+        ).strip()
         session.roi_entry_threshold = float(roi_entry_threshold)
         session.roi_exit_threshold = float(roi_exit_threshold)
         session.roi_event_mode = str(roi_event_mode or "bbox_only").strip() or "bbox_only"
@@ -200,10 +252,21 @@ class BatchProcessingService:
         session.use_existing_labels = bool(use_existing_labels)
         session.existing_labels_root = str(existing_labels_root or "").strip()
         session.inference_batch_size = max(1, int(inference_batch_size or 25))
+        session.max_det = int(300 if max_det is None else max_det)
+        if session.max_det < 1:
+            raise ValueError("max_det must be at least 1.")
         session.tracker_enabled = bool(tracker_enabled)
         session.tracker_config_path = str(tracker_config_path or "").strip()
         session.min_bout_frames = max(1, int(min_bout_frames or 3))
         session.max_gap_frames = max(0, int(5 if max_gap_frames is None else max_gap_frames))
+        session.behavior_bout_class_mode = (
+            "multi_label"
+            if str(behavior_bout_class_mode or "")
+            .strip()
+            .casefold()
+            in {"multi_label", "multi-label", "multilabel", "concurrent"}
+            else "mutually_exclusive"
+        )
         session.roi_min_dwell_frames = max(
             1,
             int(session.min_bout_frames if roi_min_dwell_frames is None else roi_min_dwell_frames),
@@ -216,6 +279,24 @@ class BatchProcessingService:
         # each video for its own fps. Non-zero values override the probe
         # (useful when the encoded fps is wrong, e.g. variable-frame-rate
         # exports from some camera software).
+        normalized_temporal_unit = str(
+            temporal_threshold_unit or "frames"
+        ).strip().lower()
+        session.temporal_threshold_unit = (
+            "seconds" if normalized_temporal_unit == "seconds" else "frames"
+        )
+        session.min_bout_seconds = max(
+            1e-9, float(min_bout_seconds or 0.10)
+        )
+        session.max_gap_seconds = max(
+            0.0, float(max_gap_seconds or 0.0)
+        )
+        session.roi_min_dwell_seconds = max(
+            1e-9, float(roi_min_dwell_seconds or 0.10)
+        )
+        session.roi_max_gap_seconds = max(
+            0.0, float(roi_max_gap_seconds or 0.0)
+        )
         try:
             session.video_fps = max(0.0, float(video_fps or 0.0))
         except (TypeError, ValueError):
@@ -223,8 +304,15 @@ class BatchProcessingService:
         session.save_annotated_video = bool(save_annotated_video)
         session.save_confidence = False
         session.review_policy = str(review_policy or "after_all").strip() or "after_all"
-        session.stats_correction = str(stats_correction or "fdr_bh").strip() or "fdr_bh"
+        session.stats_correction = (
+            str(stats_correction or "fdr_bh").strip().casefold() or "fdr_bh"
+        )
+        if session.stats_correction not in {"fdr_bh", "bonferroni"}:
+            raise ValueError(
+                "stats_correction must be 'fdr_bh' or 'bonferroni'."
+            )
         session.stats_categorical_factors = [str(name).strip() for name in (stats_categorical_factors or []) if str(name).strip()]
+        session.stats_auto_detect_design = bool(stats_auto_detect_design)
         session.analytics_assay_preset = str(analytics_assay_preset or "custom").strip() or "custom"
         session.analytics_enabled_metrics = [
             str(name).strip() for name in (analytics_enabled_metrics or []) if str(name).strip()
@@ -232,6 +320,7 @@ class BatchProcessingService:
         session.analytics_enabled_modules = [
             str(name).strip() for name in (analytics_enabled_modules or []) if str(name).strip()
         ]
+        session.include_mixed_effects = bool(include_mixed_effects)
         session.include_kpss = bool(include_kpss)
         session.figure_output_preset = str(figure_output_preset or "publication_dashboard").strip() or "publication_dashboard"
         session.export_publication_figures = bool(export_publication_figures)
@@ -344,14 +433,111 @@ class BatchProcessingService:
                     resume=resume,
                 )
                 payload = {
+                    "status": result.status.value,
                     "workbook_path": result.workbook_path,
                     "session_json_path": result.session_json_path,
                     "video_results": result.video_results or [],
+                    "total_count": int(result.total_count),
+                    "completed_count": int(result.completed_count),
+                    "failed_count": int(result.failed_count),
+                    "resumed_count": int(result.resumed_count),
                 }
                 self.last_run_result = payload
                 _finish(bool(result.cancelled), str(result.message), payload)
             except Exception as exc:
-                _finish(False, f"Batch run failed: {exc}", None)
+                active_items = [
+                    item
+                    for item in (session.videos or [])
+                    if not bool(getattr(item, "excluded", False))
+                ]
+                completed_count = sum(
+                    1
+                    for item in active_items
+                    if str(getattr(item, "inference_status", "")).strip() == "completed"
+                    and str(getattr(item, "analytics_status", "")).strip() == "completed"
+                )
+                payload = {
+                    "status": OperationStatus.FAILED.value,
+                    "workbook_path": "",
+                    "session_json_path": "",
+                    "video_results": [],
+                    "total_count": len(active_items),
+                    "completed_count": completed_count,
+                    "failed_count": max(0, len(active_items) - completed_count),
+                    "resumed_count": 0,
+                }
+                self.last_run_result = payload
+                _finish(False, f"Batch run failed: {exc}", payload)
+            finally:
+                self._run_thread = None
+                self._stop_event.clear()
+
+        self._run_thread = threading.Thread(target=_run, daemon=True)
+        self._run_thread.start()
+        return True
+
+    def start_finalize_reviewed_results(
+        self,
+        session: BatchSession,
+        *,
+        on_progress: ProgressCallback | None = None,
+        on_finish: FinishCallback | None = None,
+    ) -> bool:
+        """Rebuild batch derivatives from the current authoritative reviews."""
+
+        if self.is_running():
+            return False
+        self._stop_event.clear()
+
+        def _progress(message: str, ratio: float) -> None:
+            if on_progress is not None:
+                self._safe_ui_call(lambda: on_progress(session, message, ratio))
+
+        def _finish(cancelled: bool, message: str, payload: dict | None) -> None:
+            if on_finish is not None:
+                self._safe_ui_call(
+                    lambda: on_finish(session, cancelled, message, payload)
+                )
+
+        def _run() -> None:
+            try:
+                result = self.pipeline.finalize_reviewed_results(
+                    session,
+                    stop_event=self._stop_event,
+                    progress_callback=_progress,
+                )
+                payload = {
+                    "result_kind": "finalization",
+                    "status": result.status.value,
+                    "workbook_path": result.workbook_path,
+                    "session_json_path": result.session_json_path,
+                    "video_results": result.video_results or [],
+                    "total_count": int(result.total_count),
+                    "completed_count": int(result.completed_count),
+                    "failed_count": int(result.failed_count),
+                    "resumed_count": int(result.resumed_count),
+                }
+                self.last_run_result = payload
+                _finish(bool(result.cancelled), str(result.message), payload)
+            except Exception as exc:
+                active_items = [
+                    item
+                    for item in (session.videos or [])
+                    if not bool(getattr(item, "excluded", False))
+                ]
+                payload = {
+                    "result_kind": "finalization",
+                    "status": OperationStatus.FAILED.value,
+                    "workbook_path": "",
+                    "session_json_path": "",
+                    "video_results": [],
+                    "total_count": len(active_items),
+                    "completed_count": 0,
+                    "failed_count": len(active_items),
+                    "resumed_count": 0,
+                }
+                self.last_run_result = payload
+                _finish(False, f"Batch result finalization failed: {exc}", payload)
             finally:
                 self._run_thread = None
                 self._stop_event.clear()

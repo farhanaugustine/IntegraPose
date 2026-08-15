@@ -1,7 +1,24 @@
+from pathlib import Path
+
 import cv2
 import numpy as np
+import pandas as pd
+import pytest
 
 from integra_pose.utils import video_creator
+
+
+def _write_test_video(path: Path) -> None:
+    writer = cv2.VideoWriter(
+        str(path),
+        cv2.VideoWriter_fourcc(*"MJPG"),
+        10.0,
+        (32, 32),
+    )
+    if not writer.isOpened():
+        pytest.skip("OpenCV cannot create the test video on this platform")
+    writer.write(np.full((32, 32, 3), 90, dtype=np.uint8))
+    writer.release()
 
 
 def test_wrap_text_to_width_keeps_sidebar_lines_inside_budget() -> None:
@@ -187,3 +204,109 @@ def test_parse_detection_file_does_not_treat_confidence_as_track(tmp_path) -> No
 
     assert parsed is not None
     assert parsed.loc[0, "track_id"] == 0
+
+
+def test_single_animal_dashboard_uses_canonical_track_zero_and_bout_label(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    source_video = tmp_path / "source.avi"
+    _write_test_video(source_video)
+    labels = tmp_path / "labels"
+    labels.mkdir()
+    (labels / "frame_0.txt").write_text(
+        "0 0.5 0.5 0.25 0.25\n",
+        encoding="utf-8",
+    )
+    (labels / "labels.csv").write_text(
+        "frame,track_id\n0,1\n",
+        encoding="utf-8",
+    )
+    bouts = pd.DataFrame(
+        [
+            {
+                "Track ID": 0,
+                "Behavior": "Walking",
+                "Start Frame": 0,
+                "End Frame": 0,
+            }
+        ]
+    )
+    output_video = tmp_path / "dashboard.mp4"
+    writer_paths: list[Path] = []
+    captured_cards: list[dict] = []
+    real_writer = video_creator.cv2.VideoWriter
+
+    def recording_writer(path, *args, **kwargs):
+        writer_paths.append(Path(path))
+        assert Path(path).resolve() != output_video.resolve()
+        assert not output_video.exists()
+        return real_writer(path, *args, **kwargs)
+
+    def capture_cards(_image, cards, *, y, **_kwargs):
+        captured_cards.extend(cards)
+        return int(y) + 1
+
+    monkeypatch.setattr(video_creator.cv2, "VideoWriter", recording_writer)
+    monkeypatch.setattr(video_creator, "_draw_sidebar_card_grid", capture_cards)
+
+    rendered = video_creator.create_annotated_video(
+        str(source_video),
+        str(output_video),
+        str(labels),
+        {},
+        bouts,
+        single_animal_mode=True,
+    )
+
+    assert rendered is True
+    assert writer_paths
+    assert output_video.is_file()
+    assert not list(tmp_path.glob(".*.rendering.mp4"))
+    track_card = next(card for card in captured_cards if card.get("title") == "Track 0")
+    row_text = [row.get("text") for row in track_card["rows"]]
+    assert "Behavior: Walking" in row_text
+    assert "Total bouts: 1" in row_text
+    capture = cv2.VideoCapture(str(output_video))
+    try:
+        ok, frame = capture.read()
+        assert capture.isOpened() and ok and frame is not None
+    finally:
+        capture.release()
+
+
+def test_failed_dashboard_render_preserves_existing_final_file(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    source_video = tmp_path / "source.avi"
+    _write_test_video(source_video)
+    output_video = tmp_path / "dashboard.mp4"
+    output_video.write_bytes(b"existing finalized video")
+
+    class ClosedWriter:
+        def isOpened(self):
+            return False
+
+        def release(self):
+            return None
+
+    monkeypatch.setattr(
+        video_creator.cv2,
+        "VideoWriter",
+        lambda *_args, **_kwargs: ClosedWriter(),
+    )
+
+    rendered = video_creator.create_annotated_video(
+        str(source_video),
+        str(output_video),
+        str(tmp_path),
+        {},
+        pd.DataFrame(
+            columns=["Track ID", "Behavior", "Start Frame", "End Frame"]
+        ),
+    )
+
+    assert rendered is False
+    assert output_video.read_bytes() == b"existing finalized video"
+    assert not list(tmp_path.glob(".*.rendering.mp4"))

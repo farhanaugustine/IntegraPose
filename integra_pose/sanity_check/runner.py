@@ -28,7 +28,6 @@ Design constraints
 from __future__ import annotations
 
 import io
-import json
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -84,7 +83,7 @@ class SanityReport:
     def as_text(self) -> str:
         """Plain-text rendering suitable for clipboard / bug reports."""
         out = io.StringIO()
-        out.write(f"IntegraPose Sanity Check\n")
+        out.write("IntegraPose Sanity Check\n")
         out.write(f"  started:  {self.started_at_utc}\n")
         out.write(f"  finished: {self.finished_at_utc}\n")
         out.write(
@@ -121,7 +120,7 @@ def _stage_runtime_inventory() -> StageResult:
     detail_lines.append("Required modules:")
     for name, ver in required.items():
         detail_lines.append(f"  {name}: {ver}")
-    detail_lines.append("Optional modules:")
+    detail_lines.append("Optional plugin packages (availability only):")
     for name, ver in info.get("optional", {}).items():
         detail_lines.append(f"  {name}: {ver}")
 

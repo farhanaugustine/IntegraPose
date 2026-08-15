@@ -1,38 +1,27 @@
-"""ADP-4 Commit E — Cluster stability audit.
+"""Cluster stability audit.
 
-Re-runs ``cluster_per_class`` with N different seeds and computes the
+Runs ``cluster_per_class`` with N different seeds and computes the
 pairwise Adjusted Rand Index (ARI) between the resulting cluster
-assignments **per class**. The output answers a question every reviewer
-of an unsupervised analysis asks:
+assignments per class. Higher ARI values indicate that the assignments are
+less sensitive to initialization.
 
-    "If you re-ran this with a different seed, would you get the same
-    clusters?"
-
-If yes, the clusters are stable and defensible. If no, they're an
-artifact of the random initialization and the user shouldn't trust
-them. The defensibility report panel will refuse to surface a sub-cluster
-as a "candidate novel behavior" without a stability score above a
-threshold.
-
-Why ARI specifically:
+ARI properties:
 
 - ARI is symmetric, bounded in ``[-1, 1]`` (1 = identical clusterings,
   0 = chance, negative = worse than chance).
 - ARI is **label-permutation invariant** — HDBSCAN's "cluster 0" in
   seed 42 might be the same group of frames as "cluster 2" in seed 43.
   ARI doesn't care; it only looks at which pairs of frames were
-  grouped together. So we don't need Hungarian matching to align
-  labels across seeds before scoring.
-- Sklearn's ``adjusted_rand_score`` is the canonical implementation;
-  we don't reimplement.
+  grouped together, so labels do not need to be aligned across seeds.
+- The calculation uses sklearn's ``adjusted_rand_score``.
 
 Contract with downstream code:
 
 - ``compute_class_stability`` is **pure**: given the same input dataframe
   and same base seed, it returns the same numbers. No global RNG.
-- The N additional clustering runs are independent of the user's
-  primary run; the primary cluster assignment is preserved. Stability
-  is only used for reporting / signal-scoring, never to override the
+- The additional clustering runs are independent of the primary run;
+  the primary cluster assignment is preserved. Stability is used for
+  reporting and signal scoring, never to override the
   primary labels.
 - Cost: N additional clusterings per call. Default N=3 means 3×
   the runtime of the main run. Surface this in the UI as opt-in.
@@ -60,8 +49,7 @@ logger = logging.getLogger(__name__)
 # Default seed offset stride — seeds tested are
 # ``[base_seed, base_seed+1, ..., base_seed + n_seeds - 1]``.
 # Default base seed = 42 to match per_class_clustering and splits.py;
-# anyone wanting a different seed family edits the constant in code,
-# no UI knob (per user, "ease of use means loyalty later").
+# the value is fixed in code rather than exposed as a GUI control.
 DEFAULT_BASE_SEED = 42
 DEFAULT_N_SEEDS = 3
 

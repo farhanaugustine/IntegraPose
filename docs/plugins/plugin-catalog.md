@@ -1,23 +1,21 @@
 # Plugin Catalog
 
-IntegraPose ships with a curated plugin ecosystem that extends the
-core 7-tab workflow without bloating it. Plugins are **opt-in** - turn
-them on from `Plugins -> Manage Plugins...`, launch them from the
-`Plugins` menu, and the rest of the app continues to work
-exactly as before.
+IntegraPose includes a curated collection of plugins for specialized needs
+outside the seven main tabs. They are **optional**: enable the ones you need
+from `Plugins -> Manage Plugins...` and launch them from the `Plugins` menu.
 
-The same project files, reproducibility bundles, and run manifests
-flow through plugins as through the main tabs, so a plugin-driven
-analysis stays as defensible as a core-only analysis.
+Each plugin has its own input files, results, and optional packages. Some reuse
+the main IntegraPose project and run records; others, such as Fura Imaging Lab,
+create separate specialist results. Follow the relevant plugin guide and keep
+its result files with the rest of the study record.
 
 !!! note "Plugin status - research in progress"
     The IntegraPose plugin ecosystem evolves alongside active research.
     Some plugins are stable enough for ongoing use; others are works
     in progress, and individual plugins may change, be deprecated, or
-    be removed as research priorities shift. The set of bundled
-    plugins reflects the current shipped state - not a long-term API
-    contract. Pin to a commit hash if you depend on a specific plugin
-    for an in-flight project.
+    be removed as research priorities shift. If an ongoing study depends on a
+    particular plugin, keep a copy of the IntegraPose version used for that
+    study and record it in your methods or lab notes.
 
 ## Browse by purpose
 
@@ -40,6 +38,7 @@ analysis stays as defensible as a core-only analysis.
 | Plugin | What it adds | When to reach for it |
 | --- | --- | --- |
 | [Gait & Kinematic Dashboard](gait-kinematics.md) | Stride length, speed, paw angles, and group comparisons | Locomotion-focused experiments and gait-disorder studies |
+| [Fura Imaging Lab](fura-imaging-lab.md) | Fura-2 stack alignment, ROI tracking, ratio analysis, and workbook export | Calcium-imaging experiments whose outputs should be stored beside pose and behavior records |
 | [Zone Counter](zone-counter.md) | Live polygon-based zone counts during inference | Real-time entry/exit counts for arenas, choice tests, social zones |
 
 ### Exploration & review
@@ -56,6 +55,7 @@ analysis stays as defensible as a core-only analysis.
 | Before training | Dataset Augmentor Lab |
 | After inference | EDA Tool, Gait & Kinematic Dashboard, Zone Counter |
 | After Tab 7 sub-behavior discovery | TandemYTC - Tandem YOLO + Temporal Classifier |
+| Adjacent imaging analysis | Fura Imaging Lab |
 
 ## Browse by question
 
@@ -69,6 +69,7 @@ analysis stays as defensible as a core-only analysis.
 | Train a downstream behavior classifier | TandemYTC - Tandem YOLO + Temporal Classifier |
 | Run a multi-stage detector + classifier | TandemYTC - Tandem YOLO + Temporal Classifier |
 | Focus on gait or stride features | Gait & Kinematic Dashboard |
+| Analyze Fura-2 calcium-imaging stacks | Fura Imaging Lab |
 
 ## Enabling and launching plugins
 
@@ -97,4 +98,4 @@ Data Preprocessing -> Setup -> Training -> Inference -> Bout Analytics -> Behavi
 
 - A few plugins have additional dependencies (for example, AutoLabel Forge wants GroundingDINO and SAM weights). Per-plugin pages call those out where they apply.
 
-- All plugins respect the IntegraPose seed configuration and project-level settings, so reproducibility bundles stay consistent across plugin and core runs.
+- Preserve each plugin's manifest, workbook, model, or output folder according to its guide; a core project JSON or reproducibility bundle does not replace specialist result files.

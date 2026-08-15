@@ -12,7 +12,7 @@ If you are working with a detection-only model, the usual path is to bring that 
 
 | Best for | Typical output | Usually next |
 | --- | --- | --- |
-| Training YOLO pose checkpoints from `dataset.yaml` | Weights, metrics, exportable model artifacts | `Inference` |
+| Training YOLO pose checkpoints from `dataset.yaml` | Model files, training measurements, and optional exports | `Inference` |
 
 ## Main sections
 
@@ -30,6 +30,11 @@ If you are working with a detection-only model, the usual path is to bring that 
 | Model Variant | Starting pose checkpoint |
 | Run Name | Folder name for this training run |
 
+The initial fields are `yolo26n-pose.pt` and
+`keypoint_behavior_run1`. They are editable starting values, not requirements;
+you may type another compatible Ultralytics pose checkpoint or a local model
+path.
+
 ### 3. Training essentials
 
 Common controls include:
@@ -39,9 +44,9 @@ Common controls include:
 - batch size
 - image size
 
-### 4. Advanced training settings
+### Advanced training settings
 
-Use these when you need finer control over:
+This section is collapsed by default. Open it when you need finer control over:
 
 - optimizer choice
 - weight decay
@@ -49,24 +54,31 @@ Use these when you need finer control over:
 - early-stop patience
 - device override
 
-### 5. Augmentation settings
+The device defaults to `-1`: automatic idle-GPU selection on CUDA/ROCm systems, `mps` on supported Apple systems, and CPU otherwise. Enter `cpu`, `0`, `cuda:1`, or a multi-GPU list only when an explicit override is needed.
 
-Use these when you want to tune:
+### 4. Augmentation settings
+
+This section is also collapsed by default. Use it when you want to tune:
 
 - HSV shifts
 - rotation, translation, and scale
 - flips
 - mixup, mosaic, and copy-paste
 
-### 6. Export and quantization
+### 5. Export and quantization
 
-After training, use the export section to create deployment artifacts such as:
+After training, expand the export section to select trained `.pt` weights, an
+export directory, precision options, and a deployment format such as:
 
 - TensorRT engine
 - ONNX
 - OpenVINO
 - TorchScript
 - CoreML
+
+INT8 is available only for compatible TensorRT or OpenVINO setups. Export
+support ultimately depends on the active Ultralytics runtime and the target
+platform.
 
 ## Model Registry integration
 

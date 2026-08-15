@@ -5,6 +5,11 @@ from __future__ import annotations
 import os
 from tkinter import filedialog, messagebox
 
+from integra_pose.utils.frame_identity import (
+    FrameIdentityError,
+    resolve_frame_label_indices,
+)
+
 
 class ProjectIOService:
     """Handles project open/save flows with user prompts and logging."""
@@ -28,20 +33,32 @@ class ProjectIOService:
 
     def save_project(self) -> None:
         try:
-            self.app.config.save_project()
-            self.app.update_status("Project saved successfully.")
-            self.app.log_message("Project saved successfully.", "INFO")
-            messagebox.showinfo("Success", "Project saved successfully.", parent=self.app.root)
+            result = self.app.config.save_project()
+            if result.cancelled:
+                self.app.log_message("Project save cancelled.", "INFO")
+                return
+            if result.failed:
+                self.app.log_message(result.error or result.message, "ERROR")
+                return
+            self.app.update_status(result.message or "Project saved successfully.")
+            self.app.log_message(result.message or "Project saved successfully.", "INFO")
+            messagebox.showinfo("Success", result.message or "Project saved successfully.", parent=self.app.root)
         except Exception as exc:
             self.app.log_message(f"Failed to save project: {exc}", "ERROR")
             messagebox.showerror("Project Error", f"Failed to save project: {exc}", parent=self.app.root)
 
     def save_project_as(self) -> None:
         try:
-            self.app.config.save_project_as()
-            self.app.update_status("Project saved as new successfully.")
-            self.app.log_message("Project saved as new successfully.", "INFO")
-            messagebox.showinfo("Success", "Project saved as new successfully.", parent=self.app.root)
+            result = self.app.config.save_project_as()
+            if result.cancelled:
+                self.app.log_message("Save Project As cancelled.", "INFO")
+                return
+            if result.failed:
+                self.app.log_message(result.error or result.message, "ERROR")
+                return
+            self.app.update_status(result.message or "Project saved as new successfully.")
+            self.app.log_message(result.message or "Project saved as new successfully.", "INFO")
+            messagebox.showinfo("Success", result.message or "Project saved successfully.", parent=self.app.root)
         except Exception as exc:
             self.app.log_message(f"Failed to save project as: {exc}", "ERROR")
             messagebox.showerror("Project Error", f"Failed to save project as: {exc}", parent=self.app.root)
@@ -124,17 +141,49 @@ class ProjectIOService:
     def select_yolo_output_directory(self) -> None:
         dir_path = filedialog.askdirectory(title="Select Folder with YOLO .txt Files", parent=self.app.root)
         if dir_path:
-            txt_files = [f for f in os.listdir(dir_path) if f.endswith('.txt')]
-            if not txt_files:
-                self.app.log_message(f"No .txt files found in selected YOLO output directory: {dir_path}", "WARNING")
+            txt_files = sorted(
+                filename
+                for filename in os.listdir(dir_path)
+                if filename.lower().endswith('.txt') and not filename.startswith('.')
+            )
+            try:
+                source_video = self.app.config.analytics.source_video_path_var.get() or None
+            except Exception:
+                source_video = None
+            try:
+                frame_files = resolve_frame_label_indices(txt_files, source=source_video)
+            except FrameIdentityError as exc:
+                self.app.log_message(
+                    f"Ambiguous YOLO frame labels in {dir_path}: {exc}",
+                    "WARNING",
+                )
                 messagebox.showwarning(
                     "Invalid Directory",
-                    "The selected directory contains no .txt files. Please select a directory with YOLO detection outputs.",
+                    f"The selected directory has ambiguous frame labels:\n{exc}",
+                    parent=self.app.root,
+                )
+                return
+
+            if not frame_files:
+                self.app.log_message(
+                    f"No frame-indexed detection labels found in selected directory: {dir_path}",
+                    "WARNING",
+                )
+                messagebox.showwarning(
+                    "Invalid Directory",
+                    "The selected directory contains no frame-indexed detection labels. "
+                    "Auxiliary files such as classes.txt and notes.txt are not inference frames.",
                     parent=self.app.root,
                 )
             else:
                 self.app.config.analytics.yolo_output_path_var.set(dir_path)
-                self.app.log_message(f"Selected YOLO output directory with {len(txt_files)} .txt files: {dir_path}", "INFO")
+                ignored_count = len(txt_files) - len(frame_files)
+                ignored_detail = f"; ignored {ignored_count} auxiliary TXT file(s)" if ignored_count else ""
+                self.app.log_message(
+                    f"Selected YOLO output directory with {len(frame_files)} frame label(s)"
+                    f"{ignored_detail}: {dir_path}",
+                    "INFO",
+                )
 
     def select_source_video(self) -> None:
         filetypes = (("Video files", "*.mp4 *.avi *.mov"), ("All files", "*.*"))

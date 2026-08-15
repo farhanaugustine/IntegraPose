@@ -1,8 +1,6 @@
 import os
 import pandas as pd
 import numpy as np
-import seaborn as sns
-import matplotlib.pyplot as plt
 import logging
 from sklearn.preprocessing import StandardScaler
 import umap
@@ -16,13 +14,17 @@ def load_and_prepare_data(base_results_dir, groups_config):
     for group_info in groups_config:
         for video_folder in group_info["videos"]:
             data_path = os.path.join(base_results_dir, video_folder, 'final_analysis_data.csv')
-            if not os.path.exists(data_path): continue
+            if not os.path.exists(data_path):
+                continue
             df = pd.read_csv(data_path)
+            df = df.sort_values(['track_id', 'frame']).reset_index(drop=True)
             df['group'] = group_info["name"]
             df['video_source'] = video_folder
             keypoint_cols = [col for col in df.columns if '_x' in col or '_y' in col]
+            frame_delta = df.groupby('track_id', sort=False)['frame'].diff()
             for col in keypoint_cols:
-                df[f'{col}_vel'] = df.groupby('track_id')[col].diff()
+                velocity = df.groupby('track_id', sort=False)[col].diff()
+                df[f'{col}_vel'] = velocity.where(frame_delta.eq(1))
             all_dfs.append(df)
     return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
 
@@ -48,7 +50,8 @@ def main(base_results_dir, group_config, config_obj):
     os.makedirs(plots_dir, exist_ok=True)
     
     full_df = load_and_prepare_data(base_results_dir, group_config)
-    if full_df.empty: return
+    if full_df.empty:
+        return
         
     keypoint_order = config_obj['DATASET']['KEYPOINT_ORDER']
     umap_features = create_umap_features(full_df, keypoint_order)

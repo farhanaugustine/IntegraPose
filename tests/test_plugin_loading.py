@@ -5,7 +5,9 @@ import types
 from pathlib import Path
 
 import pytest
+from setuptools import find_packages
 
+from integra_pose.gui.controllers.plugin_controller import PluginController
 from integra_pose.utils import plugin_security
 
 
@@ -84,6 +86,29 @@ def test_bundled_plugins_are_auto_trusted(plugin_name: str) -> None:
     decision = plugin_security.ensure_plugin_trusted(plugin_dir, prompt=None)
     assert decision.allowed, f"{plugin_name} should be trusted by default"
     assert "Trusted bundled plugin" in decision.message
+
+
+def test_legacy_behaviorscope_plugin_is_not_bundled_discovered_or_packaged(tmp_path) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    plugins_dir = repo_root / "integra_pose" / "plugins"
+    legacy_plugin = plugins_dir / "plugin_behavior_scope"
+
+    controller = PluginController(
+        app=object(),
+        plugins_dir=plugins_dir,
+        user_plugins_dir=tmp_path / "user_plugins",
+    )
+    discovered = {plugin.identifier for plugin in controller.discover_plugins()}
+    packaged = set(find_packages(where=str(repo_root)))
+
+    assert not legacy_plugin.exists()
+    assert "plugin_behavior_scope" not in discovered
+    assert not plugin_security.is_bundled_plugin("plugin_behavior_scope")
+    assert not any(
+        package == "integra_pose.plugins.plugin_behavior_scope"
+        or package.startswith("integra_pose.plugins.plugin_behavior_scope.")
+        for package in packaged
+    )
 
 
 @pytest.mark.parametrize(

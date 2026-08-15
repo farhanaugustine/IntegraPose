@@ -37,7 +37,7 @@ def _stationary_distribution(transmat: np.ndarray) -> np.ndarray:
     """Left eigenvector with eigenvalue 1, normalised to sum to 1.
 
     Falls back to a uniform distribution if the eigendecomposition is
-    degenerate. Never raises — used as a tiebreaker, not load-bearing.
+    degenerate. Never raises because the value is used only as a tiebreaker.
     """
     n = transmat.shape[0]
     try:

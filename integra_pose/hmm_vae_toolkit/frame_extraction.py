@@ -1,4 +1,4 @@
-"""ADP-4 Commit G — Frame extraction for cluster naming.
+"""Representative-frame extraction for cluster naming.
 
 Pulls representative frames from a source video given a list of bouts.
 Default policy: for each bout, return three frames — start, middle,
@@ -12,8 +12,7 @@ Why a separate module:
   - The extraction logic is pure given (video_path, frame_indices) —
     easy to unit-test against a synthesized video without wiring up
     Tk.
-  - Reused by the naming dialog (Commit G) AND the bout scrubber
-    (Commit H) once that lands.
+  - Shared by the naming dialog and bout-review components.
 
 Output format: list of PIL Image objects (RGB), thumbnailed to
 ``thumbnail_size`` so the naming dialog's 3×3 grid stays manageable.
@@ -186,12 +185,12 @@ def select_top_n_bouts(
 
     Args:
         bouts: Aggregated bouts.
-        n: Maximum number to return. Default 9 (per ADP-4 user signoff).
+        n: Maximum number to return. Default 9.
         target_state: When supplied, only bouts with ``state ==
             target_state`` are considered. Compares as string or int —
             the namespaced cluster_label or raw HDBSCAN id both work.
-        sort_key: Bout-dict key whose value is sorted descending. For
-            ADP-4 we use ``duration_frames`` (longest first).
+        sort_key: Bout-dict key whose value is sorted descending. The
+            default is ``duration_frames`` (longest first).
     """
     if target_state is not None:
         candidates = [

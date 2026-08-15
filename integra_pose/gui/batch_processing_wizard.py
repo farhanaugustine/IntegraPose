@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import json
+import math
 import subprocess
 import sys
 import tkinter as tk
@@ -16,7 +18,15 @@ import pandas as pd
 from PIL import Image, ImageDraw, ImageTk
 
 from integra_pose.gui.bout_confirmation_tool import BoutConfirmationTool, normalize_bout_confirmation_dataframe
+from integra_pose.gui.collapsible import CollapsibleSection
 from integra_pose.gui.roi_event_review_tool import ROIEventReviewTool, normalize_roi_event_dataframe
+from integra_pose.bout_reviewer.launcher import (
+    BEHAVIOR_MODE,
+    SPATIAL_MODE,
+    ReviewLaunchError,
+    launch_reviewer,
+)
+from integra_pose.bout_reviewer.models import BEHAVIOR, ROI_CONCURRENT
 from integra_pose.gui.scrollable import create_scrollable_section
 from integra_pose.gui.services.batch_processing_service import BatchProcessingService
 from integra_pose.gui.tooltips import CreateToolTip
@@ -25,6 +35,7 @@ from integra_pose.logic.batch_preflight import (
     AnalysisPreflightConfig,
     PreflightVideoState,
     build_analysis_preflight_rows,
+    summarize_study_design,
     summarize_preflight_counts,
 )
 from integra_pose.logic.analytics_metric_catalog import (
@@ -36,7 +47,27 @@ from integra_pose.logic.analytics_metric_catalog import (
     iter_assay_presets,
     iter_metric_specs,
 )
+from integra_pose.utils.bout_review import (
+    BoutReviewPaths,
+    build_review_workspace,
+    load_review_decisions,
+    migrate_legacy_review_workspace,
+    normalize_detected_bouts,
+    register_authoritative_review_in_manifest,
+)
 from integra_pose.utils.batch_session import BatchModelCapabilities, BatchSession, BatchVideoItem
+from integra_pose.utils.keypoint_schema import validate_keypoint_names
+from integra_pose.utils.object_interaction_geometry import (
+    OBJECT_DISTANCE_HELP_TEXT,
+    interaction_boundary_contours,
+)
+from integra_pose.utils.operation_result import OperationStatus
+from integra_pose.utils.roi_event_review import (
+    ROIReviewValidationError,
+    register_authoritative_roi_review_in_manifest,
+    save_reviewed_roi_bundle,
+)
+from integra_pose.utils.safe_io import safe_write_json
 from integra_pose.utils.review_keybinds import (
     DEFAULT_KEYBINDS,
     load_keybind_profile,
@@ -52,6 +83,215 @@ from integra_pose.utils.roi_layout import (
 )
 from integra_pose.gui.roi_builder_dialog import RoiBuilderDialog, RoiBuilderRow
 from integra_pose.gui.roi_editor import RoiEditor
+
+
+class _BatchMetadataEditorDialog(tk.Toplevel):
+    """Edit group, subject, and time labels for many videos in one view."""
+
+    _FIELD_LABELS = (
+        ("group", "Group"),
+        ("subject_id", "Subject ID"),
+        ("time_point", "Time Point"),
+    )
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        items: list[BatchVideoItem],
+        known_values: dict[str, list[str]],
+    ) -> None:
+        super().__init__(master)
+        self.title("Edit Experimental Design Metadata")
+        apply_adaptive_window_geometry(
+            self,
+            preferred_size=(1080, 680),
+            min_size=(820, 480),
+        )
+        self.transient(master)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.result: list[dict[str, str]] | None = None
+        self._items = list(items)
+        self._known_values = {
+            field: list(known_values.get(field, ()))
+            for field, _label in self._FIELD_LABELS
+        }
+        self._bulk_vars = {
+            field: tk.StringVar(value="")
+            for field, _label in self._FIELD_LABELS
+        }
+        self._row_vars: list[tuple[BatchVideoItem, dict[str, tk.StringVar]]] = []
+
+        self._build_ui()
+        self.bind("<Escape>", lambda _event: self._cancel())
+        self.bind("<Control-s>", lambda _event: self._save())
+        self.bind("<Control-S>", lambda _event: self._save())
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    def _build_ui(self) -> None:
+        outer = ttk.Frame(self, padding=12)
+        outer.pack(fill=tk.BOTH, expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=1)
+
+        ttk.Label(
+            outer,
+            text=(
+                "Edit every selected video side-by-side. You can enter different "
+                "values per row, or use the bulk fields to fill a whole column. "
+                "An intentionally blank row value clears that designation when saved."
+            ),
+            wraplength=1030,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
+
+        bulk = ttk.LabelFrame(outer, text="Bulk fill selected videos", padding=8)
+        bulk.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        for col_index, (field, label) in enumerate(self._FIELD_LABELS):
+            column = ttk.Frame(bulk)
+            column.grid(row=0, column=col_index, sticky="ew", padx=(0, 10))
+            column.columnconfigure(0, weight=1)
+            bulk.columnconfigure(col_index, weight=1)
+            ttk.Label(column, text=f"{label}:").grid(row=0, column=0, sticky="w")
+            combo = ttk.Combobox(
+                column,
+                textvariable=self._bulk_vars[field],
+                values=self._known_values[field],
+                state="normal",
+                width=24,
+            )
+            combo.grid(row=1, column=0, sticky="ew", padx=(0, 5))
+            ttk.Button(
+                column,
+                text=f"Fill {label}",
+                command=lambda key=field: self._fill_column(key),
+            ).grid(row=1, column=1, sticky="e")
+
+        ttk.Button(
+            bulk,
+            text="Apply All Nonblank Bulk Values",
+            command=self._fill_nonblank_columns,
+        ).grid(row=0, column=len(self._FIELD_LABELS), sticky="s", padx=(4, 0))
+
+        table = ttk.Frame(outer)
+        table.grid(row=2, column=0, sticky="nsew")
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(table)
+        header.grid(row=0, column=0, sticky="ew", padx=(0, 16))
+        header.columnconfigure(0, weight=2)
+        for col_index in range(1, 4):
+            header.columnconfigure(col_index, weight=1)
+        ttk.Label(header, text="Video", anchor="w").grid(row=0, column=0, sticky="ew", padx=(4, 8))
+        for col_index, (_field, label) in enumerate(self._FIELD_LABELS, start=1):
+            ttk.Label(header, text=label, anchor="w").grid(
+                row=0,
+                column=col_index,
+                sticky="ew",
+                padx=(0, 8),
+            )
+
+        canvas = tk.Canvas(table, highlightthickness=1, highlightbackground="#b8b8b8")
+        canvas.grid(row=1, column=0, sticky="nsew")
+        scroll_y = ttk.Scrollbar(table, orient=tk.VERTICAL, command=canvas.yview)
+        scroll_y.grid(row=1, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scroll_y.set)
+
+        rows_frame = ttk.Frame(canvas)
+        rows_window = canvas.create_window((0, 0), window=rows_frame, anchor="nw")
+
+        def _on_rows_configure(_event: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event: tk.Event) -> None:
+            canvas.itemconfigure(rows_window, width=event.width)
+
+        rows_frame.bind("<Configure>", _on_rows_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        rows_frame.columnconfigure(0, weight=2)
+        for col_index in range(1, 4):
+            rows_frame.columnconfigure(col_index, weight=1)
+
+        first_entry: ttk.Combobox | None = None
+        for row_index, item in enumerate(self._items):
+            ttk.Label(
+                rows_frame,
+                text=f"{row_index + 1}. {item.video_name}",
+                anchor="w",
+            ).grid(row=row_index, column=0, sticky="ew", padx=(4, 8), pady=3)
+            variables: dict[str, tk.StringVar] = {}
+            for col_index, (field, _label) in enumerate(self._FIELD_LABELS, start=1):
+                variable = tk.StringVar(value=str(getattr(item, field, "") or "").strip())
+                variables[field] = variable
+                entry = ttk.Combobox(
+                    rows_frame,
+                    textvariable=variable,
+                    values=self._known_values[field],
+                    state="normal",
+                    width=22,
+                )
+                entry.grid(
+                    row=row_index,
+                    column=col_index,
+                    sticky="ew",
+                    padx=(0, 8),
+                    pady=3,
+                )
+                if first_entry is None:
+                    first_entry = entry
+            self._row_vars.append((item, variables))
+
+        footer = ttk.Frame(outer)
+        footer.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        footer.columnconfigure(0, weight=1)
+        ttk.Label(
+            footer,
+            text=f"Editing {len(self._items)} selected video(s). Ctrl+S saves.",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Button(footer, text="Cancel", command=self._cancel).grid(
+            row=0,
+            column=1,
+            padx=(0, 6),
+        )
+        ttk.Button(
+            footer,
+            text="Save Metadata",
+            command=self._save,
+            style="Accent.TButton",
+        ).grid(row=0, column=2)
+        if first_entry is not None:
+            self.after_idle(first_entry.focus_set)
+
+    def _fill_column(self, field: str) -> None:
+        value = str(self._bulk_vars[field].get() or "").strip()
+        for _item, variables in self._row_vars:
+            variables[field].set(value)
+
+    def _fill_nonblank_columns(self) -> None:
+        for field, _label in self._FIELD_LABELS:
+            if str(self._bulk_vars[field].get() or "").strip():
+                self._fill_column(field)
+
+    def _save(self) -> None:
+        self.result = []
+        for item, variables in self._row_vars:
+            self.result.append(
+                {
+                    "video_id": str(item.video_id or "").strip(),
+                    "group": str(variables["group"].get() or "").strip(),
+                    "subject_id": str(variables["subject_id"].get() or "").strip(),
+                    "time_point": str(variables["time_point"].get() or "").strip(),
+                }
+            )
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.destroy()
 
 
 class _BatchRoiLoopController:
@@ -148,23 +388,26 @@ class _BatchRoiLoopController:
         for r in new_rois:
             r["reference_frame_index"] = int(ref_idx)
 
-        # Avoid name collisions between existing ROIs and the freshly
-        # auto-placed ones (e.g., template "ROI 1" already exists for this
-        # video). Rename the new ones to first-free integer suffixes.
-        existing_names = {str(r.get("name", "")).strip() for r in existing}
-        deduped: list[dict] = []
+        # Existing names represent already placed members of this template.
+        # Keep them in place and only auto-add template members that are
+        # missing. Renaming a repeated template name to "(2)" would create a
+        # duplicate object every time a researcher re-ran the queue.
+        existing_names = {
+            str(r.get("name", "")).strip().lower()
+            for r in existing
+            if str(r.get("name", "")).strip()
+        }
+        missing_template_rois: list[dict] = []
         for r in new_rois:
             name = str(r.get("name", "")).strip() or "ROI"
-            base = name
-            suffix = 2
-            while name in existing_names:
-                name = f"{base} ({suffix})"
-                suffix += 1
+            name_key = name.lower()
+            if name_key in existing_names:
+                continue
             r["name"] = name
-            existing_names.add(name)
-            deduped.append(r)
+            existing_names.add(name_key)
+            missing_template_rois.append(r)
 
-        initial = list(existing) + deduped
+        initial = list(existing) + missing_template_rois
         if not initial:
             # Nothing to show. Auto-skip this video.
             self._skipped_video_ids.append(item.video_id)
@@ -186,6 +429,16 @@ class _BatchRoiLoopController:
             on_skip=lambda it=item: self._on_skip(it),
             on_cancel=self._on_cancel,
             loop_position=(self._index + 1, len(self.items)),
+            object_mode=self.object_mode,
+            interaction_distance_px=(
+                self.wizard._parse_nonnegative_float(
+                    self.wizard.object_distance_px_var.get(),
+                    "Object interaction distance threshold (px)",
+                    0.0,
+                )
+                if self.object_mode
+                else 0.0
+            ),
             title=title,
         )
 
@@ -366,6 +619,11 @@ class BatchProcessingWizard(tk.Toplevel):
         ("full_analysis_archive", "Full Analysis Archive"),
         ("custom", "Custom"),
     )
+    REVIEW_POLICY_PRESETS = (
+        ("after_each", "Review after each video"),
+        ("after_all", "Review after all videos"),
+        ("skip", "Skip manual review"),
+    )
 
     def __init__(self, app, service: BatchProcessingService) -> None:
         super().__init__(app.root)
@@ -385,12 +643,11 @@ class BatchProcessingWizard(tk.Toplevel):
         self.roi_event_mode_var = tk.StringVar(value="bbox_only")
         self.roi_use_keypoint_var = tk.BooleanVar(value=False)
         self.model_path_var = tk.StringVar(value="")
-        # Default to "-1" — Ultralytics' "auto-pick the best idle GPU"
-        # flag. Sidesteps the CUDA-pollution bug that an explicit "cpu"
-        # triggers when BoT-SORT's ReID submodel auto-selects a device.
-        # On a no-GPU machine this still falls through to CPU cleanly.
+        # Ultralytics uses -1 to select an available GPU automatically. The
+        # shared device resolver falls back to MPS or CPU when CUDA is absent.
         self.inference_device_var = tk.StringVar(value="-1")
         self.inference_batch_size_var = tk.StringVar(value="25")
+        self.max_det_var = tk.StringVar(value="300")
         self.output_path_var = tk.StringVar(value="")
         self.yaml_path_var = tk.StringVar(value="")
         self.tracker_config_path_var = tk.StringVar(value="botsort.yaml")
@@ -413,21 +670,30 @@ class BatchProcessingWizard(tk.Toplevel):
         self.tracker_enabled_var = tk.BooleanVar(value=True)
         self.save_annotated_var = tk.BooleanVar(value=False)
         self.save_confidence_var = tk.BooleanVar(value=False)
-        self.review_policy_var = tk.StringVar(value="after_all")
+        self.review_policy_var = tk.StringVar(value="Review after all videos")
         self.stats_correction_var = tk.StringVar(value="fdr_bh")
         self.stats_categorical_factors_var = tk.StringVar(value="")
-        self.include_kpss_var = tk.BooleanVar(value=True)
+        self.stats_auto_detect_design_var = tk.BooleanVar(value=True)
+        self.include_mixed_effects_var = tk.BooleanVar(value=True)
+        self.include_kpss_var = tk.BooleanVar(value=False)
+        self.stats_design_summary_var = tk.StringVar(
+            value="Study design: discover videos to inspect Group, Subject ID, and Time Point."
+        )
         self.figure_output_preset_var = tk.StringVar(value="Publication + Dashboard")
         self.export_publication_figures_var = tk.BooleanVar(value=True)
         self.export_batch_dashboard_var = tk.BooleanVar(value=True)
         self.export_group_stats_overview_var = tk.BooleanVar(value=True)
         self.export_individual_profiles_var = tk.BooleanVar(value=False)
         self.export_module_archive_var = tk.BooleanVar(value=False)
-        self.generate_video_quicklooks_var = tk.BooleanVar(value=False)
+        self.generate_video_quicklooks_var = tk.BooleanVar(value=True)
         self.single_animal_mode_var = tk.BooleanVar(value=False)
-        self.max_gap_frames_var = tk.StringVar(value="5")
-        self.min_bout_frames_var = tk.StringVar(value="3")
-        self.roi_max_gap_frames_var = tk.StringVar(value="5")
+        self.temporal_threshold_unit_var = tk.StringVar(value="seconds")
+        self.max_gap_frames_var = tk.StringVar(value="0.17")
+        self.min_bout_frames_var = tk.StringVar(value="0.10")
+        self.behavior_bout_class_mode_var = tk.StringVar(
+            value="Mutually exclusive (one class per frame)"
+        )
+        self.roi_max_gap_frames_var = tk.StringVar(value="0.17")
         self.video_fps_var = tk.StringVar(value="")
         self.detected_fps_var = tk.StringVar(value="(no probe yet)")
         # PR 2B coherence-pass 2c: grey-italic inline gotcha hints surfaced
@@ -436,8 +702,11 @@ class BatchProcessingWizard(tk.Toplevel):
         self.unassigned_group_hint_var = tk.StringVar(value="")
         self.output_path_hint_var = tk.StringVar(value="")
         self.tracker_config_hint_var = tk.StringVar(value="")
-        self.roi_min_dwell_frames_var = tk.StringVar(value="3")
+        self.roi_min_dwell_frames_var = tk.StringVar(value="0.10")
         self.progress_text_var = tk.StringVar(value="Ready.")
+        self.results_status_var = tk.StringVar(
+            value="RESULTS: No batch results have been generated yet."
+        )
         self.roi_summary_var = tk.StringVar(value="No ROI assignments yet.")
         self.model_capability_var = tk.StringVar(value="Model preflight not run.")
         self.analysis_preflight_var = tk.StringVar(value="Analysis preflight not run.")
@@ -455,12 +724,14 @@ class BatchProcessingWizard(tk.Toplevel):
         self._current_session = None
         self._current_keybinds = dict(DEFAULT_KEYBINDS)
         self._last_run_payload: dict[str, Any] | None = None
+        self._model_preflight_error = ""
         self._queue_sort_column = "video_name"
         self._queue_sort_desc = False
         self._session_file_path = ""
         self._has_unsaved_changes = False
         self._suspend_dirty_tracking = True
         self._autosave_after_id: str | None = None
+        self._last_temporal_threshold_unit = "seconds"
 
         self._build_ui()
         self._refresh_roi_event_controls()
@@ -469,6 +740,7 @@ class BatchProcessingWizard(tk.Toplevel):
         self._suspend_dirty_tracking = False
         self._update_figure_output_summary()
         self._update_session_status()
+        self._refresh_results_status()
         self._center_on_parent()
 
     def _prefill_defaults(self) -> None:
@@ -477,6 +749,7 @@ class BatchProcessingWizard(tk.Toplevel):
             analytics_cfg = self.app.config.analytics
             self.model_path_var.set(str(infer_cfg.trained_model_path_infer.get() or "").strip())
             self.inference_device_var.set(str(infer_cfg.infer_device_var.get() or "").strip())
+            self.max_det_var.set(str(infer_cfg.infer_max_det_var.get() or "300").strip() or "300")
             project_path = str(infer_cfg.infer_project_var.get() or "").strip()
             if project_path:
                 self.output_path_var.set(project_path)
@@ -487,13 +760,41 @@ class BatchProcessingWizard(tk.Toplevel):
             if analytics_yaml:
                 self.yaml_path_var.set(analytics_yaml)
             self.single_animal_mode_var.set(bool(analytics_cfg.single_animal_analysis_var.get()))
-            self.max_gap_frames_var.set(str(analytics_cfg.max_frame_gap_var.get() or "5").strip() or "5")
-            self.min_bout_frames_var.set(str(analytics_cfg.min_bout_duration_var.get() or "3").strip() or "3")
-            self.roi_max_gap_frames_var.set(str(analytics_cfg.roi_max_gap_frames_var.get() or "5").strip() or "5")
-            self.roi_min_dwell_frames_var.set(str(analytics_cfg.roi_min_dwell_frames_var.get() or "3").strip() or "3")
+            configured_class_mode = str(
+                analytics_cfg.behavior_bout_class_mode_var.get()
+                or "mutually_exclusive"
+            ).strip().casefold()
+            self.behavior_bout_class_mode_var.set(
+                "Multi-label (allow overlapping classes)"
+                if configured_class_mode == "multi_label"
+                else "Mutually exclusive (one class per frame)"
+            )
             analytics_fps_seed = str(analytics_cfg.video_fps_var.get() or "").strip()
             if analytics_fps_seed:
                 self.video_fps_var.set(analytics_fps_seed)
+            if str(self.temporal_threshold_unit_var.get()).strip() == "seconds":
+                try:
+                    threshold_fps = float(analytics_fps_seed or 30.0)
+                except (TypeError, ValueError):
+                    threshold_fps = 30.0
+                threshold_fps = threshold_fps if threshold_fps > 0 else 30.0
+                self.max_gap_frames_var.set(
+                    f"{float(analytics_cfg.max_frame_gap_var.get() or 5) / threshold_fps:.4g}"
+                )
+                self.min_bout_frames_var.set(
+                    f"{float(analytics_cfg.min_bout_duration_var.get() or 3) / threshold_fps:.4g}"
+                )
+                self.roi_max_gap_frames_var.set(
+                    f"{float(analytics_cfg.roi_max_gap_frames_var.get() or 5) / threshold_fps:.4g}"
+                )
+                self.roi_min_dwell_frames_var.set(
+                    f"{float(analytics_cfg.roi_min_dwell_frames_var.get() or 3) / threshold_fps:.4g}"
+                )
+            else:
+                self.max_gap_frames_var.set(str(analytics_cfg.max_frame_gap_var.get() or "5").strip() or "5")
+                self.min_bout_frames_var.set(str(analytics_cfg.min_bout_duration_var.get() or "3").strip() or "3")
+                self.roi_max_gap_frames_var.set(str(analytics_cfg.roi_max_gap_frames_var.get() or "5").strip() or "5")
+                self.roi_min_dwell_frames_var.set(str(analytics_cfg.roi_min_dwell_frames_var.get() or "3").strip() or "3")
             self.entry_threshold_var.set(str(analytics_cfg.roi_entry_threshold_var.get() or "0.75").strip() or "0.75")
             self.exit_threshold_var.set(str(analytics_cfg.roi_exit_threshold_var.get() or "0.25").strip() or "0.25")
             self.roi_use_keypoint_var.set(bool(analytics_cfg.roi_use_keypoint_var.get()))
@@ -510,6 +811,53 @@ class BatchProcessingWizard(tk.Toplevel):
             )
         except Exception:
             return
+
+    def _on_temporal_threshold_unit_changed(self, _event=None) -> None:
+        old_unit = str(
+            getattr(self, "_last_temporal_threshold_unit", "seconds") or "seconds"
+        ).strip().lower()
+        new_unit = str(
+            self.temporal_threshold_unit_var.get() or "seconds"
+        ).strip().lower()
+        if new_unit not in {"seconds", "frames"}:
+            new_unit = "seconds"
+            self.temporal_threshold_unit_var.set(new_unit)
+        if old_unit == new_unit:
+            return
+        try:
+            reference_fps = float(str(self.video_fps_var.get() or "").strip() or 30.0)
+        except (TypeError, ValueError):
+            reference_fps = 30.0
+        reference_fps = reference_fps if reference_fps > 0 else 30.0
+        fields = (
+            (self.max_gap_frames_var, False),
+            (self.min_bout_frames_var, True),
+            (self.roi_max_gap_frames_var, False),
+            (self.roi_min_dwell_frames_var, True),
+        )
+        try:
+            for variable, is_minimum in fields:
+                value = float(str(variable.get() or "").strip())
+                if old_unit == "seconds" and new_unit == "frames":
+                    converted = (
+                        math.ceil((value * reference_fps) - 1e-12)
+                        if is_minimum
+                        else math.floor((value * reference_fps) + 1e-12)
+                    )
+                    variable.set(str(max(1 if is_minimum else 0, int(converted))))
+                elif old_unit == "frames" and new_unit == "seconds":
+                    variable.set(f"{max(0.0, value) / reference_fps:.4g}")
+        except (TypeError, ValueError):
+            self.progress_text_var.set(
+                "Duration unit changed. Enter valid numeric bout and ROI "
+                f"thresholds in {new_unit}."
+            )
+        else:
+            self.progress_text_var.set(
+                f"Converted displayed duration thresholds using {reference_fps:g} FPS. "
+                "Seconds mode will still resolve each video with its own FPS at run time."
+            )
+        self._last_temporal_threshold_unit = new_unit
 
     def _center_on_parent(self) -> None:
         try:
@@ -532,6 +880,24 @@ class BatchProcessingWizard(tk.Toplevel):
     def _figure_preset_key_by_label(cls) -> dict[str, str]:
         return {label: key for key, label in cls.FIGURE_OUTPUT_PRESETS}
 
+    @classmethod
+    def _review_policy_key(cls, value: object) -> str:
+        text = str(value or "").strip()
+        keys = {key for key, _label in cls.REVIEW_POLICY_PRESETS}
+        if text in keys:
+            return text
+        return {
+            label: key for key, label in cls.REVIEW_POLICY_PRESETS
+        }.get(text, "after_all")
+
+    @classmethod
+    def _review_policy_label(cls, value: object) -> str:
+        key = cls._review_policy_key(value)
+        return {
+            option_key: label
+            for option_key, label in cls.REVIEW_POLICY_PRESETS
+        }.get(key, "Review after all videos")
+
     def _set_figure_output_preset_from_key(self, preset_key: str) -> None:
         normalized = str(preset_key or "publication_dashboard").strip() or "publication_dashboard"
         self.figure_output_preset_var.set(self._figure_preset_label_by_key().get(normalized, "Custom"))
@@ -543,7 +909,7 @@ class BatchProcessingWizard(tk.Toplevel):
     def _apply_figure_output_preset(self) -> None:
         preset_key = self._get_figure_output_preset_key()
         preset_map = {
-            "publication_dashboard": (True, True, True, False, False, False),
+            "publication_dashboard": (True, True, True, False, True, False),
             "dashboard_only": (False, True, True, False, False, False),
             "full_analysis_archive": (True, True, True, True, True, True),
         }
@@ -578,7 +944,7 @@ class BatchProcessingWizard(tk.Toplevel):
             bool(self.export_module_archive_var.get()),
         )
         preset_map = {
-            (True, True, True, False, False, False): "publication_dashboard",
+            (True, True, True, False, True, False): "publication_dashboard",
             (False, True, True, False, False, False): "dashboard_only",
             (True, True, True, True, True, True): "full_analysis_archive",
         }
@@ -635,6 +1001,7 @@ class BatchProcessingWizard(tk.Toplevel):
             self.model_path_var,
             self.inference_device_var,
             self.inference_batch_size_var,
+            self.max_det_var,
             self.output_path_var,
             self.yaml_path_var,
             self.tracker_config_path_var,
@@ -659,10 +1026,14 @@ class BatchProcessingWizard(tk.Toplevel):
             self.review_policy_var,
             self.stats_correction_var,
             self.stats_categorical_factors_var,
+            self.stats_auto_detect_design_var,
+            self.include_mixed_effects_var,
             self.include_kpss_var,
             self.single_animal_mode_var,
+            self.temporal_threshold_unit_var,
             self.max_gap_frames_var,
             self.min_bout_frames_var,
+            self.behavior_bout_class_mode_var,
             self.roi_max_gap_frames_var,
             self.roi_min_dwell_frames_var,
         ]
@@ -862,23 +1233,56 @@ class BatchProcessingWizard(tk.Toplevel):
 
         actions = ttk.Frame(frame)
         actions.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        actions.columnconfigure(8, weight=1)
-        ttk.Button(actions, text="Assign Group", command=self._assign_group_to_selected).grid(row=0, column=0, padx=(0, 6), pady=(0, 6))
-        ttk.Button(actions, text="Assign Time Point", command=self._assign_time_point_to_selected).grid(row=0, column=1, padx=(0, 6), pady=(0, 6))
-        ttk.Button(actions, text="Clear Group", command=self._clear_group_for_selected).grid(row=0, column=2, padx=(0, 6), pady=(0, 6))
-        ttk.Button(actions, text="Refresh ROI Columns", command=self._refresh_roi_assignment_columns).grid(row=0, column=3, padx=(0, 6), pady=(0, 6))
-        ttk.Button(actions, text="Reset Status", command=self._reset_selected_statuses).grid(row=0, column=4, padx=(0, 6), pady=(0, 6))
-        ttk.Button(actions, text="Edit Subject/Time", command=self._edit_metadata_for_selected).grid(row=0, column=5, padx=(0, 6), pady=(0, 6))
-        ttk.Button(actions, text="Open Selected Video", command=self._open_selected_source_video).grid(row=0, column=6, padx=(0, 6), pady=(0, 6))
-        ttk.Button(actions, text="Open Video Folder", command=self._open_selected_source_folder).grid(row=0, column=7, pady=(0, 6))
+        actions.columnconfigure(9, weight=1)
+        metadata_button = ttk.Button(
+            actions,
+            text="Edit Metadata (Bulk / Per Video)",
+            command=self._edit_metadata_for_selected,
+        )
+        metadata_button.grid(row=0, column=0, padx=(0, 6), pady=(0, 6))
+        CreateToolTip(
+            metadata_button,
+            "Select one or many queue rows, then edit Group, Subject ID, and "
+            "Time Point together. Each video can receive a different value, "
+            "or the bulk-fill controls can apply one value to all selected rows.",
+        )
+        ttk.Button(actions, text="Assign Group", command=self._assign_group_to_selected).grid(row=0, column=1, padx=(0, 6), pady=(0, 6))
+        ttk.Button(actions, text="Assign Subject", command=self._assign_subject_to_selected).grid(row=0, column=2, padx=(0, 6), pady=(0, 6))
+        ttk.Button(actions, text="Assign Time Point", command=self._assign_time_point_to_selected).grid(row=0, column=3, padx=(0, 6), pady=(0, 6))
+        ttk.Button(actions, text="Clear Group", command=self._clear_group_for_selected).grid(row=0, column=4, padx=(0, 6), pady=(0, 6))
+        ttk.Button(actions, text="Refresh ROI Columns", command=self._refresh_roi_assignment_columns).grid(row=0, column=5, padx=(0, 6), pady=(0, 6))
+        ttk.Button(actions, text="Reset Status", command=self._reset_selected_statuses).grid(row=0, column=6, padx=(0, 6), pady=(0, 6))
+        ttk.Button(actions, text="Open Selected Video", command=self._open_selected_source_video).grid(row=0, column=7, padx=(0, 6), pady=(0, 6))
+        ttk.Button(actions, text="Open Video Folder", command=self._open_selected_source_folder).grid(row=0, column=8, pady=(0, 6))
         ttk.Button(actions, text="Exclude Selected", command=self._exclude_selected_from_queue).grid(row=1, column=0, padx=(0, 6))
         ttk.Button(actions, text="Include Selected", command=self._include_selected_in_queue).grid(row=1, column=1, padx=(0, 6))
         ttk.Button(actions, text="Remove Selected", command=self._remove_selected_from_queue).grid(row=1, column=2, padx=(0, 6))
         ttk.Button(actions, text="Keep Selected Only", command=self._keep_selected_only).grid(row=1, column=3, padx=(0, 6))
         ttk.Button(actions, text="Clear Queue", command=self._clear_queue).grid(row=1, column=4, padx=(0, 6))
+        ttk.Button(
+            actions,
+            text="Edit All Included Metadata",
+            command=self._edit_metadata_for_all_included,
+        ).grid(row=1, column=5, padx=(0, 6))
+        auto_metadata_button = ttk.Button(
+            actions,
+            text="Auto-detect Missing Metadata",
+            command=self._auto_assign_design_metadata,
+        )
+        auto_metadata_button.grid(row=1, column=6, padx=(0, 6))
+        CreateToolTip(
+            auto_metadata_button,
+            "Fill only blank Group, Subject ID, and Time Point fields when a "
+            "confident value can be read from filenames or cohort folders. "
+            "Manual values are preserved and ambiguous candidates remain blank.",
+        )
         ttk.Label(
             frame,
-            text="Tip: Ctrl-click or Shift-click multiple rows to bulk-edit metadata, or exclude/remove videos before the run.",
+            text=(
+                "Tip: Ctrl-click or Shift-click rows, then use Edit Metadata to "
+                "enter different design labels per video or bulk-fill the selection. "
+                "Auto-detection never overwrites an existing value."
+            ),
             justify=tk.LEFT,
         ).grid(row=3, column=0, sticky="w", pady=(6, 0))
 
@@ -956,7 +1360,7 @@ class BatchProcessingWizard(tk.Toplevel):
         ).pack(fill=tk.X, pady=(0, 6))
 
         object_row = ttk.Frame(frame)
-        object_row.pack(fill=tk.X, pady=(0, 6))
+        object_row.pack(fill=tk.X, pady=(0, 4))
         # PR 2B coherence-pass 2d: label matches Tab 6's wording.
         ttk.Checkbutton(
             object_row,
@@ -976,19 +1380,42 @@ class BatchProcessingWizard(tk.Toplevel):
             textvariable=self.object_roi_shape_var,
             values=("circle", "square"),
         ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(object_row, text="Object interaction keypoint index:").pack(side=tk.LEFT, padx=(0, 4))
+
+        object_metric_row = ttk.Frame(frame)
+        object_metric_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(object_metric_row, text="Object interaction keypoint index:").pack(side=tk.LEFT, padx=(0, 4))
         self.object_keypoint_entry = ttk.Entry(
-            object_row,
+            object_metric_row,
             textvariable=self.object_keypoint_index_var,
             width=7,
         )
         self.object_keypoint_entry.pack(side=tk.LEFT, padx=(0, 8))
         CreateToolTip(
             self.object_keypoint_entry,
-            "Raw model keypoint index used to decide object interaction. This is independent from ROI entry/exit.",
+            "Raw pose-model keypoint index used for object interaction. This is "
+            "independent from the regular ROI entry/exit mode and keypoint. "
+            "Object interaction requires a keypoint model.",
         )
-        ttk.Label(object_row, text="Distance threshold (px):").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Entry(object_row, textvariable=self.object_distance_px_var, width=8).pack(side=tk.LEFT)
+        distance_label = ttk.Label(
+            object_metric_row,
+            text="Interaction distance from object edge (px):",
+        )
+        distance_label.pack(side=tk.LEFT, padx=(10, 4))
+        self.object_distance_entry = ttk.Entry(
+            object_metric_row,
+            textvariable=self.object_distance_px_var,
+            width=8,
+        )
+        self.object_distance_entry.pack(side=tk.LEFT, padx=(0, 8))
+        CreateToolTip(distance_label, OBJECT_DISTANCE_HELP_TEXT)
+        CreateToolTip(self.object_distance_entry, OBJECT_DISTANCE_HELP_TEXT)
+        distance_hint = ttk.Label(
+            object_metric_row,
+            text="Orange dotted outline = selected-keypoint activation boundary",
+            foreground="#b45309",
+        )
+        distance_hint.pack(side=tk.LEFT)
+        CreateToolTip(distance_hint, OBJECT_DISTANCE_HELP_TEXT)
 
         roi_template_row = ttk.Frame(frame)
         roi_template_row.pack(fill=tk.X, pady=(0, 6))
@@ -1055,14 +1482,16 @@ class BatchProcessingWizard(tk.Toplevel):
         # PR 2B coherence-pass 2f: queue-loop object ROI builder.
         place_btn = ttk.Button(
             object_actions,
-            text="Place Objects for Queue",
+            text="Place Objects Across Queue",
             command=self._start_object_roi_queue_loop,
         )
         place_btn.pack(side=tk.LEFT, padx=(0, 6))
         CreateToolTip(
             place_btn,
-            "Same loop as Build ROIs for Queue, but for object/stimulus ROIs. "
-            "Walks every included video opening the editor on a random frame.",
+            "Define the object template once, then automatically walk every "
+            "included video in queue order. Save advances to the next video; "
+            "Skip leaves that video unchanged; Cancel stops the remaining queue. "
+            "The orange dotted outline shows the configured edge-distance buffer.",
         )
         ttk.Button(object_actions, text="Copy Shared Objects to All Videos", command=self._copy_shared_objects_to_all).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(object_actions, text="Clear Selected Video Objects", command=self._clear_selected_video_objects).pack(side=tk.LEFT)
@@ -1121,16 +1550,22 @@ class BatchProcessingWizard(tk.Toplevel):
         self._inference_only_widgets: list = []
         self._existing_labels_only_widgets: list = []
 
-        # --- Row 0: Model path + Preflight (inference-only) ---
+        # --- Row 0: Model path (inference-only) + full preflight (always visible) ---
         model_lbl = ttk.Label(frame, text="Model path:")
         model_lbl.grid(row=0, column=0, sticky="w", padx=(0, 6), pady=4)
         model_entry = ttk.Entry(frame, textvariable=self.model_path_var)
         model_entry.grid(row=0, column=1, sticky="ew", padx=(0, 6), pady=4)
         model_browse = ttk.Button(frame, text="Browse...", command=self._browse_model_path)
         model_browse.grid(row=0, column=2, padx=(0, 6), pady=4)
-        model_preflight = ttk.Button(frame, text="Preflight", command=self._preflight_model)
+        model_preflight = ttk.Button(frame, text="Run Full Preflight", command=self._preflight_model)
         model_preflight.grid(row=0, column=3, pady=4)
-        self._inference_only_widgets += [model_lbl, model_entry, model_browse, model_preflight]
+        CreateToolTip(
+            model_preflight,
+            "Check the model or saved-label source, ROI/object readiness, "
+            "study-design metadata, group statistics, mixed-effects models, "
+            "and optional KPSS requirements.",
+        )
+        self._inference_only_widgets += [model_lbl, model_entry, model_browse]
 
         # --- Row 1: Output folder (always shown) + Device + Batch size (inference-only) ---
         ttk.Label(frame, text="Output folder:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=4)
@@ -1143,17 +1578,25 @@ class BatchProcessingWizard(tk.Toplevel):
         device_entry.grid(row=1, column=4, sticky="w", padx=(0, 6), pady=4)
         CreateToolTip(
             device_entry,
-            "Default: -1  (auto-pick the best idle GPU; falls through to CPU "
-            "on machines with no GPU). Override examples: 0 = first GPU, "
-            "cuda:1 = second GPU, cpu = force CPU. The default is recommended "
-            "because it avoids a known Ultralytics bug where explicit 'cpu' "
-            "crashes when BoT-SORT's ReID submodel is enabled.",
+            "Default: -1 (automatic backend selection). IntegraPose selects "
+            "an available CUDA GPU, then MPS on supported Apple systems, and "
+            "otherwise CPU. Overrides: 0 = first GPU, cuda:1 = second GPU, "
+            "cpu = force CPU.",
         )
         batch_lbl = ttk.Label(frame, text="Ultralytics batch size:")
         batch_lbl.grid(row=1, column=5, sticky="w", padx=(8, 6), pady=4)
         batch_entry = ttk.Entry(frame, textvariable=self.inference_batch_size_var, width=8)
         batch_entry.grid(row=1, column=6, sticky="w", pady=4)
-        self._inference_only_widgets += [device_lbl, device_entry, batch_lbl, batch_entry]
+        max_det_group = ttk.Frame(frame)
+        max_det_group.grid(row=1, column=7, sticky="w", padx=(8, 0), pady=4)
+        ttk.Label(max_det_group, text="Max detections/frame:").pack(side=tk.LEFT, padx=(0, 4))
+        max_det_entry = ttk.Entry(max_det_group, textvariable=self.max_det_var, width=7)
+        max_det_entry.pack(side=tk.LEFT)
+        CreateToolTip(
+            max_det_entry,
+            "Maximum detections retained per video frame. This value is saved in the batch session and inference metadata.",
+        )
+        self._inference_only_widgets += [device_lbl, device_entry, batch_lbl, batch_entry, max_det_group]
 
         # --- Row 2: Dataset YAML (always) + Tracker YAML (inference-only) ---
         ttk.Label(frame, text="Dataset YAML (optional):").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=4)
@@ -1205,7 +1648,6 @@ class BatchProcessingWizard(tk.Toplevel):
         self._tracker_checkbox_widget = tracker_cb
         self._tracker_checkbox_pack_args = {"side": tk.LEFT, "padx": (0, 10)}
         ttk.Checkbutton(opts_row, text="Save annotated videos", variable=self.save_annotated_var).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Checkbutton(opts_row, text="Include KPSS/Mixed effects", variable=self.include_kpss_var).pack(side=tk.LEFT, padx=(0, 10))
         # PR 2B coherence-pass 2d: label matches Tab 6's "Single Animal Analysis".
         single_animal_cb = ttk.Checkbutton(opts_row, text="Single Animal Analysis", variable=self.single_animal_mode_var)
         single_animal_cb.pack(side=tk.LEFT, padx=(0, 10))
@@ -1219,51 +1661,64 @@ class BatchProcessingWizard(tk.Toplevel):
             frame,
             state="readonly",
             textvariable=self.review_policy_var,
-            values=("after_each", "after_all", "skip"),
-            width=18,
+            values=[label for _key, label in self.REVIEW_POLICY_PRESETS],
+            width=24,
         ).grid(row=5, column=1, sticky="w", padx=(0, 6), pady=4)
-        ttk.Label(frame, text="Multiple-comparison correction:").grid(row=5, column=2, sticky="w", padx=(0, 6), pady=4)
-        ttk.Combobox(
-            frame,
-            state="readonly",
-            textvariable=self.stats_correction_var,
-            values=("fdr_bh", "bonferroni"),
-            width=14,
-        ).grid(row=5, column=3, sticky="w", padx=(0, 6), pady=4)
         # PR 2B coherence-pass 2d: labels + tooltips match Tab 6 wording so
         # researchers don't have to re-learn parameter meanings cross-surface.
-        ttk.Label(frame, text="Max Frame Gap:").grid(row=5, column=4, sticky="w", padx=(8, 6), pady=4)
+        ttk.Label(frame, text="Bout gap limit:").grid(row=5, column=4, sticky="w", padx=(8, 6), pady=4)
         max_gap_entry = ttk.Entry(frame, textvariable=self.max_gap_frames_var, width=8)
         max_gap_entry.grid(row=5, column=5, sticky="w", padx=(0, 6), pady=4)
         CreateToolTip(
             max_gap_entry,
-            "Maximum number of frames allowed between detections of the same behavior for them to be considered part of the same bout.",
+            "Maximum missing-time gap that may be filled between observations of "
+            "the same behavior. The Duration unit below applies.",
         )
-        ttk.Label(frame, text="Min Bout Duration (frames):").grid(row=5, column=6, sticky="w", padx=(8, 6), pady=4)
+        ttk.Label(frame, text="Minimum bout:").grid(row=5, column=6, sticky="w", padx=(8, 6), pady=4)
         min_bout_entry = ttk.Entry(frame, textvariable=self.min_bout_frames_var, width=8)
         min_bout_entry.grid(row=5, column=7, sticky="w", pady=4)
         CreateToolTip(
             min_bout_entry,
-            "A behavior must last for at least this many consecutive frames to be considered a valid 'bout'. The value should be in frames.",
+            "Minimum inclusive post-gap bout span. The Duration unit below "
+            "applies; observed and bridged support are saved separately.",
         )
 
-        ttk.Label(frame, text="ROI Debounce Gap:").grid(row=6, column=4, sticky="w", padx=(8, 6), pady=4)
+        ttk.Label(frame, text="ROI gap limit:").grid(row=6, column=4, sticky="w", padx=(8, 6), pady=4)
         roi_gap_entry = ttk.Entry(frame, textvariable=self.roi_max_gap_frames_var, width=8)
         roi_gap_entry.grid(row=6, column=5, sticky="w", padx=(0, 6), pady=4)
         CreateToolTip(
             roi_gap_entry,
-            "Maximum detection dropout in frames that ROI entry/exit counting should bridge before treating it as a real exit.",
+            "Maximum missing-time gap that ROI visit construction may bridge. "
+            "The Duration unit below applies.",
         )
-        ttk.Label(frame, text="Min ROI Dwell (frames):").grid(row=6, column=6, sticky="w", padx=(8, 6), pady=4)
+        ttk.Label(frame, text="Minimum ROI dwell:").grid(row=6, column=6, sticky="w", padx=(8, 6), pady=4)
         roi_dwell_entry = ttk.Entry(frame, textvariable=self.roi_min_dwell_frames_var, width=8)
         roi_dwell_entry.grid(row=6, column=7, sticky="w", pady=4)
         CreateToolTip(
             roi_dwell_entry,
-            "Minimum frames an ROI visit must persist before it counts as an ROI entry/exit event in summaries and review videos.",
+            "Minimum visit duration required for dwell-qualified ROI summaries. "
+            "Raw occupancy is retained separately. The Duration unit below applies.",
         )
 
         fps_row = ttk.Frame(frame)
         fps_row.grid(row=7, column=0, columnspan=8, sticky="w", pady=(4, 2))
+        ttk.Label(fps_row, text="Duration unit:").pack(side=tk.LEFT, padx=(0, 6))
+        temporal_unit_combo = ttk.Combobox(
+            fps_row,
+            state="readonly",
+            textvariable=self.temporal_threshold_unit_var,
+            values=("seconds", "frames"),
+            width=10,
+        )
+        temporal_unit_combo.pack(side=tk.LEFT, padx=(0, 10))
+        temporal_unit_combo.bind(
+            "<<ComboboxSelected>>", self._on_temporal_threshold_unit_changed
+        )
+        CreateToolTip(
+            temporal_unit_combo,
+            "Seconds is recommended and is converted separately using each "
+            "video's FPS. Frames preserves legacy behavior.",
+        )
         ttk.Label(fps_row, text="Video FPS (batch):").pack(side=tk.LEFT, padx=(0, 6))
         fps_entry = ttk.Entry(fps_row, textvariable=self.video_fps_var, width=10)
         fps_entry.pack(side=tk.LEFT, padx=(0, 6))
@@ -1276,18 +1731,132 @@ class BatchProcessingWizard(tk.Toplevel):
         )
         ttk.Button(fps_row, text="Detect from first video", command=self._probe_first_video_fps).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Label(fps_row, textvariable=self.detected_fps_var, foreground="#555").pack(side=tk.LEFT, padx=(2, 0))
+        ttk.Label(fps_row, text="Behavior bouts:").pack(
+            side=tk.LEFT, padx=(16, 6)
+        )
+        class_mode_combo = ttk.Combobox(
+            fps_row,
+            state="readonly",
+            textvariable=self.behavior_bout_class_mode_var,
+            values=(
+                "Mutually exclusive (one class per frame)",
+                "Multi-label (allow overlapping classes)",
+            ),
+            width=38,
+        )
+        class_mode_combo.pack(side=tk.LEFT)
+        CreateToolTip(
+            class_mode_combo,
+            "Mutually exclusive preserves the historical highest-confidence "
+            "single class per track/frame. Multi-label constructs each class "
+            "channel independently and permits legitimate overlapping "
+            "behavior bouts on the same track.",
+        )
 
-        ttk.Label(frame, text="Categorical factor columns:").grid(row=6, column=0, sticky="w", padx=(0, 6), pady=4)
-        ttk.Entry(frame, textvariable=self.stats_categorical_factors_var).grid(row=6, column=1, sticky="ew", padx=(0, 6), pady=4)
-        ttk.Label(
+        self.advanced_stats_section = CollapsibleSection(
             frame,
-            text="Comma-separated: e.g. group,time_point,condition. Leave blank to compare experimental groups only.",
-            wraplength=360,
+            title="Advanced Statistics",
+            description=(
+                "Optional inferential and time-series settings. Group, Subject ID, "
+                "and Time Point are assigned their study-design roles automatically."
+            ),
+            expanded=False,
+            body_padding=(8, 4, 8, 8),
+        )
+        self.advanced_stats_section.grid(
+            row=8,
+            column=0,
+            columnspan=8,
+            sticky="ew",
+            pady=(8, 4),
+        )
+        stats_body = self.advanced_stats_section.body
+        stats_body.columnconfigure(1, weight=1)
+        stats_body.columnconfigure(3, weight=1)
+
+        auto_design_cb = ttk.Checkbutton(
+            stats_body,
+            text="Automatically add discovered design factors to group statistics",
+            variable=self.stats_auto_detect_design_var,
+            command=self._refresh_stats_design_summary,
+        )
+        auto_design_cb.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
+        CreateToolTip(
+            auto_design_cb,
+            "Recommended. Time Point and other supported categorical design "
+            "columns are added when they contain comparable levels. Group always "
+            "remains the primary comparison factor, Subject ID remains the "
+            "experimental unit, and mixed-effects/KPSS use their required roles.",
+        )
+        ttk.Label(
+            stats_body,
+            textvariable=self.stats_design_summary_var,
+            wraplength=1040,
             justify=tk.LEFT,
-        ).grid(row=6, column=2, columnspan=2, sticky="w", pady=4)
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 8))
+
+        mixed_cb = ttk.Checkbutton(
+            stats_body,
+            text="Mixed-effects models for repeated subjects",
+            variable=self.include_mixed_effects_var,
+        )
+        mixed_cb.grid(row=2, column=0, columnspan=2, sticky="w", padx=(0, 12), pady=3)
+        CreateToolTip(
+            mixed_cb,
+            "Uses Subject ID as the random grouping variable. Preflight flags "
+            "missing IDs or an insufficient repeated-measures design.",
+        )
+        kpss_cb = ttk.Checkbutton(
+            stats_body,
+            text="KPSS stationarity diagnostic",
+            variable=self.include_kpss_var,
+        )
+        kpss_cb.grid(row=2, column=2, columnspan=2, sticky="w", pady=3)
+        CreateToolTip(
+            kpss_cb,
+            "Optional time-series diagnostic. It requires at least five ordered "
+            "Time Point levels within a group. Numeric labels and values such as "
+            "Day7, Week2, Hour24, and Visit3 are recognized.",
+        )
+
+        ttk.Label(stats_body, text="Multiple-comparison correction:").grid(
+            row=3, column=0, sticky="w", padx=(0, 6), pady=4
+        )
+        ttk.Combobox(
+            stats_body,
+            state="readonly",
+            textvariable=self.stats_correction_var,
+            values=("fdr_bh", "bonferroni"),
+            width=14,
+        ).grid(row=3, column=1, sticky="w", padx=(0, 12), pady=4)
+        ttk.Label(stats_body, text="Additional categorical factors:").grid(
+            row=3, column=2, sticky="w", padx=(0, 6), pady=4
+        )
+        additional_factors_entry = ttk.Entry(
+            stats_body,
+            textvariable=self.stats_categorical_factors_var,
+        )
+        additional_factors_entry.grid(row=3, column=3, sticky="ew", pady=4)
+        CreateToolTip(
+            additional_factors_entry,
+            "Optional comma-separated factors. Built-in aliases such as cohort, "
+            "condition, time, visit, animal, and subject are normalized. Unknown "
+            "columns are flagged by preflight and cannot silently enter a run.",
+        )
+        ttk.Label(
+            stats_body,
+            text=(
+                "Group comparisons automatically include Kruskal-Wallis omnibus "
+                "tests, Mann-Whitney pairwise tests, effect sizes, and the selected "
+                "multiple-comparison correction when the design has enough "
+                "independent units."
+            ),
+            wraplength=1040,
+            justify=tk.LEFT,
+        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         metrics_frame = ttk.LabelFrame(frame, text="Analytics Metric Selection", padding=8)
-        metrics_frame.grid(row=8, column=0, columnspan=8, sticky="ew", pady=(6, 4))
+        metrics_frame.grid(row=9, column=0, columnspan=8, sticky="ew", pady=(6, 4))
         metrics_frame.columnconfigure(1, weight=1)
 
         preset_label_by_key = {spec.key: spec.label for spec in self.ASSAY_PRESETS}
@@ -1344,7 +1913,7 @@ class BatchProcessingWizard(tk.Toplevel):
         self._preset_key_by_label = preset_key_by_label
 
         figure_frame = ttk.LabelFrame(frame, text="Figure Outputs", padding=8)
-        figure_frame.grid(row=9, column=0, columnspan=8, sticky="ew", pady=(6, 4))
+        figure_frame.grid(row=10, column=0, columnspan=8, sticky="ew", pady=(6, 4))
         figure_frame.columnconfigure(1, weight=1)
         figure_frame.columnconfigure(3, weight=1)
         ttk.Label(figure_frame, text="Output preset:").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
@@ -1390,7 +1959,7 @@ class BatchProcessingWizard(tk.Toplevel):
         ).grid(row=2, column=0, sticky="w", padx=(0, 10), pady=2)
         ttk.Checkbutton(
             figure_frame,
-            text="Per-video quicklooks",
+            text="Per-video paths, speed, and dwell",
             variable=self.generate_video_quicklooks_var,
             command=self._on_figure_output_toggle_changed,
         ).grid(row=2, column=1, sticky="w", padx=(0, 10), pady=2)
@@ -1405,7 +1974,7 @@ class BatchProcessingWizard(tk.Toplevel):
             text=(
                 "Publication keeps the assay-aware manuscript set. Dashboard adds a multi-panel overview. "
                 "Group-stats overview surfaces omnibus and pairwise findings at a glance. "
-                "Individual profiles and quicklooks stay available as diagnostics, and the full archive keeps every dense module figure."
+                "Per-video spatial outputs add path, speed, arm dwell, and object-interaction plots; the full archive keeps every dense module figure."
             ),
             wraplength=960,
             justify=tk.LEFT,
@@ -1426,19 +1995,19 @@ class BatchProcessingWizard(tk.Toplevel):
             justify=tk.LEFT,
         ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
-        ttk.Label(frame, text="Keybind profile:").grid(row=10, column=0, sticky="w", padx=(0, 6), pady=4)
-        ttk.Entry(frame, textvariable=self.keybind_profile_var).grid(row=10, column=1, sticky="ew", padx=(0, 6), pady=4)
-        ttk.Button(frame, text="Load", command=self._load_keybind_profile).grid(row=10, column=2, padx=(0, 6), pady=4)
-        ttk.Button(frame, text="Save", command=self._save_keybind_profile).grid(row=10, column=3, padx=(0, 6), pady=4)
+        ttk.Label(frame, text="Keybind profile:").grid(row=11, column=0, sticky="w", padx=(0, 6), pady=4)
+        ttk.Entry(frame, textvariable=self.keybind_profile_var).grid(row=11, column=1, sticky="ew", padx=(0, 6), pady=4)
+        ttk.Button(frame, text="Load", command=self._load_keybind_profile).grid(row=11, column=2, padx=(0, 6), pady=4)
+        ttk.Button(frame, text="Save", command=self._save_keybind_profile).grid(row=11, column=3, padx=(0, 6), pady=4)
         ttk.Label(frame, textvariable=self.keybind_status_var, wraplength=650, justify=tk.LEFT).grid(
-            row=10, column=4, columnspan=4, sticky="w", pady=4
+            row=11, column=4, columnspan=4, sticky="w", pady=4
         )
 
         ttk.Label(frame, textvariable=self.model_capability_var, wraplength=1120, justify=tk.LEFT).grid(
-            row=11, column=0, columnspan=8, sticky="w", pady=(4, 0)
+            row=12, column=0, columnspan=8, sticky="w", pady=(4, 0)
         )
         ttk.Label(frame, textvariable=self.analysis_preflight_var, wraplength=1120, justify=tk.LEFT).grid(
-            row=11, column=0, columnspan=8, sticky="w", pady=(4, 0)
+            row=13, column=0, columnspan=8, sticky="w", pady=(4, 0)
         )
 
         self._sync_metric_preset_label()
@@ -1447,7 +2016,7 @@ class BatchProcessingWizard(tk.Toplevel):
         # gotchas before the researcher clicks Run. Each label hides itself
         # when its var is empty, so a clean queue shows nothing at all.
         hints_frame = ttk.Frame(frame)
-        hints_frame.grid(row=12, column=0, columnspan=8, sticky="ew", pady=(6, 0))
+        hints_frame.grid(row=14, column=0, columnspan=8, sticky="ew", pady=(6, 0))
         hints_frame.columnconfigure(0, weight=1)
         self._unassigned_group_hint_label = ttk.Label(
             hints_frame,
@@ -1498,10 +2067,27 @@ class BatchProcessingWizard(tk.Toplevel):
                 _var.trace_add("write", lambda *_: self._refresh_inline_hints())
             except Exception:
                 pass
+        try:
+            self.output_path_var.trace_add(
+                "write", lambda *_: self._refresh_results_status()
+            )
+        except Exception:
+            pass
         self._refresh_inline_hints()
+        for _var in (
+            self.stats_auto_detect_design_var,
+            self.stats_categorical_factors_var,
+            self.include_mixed_effects_var,
+            self.include_kpss_var,
+        ):
+            try:
+                _var.trace_add("write", lambda *_: self._refresh_stats_design_summary())
+            except Exception:
+                pass
+        self._refresh_stats_design_summary()
 
     def _build_execution_section(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="5. Execute", padding=10)
+        frame = ttk.LabelFrame(parent, text="5. Run, Review, and Results", padding=10)
         frame.pack(fill=tk.X)
         frame.columnconfigure(0, weight=1)
 
@@ -1510,17 +2096,30 @@ class BatchProcessingWizard(tk.Toplevel):
 
         ttk.Label(frame, textvariable=self.progress_text_var).grid(row=1, column=0, sticky="w", pady=(0, 6))
 
+        self.results_status_label = ttk.Label(
+            frame,
+            textvariable=self.results_status_var,
+            wraplength=1120,
+            justify=tk.LEFT,
+            font=("TkDefaultFont", 10, "bold"),
+        )
+        self.results_status_label.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+
         buttons = ttk.Frame(frame)
-        buttons.grid(row=2, column=0, sticky="ew")
-        buttons.columnconfigure(7, weight=1)
-        self.load_session_button = ttk.Button(buttons, text="Load Session JSON", command=self._load_session_json)
-        self.load_session_button.grid(row=0, column=0, padx=(0, 6))
-        self.save_session_button = ttk.Button(buttons, text="Save Session JSON", command=self._save_session_json)
-        self.save_session_button.grid(row=0, column=1, padx=(0, 6))
-        self.run_button = ttk.Button(buttons, text="Run Batch", command=self._start_batch_run, style="Accent.TButton")
-        self.run_button.grid(row=0, column=2, padx=(0, 6))
-        self.resume_button = ttk.Button(buttons, text="Resume Batch", command=self._start_batch_resume)
-        self.resume_button.grid(row=0, column=3, padx=(0, 6))
+        buttons.grid(row=3, column=0, sticky="ew")
+        buttons.columnconfigure(1, weight=1)
+
+        run_group = ttk.LabelFrame(buttons, text="Run", padding=6)
+        run_group.grid(row=0, column=0, sticky="nw", padx=(0, 8), pady=(0, 8))
+        self.run_button = ttk.Button(
+            run_group,
+            text="Run Batch",
+            command=self._start_batch_run,
+            style="Accent.TButton",
+        )
+        self.run_button.grid(row=0, column=0, padx=(0, 6))
+        self.resume_button = ttk.Button(run_group, text="Resume Batch", command=self._start_batch_resume)
+        self.resume_button.grid(row=0, column=1, padx=(0, 6))
         CreateToolTip(
             self.resume_button,
             "Continue a previously interrupted batch. Videos already marked "
@@ -1528,31 +2127,114 @@ class BatchProcessingWizard(tk.Toplevel):
             "cancelled, and pending videos are reprocessed. Use 'Run Batch' "
             "instead for a fresh re-run of every video.",
         )
-        self.stop_button = ttk.Button(buttons, text="Stop", command=self._stop_batch_run, state=tk.DISABLED)
-        self.stop_button.grid(row=0, column=4)
-        self.review_button = ttk.Button(buttons, text="Review/Correct Bouts", command=self._open_selected_video_review)
-        self.review_button.grid(row=0, column=5, padx=(6, 6))
-        self.review_roi_button = ttk.Button(buttons, text="Review Selected ROI Events", command=self._open_selected_roi_event_review)
-        self.review_roi_button.grid(row=0, column=6, padx=(0, 6))
+        self.stop_button = ttk.Button(
+            run_group,
+            text="Stop",
+            command=self._stop_batch_run,
+            state=tk.DISABLED,
+        )
+        self.stop_button.grid(row=0, column=2)
+
+        review_group = ttk.LabelFrame(buttons, text="Review", padding=6)
+        review_group.grid(row=0, column=1, sticky="nw", pady=(0, 8))
+        self.review_button = ttk.Button(
+            review_group,
+            text="Review Behavior Bouts",
+            command=self._open_selected_video_review,
+        )
+        self.review_button.grid(row=0, column=0, padx=(0, 6))
+        CreateToolTip(
+            self.review_button,
+            "Open the selected video's Class ID behavior bouts in the "
+            "integrated timeline reviewer. Track, class, boundary, add, split, "
+            "merge, overlap, and tIoU decisions are saved automatically with "
+            "the selected analysis run.",
+        )
+        self.review_roi_button = ttk.Button(
+            review_group,
+            text="Review ROI / Object Bouts",
+            command=self._open_selected_roi_event_review,
+        )
+        self.review_roi_button.grid(row=0, column=1, padx=(0, 6))
+        CreateToolTip(
+            self.review_roi_button,
+            "Review concurrent ROI, exclusive ROI-X, and object-interaction "
+            "bouts separately for the selected video.",
+        )
+        self.finalize_button = ttk.Button(
+            review_group,
+            text="Finalize Reviewed Results",
+            command=self._start_finalize_reviewed_results,
+            style="Accent.TButton",
+        )
+        self.finalize_button.grid(row=0, column=2)
+        CreateToolTip(
+            self.finalize_button,
+            "After all required bout and ROI reviews are complete, rebuild the "
+            "batch workbook, statistics, coverage table, and figures from the "
+            "authoritative reviewed outputs.",
+        )
+
+        session_group = ttk.LabelFrame(buttons, text="Session", padding=6)
+        session_group.grid(row=1, column=0, sticky="nw", padx=(0, 8))
+        self.load_session_button = ttk.Button(
+            session_group,
+            text="Load Session",
+            command=self._load_session_json,
+        )
+        self.load_session_button.grid(row=0, column=0, padx=(0, 6))
+        self.save_session_button = ttk.Button(
+            session_group,
+            text="Save Session",
+            command=self._save_session_json,
+        )
+        self.save_session_button.grid(row=0, column=1)
+
+        results_group = ttk.LabelFrame(buttons, text="Results", padding=6)
+        results_group.grid(row=1, column=1, sticky="nw")
+        ttk.Button(
+            results_group,
+            text="Open Results Folder",
+            command=self._open_batch_output_folder,
+        ).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(
+            results_group,
+            text="Open Workbook",
+            command=self._open_batch_workbook,
+        ).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(
+            results_group,
+            text="Open Coverage Table",
+            command=self._open_analysis_coverage_table,
+        ).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(
+            results_group,
+            text="Open Figures",
+            command=self._open_batch_figures_folder,
+        ).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(
+            results_group,
+            text="Open Selected Video Results",
+            command=self._open_selected_analytics_folder,
+        ).grid(row=0, column=4)
+
+        tab_group = ttk.LabelFrame(buttons, text="Continue Analysis", padding=6)
+        tab_group.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.open_tab7_selected_button = ttk.Button(
-            buttons,
-            text="Open Selected in Tab 7",
+            tab_group,
+            text="Send Selected to Analysis Tab",
             command=self._open_selected_results_in_tab7,
         )
-        self.open_tab7_selected_button.grid(row=0, column=7, padx=(0, 6))
+        self.open_tab7_selected_button.grid(row=0, column=0, padx=(0, 6))
         self.open_tab7_all_button = ttk.Button(
-            buttons,
-            text="Open All Completed in Tab 7",
+            tab_group,
+            text="Send All Completed to Analysis Tab",
             command=self._open_all_completed_results_in_tab7,
         )
-        self.open_tab7_all_button.grid(row=0, column=8, sticky="e")
-        ttk.Button(buttons, text="Open Batch Folder", command=self._open_batch_output_folder).grid(row=1, column=0, padx=(0, 6), pady=(6, 0))
-        ttk.Button(buttons, text="Open Workbook", command=self._open_batch_workbook).grid(row=1, column=1, padx=(0, 6), pady=(6, 0))
-        ttk.Button(buttons, text="Open Figures", command=self._open_batch_figures_folder).grid(row=1, column=2, padx=(0, 6), pady=(6, 0))
-        ttk.Button(buttons, text="Open Selected Analytics", command=self._open_selected_analytics_folder).grid(row=1, column=3, padx=(0, 6), pady=(6, 0))
+        self.open_tab7_all_button.grid(row=0, column=1)
 
         ttk.Label(frame, textvariable=self.session_status_var, wraplength=1120, justify=tk.LEFT).grid(
-            row=3,
+            row=4,
             column=0,
             sticky="w",
             pady=(8, 0),
@@ -1561,12 +2243,12 @@ class BatchProcessingWizard(tk.Toplevel):
         ttk.Label(
             frame,
             text=(
-                "Tab 7 import: each completed batch analytics video writes its own run_manifest.json. "
-                "Use the Tab 7 buttons here to import selected or all completed analytics outputs."
+                "Continue Analysis imports each selected video's saved result "
+                "manifest into the main Analysis tab; it does not rerun inference."
             ),
             wraplength=1120,
             justify=tk.LEFT,
-        ).grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ).grid(row=5, column=0, sticky="w", pady=(8, 0))
 
     def _browse_source_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -1666,11 +2348,71 @@ class BatchProcessingWizard(tk.Toplevel):
         recursive = bool(self.recursive_scan_var.get())
         discovered_items = self.service.discover_queue(source_path, recursive=recursive)
         added_count = self._merge_discovered_items(discovered_items)
+        inferred_fields = sum(
+            1
+            for item in discovered_items
+            for field_name in ("group", "subject_id", "time_point")
+            if str(
+                (getattr(item, "metadata_sources", {}) or {}).get(
+                    field_name, ""
+                )
+                or ""
+            ).strip()
+        )
+        ambiguity_count = sum(
+            len(list(getattr(item, "metadata_warnings", []) or []))
+            for item in discovered_items
+        )
+        metadata_note = (
+            f" Auto-assigned {inferred_fields} study-design field(s)."
+            if inferred_fields
+            else ""
+        )
+        if ambiguity_count:
+            metadata_note += (
+                f" {ambiguity_count} ambiguous candidate(s) were left blank for review."
+            )
         self.progress_text_var.set(
-            f"Discovered {len(discovered_items)} video(s). Added {added_count} new row(s); queue now has {len(self.queue_items)} total."
+            f"Discovered {len(discovered_items)} video(s). Added {added_count} new row(s); "
+            f"queue now has {len(self.queue_items)} total.{metadata_note}"
         )
         self._refresh_queue_tree()
         self._refresh_roi_summary()
+        self._mark_session_dirty()
+
+    def _auto_assign_design_metadata(self) -> None:
+        items = self._included_queue_items()
+        if not items:
+            messagebox.showwarning(
+                "Study-design Metadata",
+                "Queue at least one included video before auto-detecting metadata.",
+                parent=self,
+            )
+            return
+        counts = self.service.infer_queue_design_metadata(
+            items,
+            source_path=str(self.source_path_var.get() or "").strip(),
+            overwrite=False,
+        )
+        assigned_total = sum(
+            int(counts.get(field_name, 0) or 0)
+            for field_name in ("group", "subject_id", "time_point")
+        )
+        ambiguity_count = int(counts.get("ambiguous", 0) or 0)
+        message = (
+            "Study-design auto-detection finished: "
+            f"group={int(counts.get('group', 0) or 0)}, "
+            f"subject={int(counts.get('subject_id', 0) or 0)}, "
+            f"time={int(counts.get('time_point', 0) or 0)} newly assigned."
+        )
+        if ambiguity_count:
+            message += (
+                f" {ambiguity_count} ambiguous candidate(s) remain for manual review."
+            )
+        if assigned_total == 0:
+            message += " Existing values were preserved."
+        self.progress_text_var.set(message)
+        self._refresh_queue_tree()
         self._mark_session_dirty()
 
     @staticmethod
@@ -1696,6 +2438,71 @@ class BatchProcessingWizard(tk.Toplevel):
                 existing_seen.add(key)
                 if not str(existing.video_name or "").strip():
                     existing.video_name = str(candidate.video_name or "").strip()
+                existing_sources = dict(
+                    getattr(existing, "metadata_sources", {}) or {}
+                )
+                candidate_sources = dict(
+                    getattr(candidate, "metadata_sources", {}) or {}
+                )
+                filled_fields: set[str] = set()
+                for field_name in ("group", "subject_id", "time_point"):
+                    current_value = str(
+                        getattr(existing, field_name, "") or ""
+                    ).strip()
+                    candidate_value = str(
+                        getattr(candidate, field_name, "") or ""
+                    ).strip()
+                    if current_value or not candidate_value:
+                        continue
+                    setattr(existing, field_name, candidate_value)
+                    filled_fields.add(field_name)
+                    if candidate_sources.get(field_name):
+                        existing_sources[field_name] = str(
+                            candidate_sources[field_name]
+                        )
+                existing.metadata_sources = existing_sources
+                relevant_warnings: list[str] = []
+                for warning in list(
+                    getattr(candidate, "metadata_warnings", []) or []
+                ):
+                    warning_text = str(warning)
+                    lowered = warning_text.casefold()
+                    if (
+                        ("group" in lowered and not str(existing.group or "").strip())
+                        or (
+                            "subject" in lowered
+                            and not str(existing.subject_id or "").strip()
+                        )
+                        or (
+                            "time point" in lowered
+                            and not str(existing.time_point or "").strip()
+                        )
+                    ):
+                        relevant_warnings.append(warning_text)
+                warning_terms = {
+                    "group": ("group",),
+                    "subject_id": ("subject", "animal id"),
+                    "time_point": ("time point", "timepoint"),
+                }
+                retained_warnings = [
+                    str(warning)
+                    for warning in list(
+                        getattr(existing, "metadata_warnings", []) or []
+                    )
+                    if not any(
+                        term in str(warning).casefold()
+                        for field_name in filled_fields
+                        for term in warning_terms[field_name]
+                    )
+                ]
+                existing.metadata_warnings = list(
+                    dict.fromkeys(
+                        [
+                            *retained_warnings,
+                            *relevant_warnings,
+                        ]
+                    )
+                )
                 merged.append(existing)
                 continue
             merged.append(candidate)
@@ -1716,8 +2523,8 @@ class BatchProcessingWizard(tk.Toplevel):
         """Compute pre-run gotcha hints (PR 2B coherence-pass 2c).
 
         Three hints surfaced as grey-italic labels above the Execute section:
-          1. Videos with no group assigned will be bucketed as ``group_unset``
-             — researchers usually want to know before Run, not after.
+          1. Missing or ambiguous Group, Subject ID, and Time Point values,
+             with full per-video detail delegated to preflight.
           2. Output folder doesn't exist yet — non-fatal (created on Run),
              but worth flagging in case it's a typo.
           3. Tracker checkbox is on but no tracker config supplied —
@@ -1726,21 +2533,48 @@ class BatchProcessingWizard(tk.Toplevel):
         Empty strings hide the relevant label visually because the parent
         frame has no minimum height for empty-text labels.
         """
-        # 1. Unassigned-group hint — read from queue items.
+        # 1. Missing study-design metadata hint — read from queue items.
         try:
             included = self._included_queue_items()
         except Exception:
             included = []
-        n_unset = sum(1 for it in included if not str(getattr(it, "group", "") or "").strip())
-        if not included or n_unset == 0:
+        missing_counts = {
+            "group": sum(
+                1
+                for item in included
+                if not str(getattr(item, "group", "") or "").strip()
+            ),
+            "subject": sum(
+                1
+                for item in included
+                if not str(getattr(item, "subject_id", "") or "").strip()
+            ),
+            "time": sum(
+                1
+                for item in included
+                if not str(getattr(item, "time_point", "") or "").strip()
+            ),
+        }
+        missing_parts = [
+            f"{label}={count}"
+            for label, count in missing_counts.items()
+            if count > 0
+        ]
+        ambiguity_count = sum(
+            len(list(getattr(item, "metadata_warnings", []) or []))
+            for item in included
+        )
+        if not included or (not missing_parts and ambiguity_count <= 0):
             self.unassigned_group_hint_var.set("")
-        elif n_unset == 1:
-            self.unassigned_group_hint_var.set(
-                "Heads up: 1 video has no group assigned — it will be bucketed as `group_unset` at run time."
-            )
         else:
+            warning_suffix = (
+                f"; ambiguous={ambiguity_count}" if ambiguity_count else ""
+            )
             self.unassigned_group_hint_var.set(
-                f"Heads up: {n_unset} videos have no group assigned — they'll be bucketed together as `group_unset` at run time."
+                "Study-design metadata needs review: "
+                + (", ".join(missing_parts) if missing_parts else "no blank fields")
+                + warning_suffix
+                + ". Run Full Preflight for the exact videos and affected analyses."
             )
 
         # 2. Output-folder-does-not-exist hint.
@@ -1953,6 +2787,74 @@ class BatchProcessingWizard(tk.Toplevel):
             pass
         except Exception:
             pass
+        try:
+            self._refresh_stats_design_summary()
+        except AttributeError:
+            pass
+        except Exception:
+            pass
+
+    def _refresh_stats_design_summary(self) -> None:
+        """Show how queue metadata will be assigned to statistical roles."""
+
+        items = self._included_queue_items()
+        if not items:
+            self.stats_design_summary_var.set(
+                "Study design: discover videos to inspect Group, Subject ID, and Time Point."
+            )
+            return
+        design = summarize_study_design(
+            [
+                PreflightVideoState(
+                    video_id=str(item.video_id or ""),
+                    video_name=str(item.video_name or ""),
+                    video_path=str(item.video_path or ""),
+                    has_rois=bool(item.rois),
+                    has_object_rois=bool(item.object_rois),
+                    group=str(item.group or ""),
+                    subject_id=str(item.subject_id or ""),
+                    time_point=str(item.time_point or ""),
+                    metadata_sources=dict(
+                        getattr(item, "metadata_sources", {}) or {}
+                    ),
+                    metadata_warnings=list(
+                        getattr(item, "metadata_warnings", []) or []
+                    ),
+                )
+                for item in items
+            ]
+        )
+        total = len(items)
+        group_available = total - int(design["missing_group_videos"])
+        subject_available = total - int(design["missing_subject_videos"])
+        time_available = total - int(design["missing_time_videos"])
+        roles = (
+            "Group=comparison factor; Subject ID=experimental/repeated unit; "
+            "Time Point=time factor. Automatic factor discovery is "
+            + (
+                "enabled"
+                if bool(self.stats_auto_detect_design_var.get())
+                else "disabled"
+            )
+        )
+        summary = (
+            f"Detected: Group {group_available}/{total}, "
+            f"Subject ID {subject_available}/{total}, "
+            f"Time Point {time_available}/{total}. {roles}."
+        )
+        inferred_counts = dict(design["inferred_field_counts"])
+        inferred_total = sum(int(value or 0) for value in inferred_counts.values())
+        if inferred_total:
+            summary += (
+                " Auto-detected fields: "
+                f"group={int(inferred_counts.get('group', 0) or 0)}, "
+                f"subject={int(inferred_counts.get('subject_id', 0) or 0)}, "
+                f"time={int(inferred_counts.get('time_point', 0) or 0)}."
+            )
+        warning_count = int(design["metadata_warning_count"])
+        if warning_count:
+            summary += f" Ambiguous assignments requiring review: {warning_count}."
+        self.stats_design_summary_var.set(summary)
 
     def _queue_uses_shared_rois(self) -> bool:
         return str(self.roi_strategy_var.get() or "single").strip().lower() == "single"
@@ -1987,9 +2889,15 @@ class BatchProcessingWizard(tk.Toplevel):
 
     def _queue_object_roi_status(self, item: BatchVideoItem) -> str:
         if self._queue_uses_shared_rois():
-            if item.object_rois and not self._store_matches_shared(item.object_rois, self.shared_object_rois):
+            if (
+                self.shared_object_rois
+                and item.object_rois
+                and not self._store_matches_shared(item.object_rois, self.shared_object_rois)
+            ):
                 return "override"
-            return "shared" if bool(self.shared_object_rois or item.object_rois) else "pending"
+            if self.shared_object_rois:
+                return "shared"
+            return "done" if bool(item.object_rois) else "pending"
         return "done" if bool(item.object_rois) else "pending"
 
     def _get_selected_items(self) -> list[BatchVideoItem]:
@@ -2059,6 +2967,123 @@ class BatchProcessingWizard(tk.Toplevel):
             self._launch_path(target)
         except Exception as exc:
             messagebox.showerror("Batch Outputs", f"Could not open the workbook:\n{exc}", parent=self)
+
+    def _open_analysis_coverage_table(self) -> None:
+        output_text = str(self.output_path_var.get() or "").strip()
+        target = Path(output_text).expanduser() / "analysis_coverage_table.csv"
+        if not output_text or not target.is_file():
+            messagebox.showwarning(
+                "Batch Outputs",
+                f"Analysis coverage table not found:\n{target}",
+                parent=self,
+            )
+            return
+        try:
+            self._launch_path(target)
+        except Exception as exc:
+            messagebox.showerror(
+                "Batch Outputs",
+                f"Could not open the analysis coverage table:\n{exc}",
+                parent=self,
+            )
+
+    def _refresh_results_status(self) -> None:
+        output_text = str(self.output_path_var.get() or "").strip()
+        status = ""
+        source_kind = ""
+        reason = ""
+        warning_count = 0
+        if output_text:
+            marker_path = (
+                Path(output_text).expanduser() / "batch_results_status.json"
+            )
+            if marker_path.is_file():
+                try:
+                    payload = json.loads(marker_path.read_text(encoding="utf-8"))
+                    if isinstance(payload, dict):
+                        status = str(payload.get("status", "") or "").strip().lower()
+                        source_kind = str(
+                            payload.get("source_kind", "") or ""
+                        ).strip()
+                        reason = str(payload.get("reason", "") or "").strip()
+                        warnings = payload.get("warnings")
+                        warning_count = (
+                            len(warnings) if isinstance(warnings, list) else 0
+                        )
+                except Exception:
+                    status = "unknown"
+            elif (Path(output_text).expanduser() / "batch_results.xlsx").is_file():
+                status = "legacy"
+
+        if status == "finalized":
+            if source_kind == "automatic_outputs_review_explicitly_skipped":
+                text = (
+                    "FINALIZED (REVIEW SKIPPED): Workbook, statistics, and figures "
+                    "match the automatic outputs selected by this session."
+                )
+            elif source_kind == "automatic_outputs_no_review_required":
+                text = (
+                    "FINALIZED (NO REVIEW NEEDED): No non-empty bout or ROI event "
+                    "tables required review; batch derivatives match the saved outputs."
+                )
+            else:
+                text = (
+                    "FINALIZED: Workbook, statistics, and figures use the current "
+                    "authoritative reviewed outputs."
+                )
+            if warning_count:
+                text += (
+                    f" {warning_count} video(s) have review-dependent optional "
+                    "module outputs excluded; see the Coverage Table."
+                )
+            color = "#1b6e3c"
+        elif status == "needs_rebuild":
+            text = (
+                "REVIEWED CHANGES PENDING: Per-video review outputs are saved, but "
+                "the batch workbook/statistics/figures must be rebuilt with "
+                "Finalize Reviewed Results."
+            )
+            if reason:
+                text = f"{text} {reason}"
+            color = "#9a5a00"
+        elif status == "draft":
+            text = (
+                "DRAFT: The current batch workbook uses automatic detections. "
+                "Complete required reviews, then choose Finalize Reviewed Results."
+            )
+            color = "#9a5a00"
+        elif status in {"legacy", "unknown"}:
+            text = (
+                "STATUS UNKNOWN: A workbook exists, but it has no readable result "
+                "status marker. Finalize it before treating reviewed outputs as authoritative."
+            )
+            color = "#8a3b12"
+        else:
+            text = "RESULTS: No batch results have been generated yet."
+            color = "#4f5b66"
+        self.results_status_var.set(text)
+        if hasattr(self, "results_status_label"):
+            try:
+                self.results_status_label.configure(foreground=color)
+            except Exception:
+                pass
+        if hasattr(self, "finalize_button"):
+            self.finalize_button.configure(
+                state=tk.DISABLED if self.service.is_running() else tk.NORMAL
+            )
+
+    def _mark_batch_results_stale(self, *, reason: str) -> None:
+        session = self._current_session
+        if session is None:
+            return
+        try:
+            self.service.pipeline.mark_results_stale(session, reason=reason)
+        except Exception as exc:
+            self.app.log_message(
+                f"Could not update batch result status after review: {exc}",
+                "WARNING",
+            )
+        self._refresh_results_status()
 
     def _open_batch_figures_folder(self) -> None:
         figures_dir = Path(str(self.output_path_var.get() or "").strip()).expanduser() / "figures"
@@ -2202,6 +3227,35 @@ class BatchProcessingWizard(tk.Toplevel):
             return first_value
         return ""
 
+    @staticmethod
+    def _set_design_metadata_value(
+        item: BatchVideoItem,
+        field_name: str,
+        value: str,
+    ) -> None:
+        """Set one reviewed design value and keep its provenance coherent."""
+
+        clean_value = str(value or "").strip()
+        setattr(item, field_name, clean_value)
+        sources = dict(getattr(item, "metadata_sources", {}) or {})
+        if clean_value:
+            sources[field_name] = "manual"
+        else:
+            sources.pop(field_name, None)
+        item.metadata_sources = sources
+
+        warning_terms = {
+            "group": ("group",),
+            "subject_id": ("subject", "animal id"),
+            "time_point": ("time point", "timepoint"),
+        }
+        terms = warning_terms.get(field_name, (field_name,))
+        item.metadata_warnings = [
+            str(warning)
+            for warning in list(getattr(item, "metadata_warnings", []) or [])
+            if not any(term in str(warning).casefold() for term in terms)
+        ]
+
     def _assign_group_to_selected(self) -> None:
         items = self._require_selected_items(title="Batch Queue")
         if not items:
@@ -2218,7 +3272,7 @@ class BatchProcessingWizard(tk.Toplevel):
             return
         group = group.strip()
         for item in items:
-            item.group = group
+            self._set_design_metadata_value(item, "group", group)
         self._refresh_queue_tree()
         self._mark_session_dirty()
 
@@ -2238,37 +3292,101 @@ class BatchProcessingWizard(tk.Toplevel):
             return
         time_point = time_point.strip()
         for item in items:
-            item.time_point = time_point
+            self._set_design_metadata_value(item, "time_point", time_point)
         self._refresh_queue_tree()
         self._mark_session_dirty()
 
-    def _edit_metadata_for_selected(self) -> None:
-        item = self._require_single_selected_item(
-            title="Batch Queue",
-            action_name="editing subject and time metadata",
-        )
-        if item is None:
+    def _assign_subject_to_selected(self) -> None:
+        items = self._require_selected_items(title="Batch Queue")
+        if not items:
             return
-        subject = self._prompt_roi_name(
-            title="Subject ID",
-            prompt=f"Subject ID for {item.video_name}:",
+        target_label = self._selected_video_label(items)
+        subject_id = self._prompt_roi_name(
+            title="Assign Subject",
+            prompt=f"Subject ID for {target_label}:",
             existing_names=self._collect_known_metadata_values("subject_id"),
-            initial_name=item.subject_id,
-            help_text="Select an existing subject ID or type a new one.",
+            initial_name=self._common_metadata_value(items, "subject_id"),
+            help_text=(
+                "Select an existing subject ID or type a new one. The value "
+                "will be applied to every selected video."
+            ),
         )
-        if subject is None:
+        if subject_id is None:
             return
-        time_point = self._prompt_roi_name(
-            title="Time Point",
-            prompt=f"Time point for {item.video_name}:",
-            existing_names=self._collect_known_metadata_values("time_point"),
-            initial_name=item.time_point,
-            help_text="Select an existing time point or type a new one.",
+        subject_id = subject_id.strip()
+        for item in items:
+            self._set_design_metadata_value(item, "subject_id", subject_id)
+        self._refresh_queue_tree()
+        self._mark_session_dirty()
+
+    def _prompt_metadata_assignments(
+        self,
+        items: list[BatchVideoItem],
+    ) -> list[dict[str, str]] | None:
+        dialog = _BatchMetadataEditorDialog(
+            self,
+            items=items,
+            known_values={
+                "group": self._collect_known_metadata_values("group"),
+                "subject_id": self._collect_known_metadata_values("subject_id"),
+                "time_point": self._collect_known_metadata_values("time_point"),
+            },
         )
-        if time_point is None:
+        self.wait_window(dialog)
+        return dialog.result
+
+    def _edit_metadata_for_selected(self) -> None:
+        items = self._require_selected_items(title="Batch Queue")
+        if not items:
             return
-        item.subject_id = subject.strip()
-        item.time_point = time_point.strip()
+        self._edit_metadata_for_items(items)
+
+    def _edit_metadata_for_all_included(self) -> None:
+        items = self._included_queue_items()
+        if not items:
+            messagebox.showwarning(
+                "Batch Queue",
+                "Queue at least one included video before editing metadata.",
+                parent=self,
+            )
+            return
+        self._edit_metadata_for_items(items)
+
+    def _edit_metadata_for_items(self, items: list[BatchVideoItem]) -> None:
+        assignments = self._prompt_metadata_assignments(items)
+        if assignments is None:
+            return
+        assignments_by_id = {
+            str(row.get("video_id", "") or "").strip(): row
+            for row in assignments
+            if str(row.get("video_id", "") or "").strip()
+        }
+        changed = 0
+        for item in items:
+            row = assignments_by_id.get(str(item.video_id or "").strip())
+            if row is None:
+                continue
+            self._set_design_metadata_value(
+                item,
+                "group",
+                str(row.get("group", "") or "").strip(),
+            )
+            self._set_design_metadata_value(
+                item,
+                "subject_id",
+                str(row.get("subject_id", "") or "").strip(),
+            )
+            self._set_design_metadata_value(
+                item,
+                "time_point",
+                str(row.get("time_point", "") or "").strip(),
+            )
+            changed += 1
+        if not changed:
+            return
+        self.progress_text_var.set(
+            f"Updated design metadata for {changed} selected video(s)."
+        )
         self._refresh_queue_tree()
         self._mark_session_dirty()
 
@@ -2277,7 +3395,7 @@ class BatchProcessingWizard(tk.Toplevel):
         if not items:
             return
         for item in items:
-            item.group = ""
+            self._set_design_metadata_value(item, "group", "")
         self._refresh_queue_tree()
         self._mark_session_dirty()
 
@@ -2396,13 +3514,46 @@ class BatchProcessingWizard(tk.Toplevel):
             shared_store = self.shared_rois
             item_store = item.rois
             label = "shared ROIs"
-        if item_store and not self._store_matches_shared(item_store, shared_store):
+        if shared_store and item_store and not self._store_matches_shared(item_store, shared_store):
             return item_store, "Per-video override"
         if shared_store:
             return shared_store, f"Using {label}"
         if item_store:
             return item_store, "Using per-video annotations"
         return {}, "No overlay assigned"
+
+    @staticmethod
+    def _draw_dashed_preview_contour(
+        draw: ImageDraw.ImageDraw,
+        points: list[tuple[int, int]],
+        *,
+        fill: tuple[int, int, int, int],
+        width: int = 3,
+        dash_length: float = 10.0,
+        gap_length: float = 6.0,
+    ) -> None:
+        if len(points) < 2:
+            return
+        closed = list(points) + [points[0]]
+        for start, end in zip(closed, closed[1:]):
+            dx = float(end[0] - start[0])
+            dy = float(end[1] - start[1])
+            segment_length = math.hypot(dx, dy)
+            if segment_length <= 0.0:
+                continue
+            offset = 0.0
+            while offset < segment_length:
+                dash_end = min(segment_length, offset + dash_length)
+                first = (
+                    start[0] + (dx * offset / segment_length),
+                    start[1] + (dy * offset / segment_length),
+                )
+                second = (
+                    start[0] + (dx * dash_end / segment_length),
+                    start[1] + (dy * dash_end / segment_length),
+                )
+                draw.line((first, second), fill=fill, width=width)
+                offset += dash_length + gap_length
 
     def _build_overlay_preview_image(self, item: BatchVideoItem, *, object_mode: bool) -> tuple[Image.Image, str, str]:
         frame = self._read_first_frame(item.video_path)
@@ -2411,6 +3562,17 @@ class BatchProcessingWizard(tk.Toplevel):
         overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
         store, usage_text = self._store_for_preview(item, object_mode=object_mode)
+        interaction_distance_px = 0.0
+        if object_mode:
+            interaction_distance_px = self._parse_nonnegative_float(
+                self.object_distance_px_var.get(),
+                "Object interaction distance threshold (px)",
+                0.0,
+            )
+            usage_text = (
+                f"{usage_text} | Selected-keypoint edge buffer: "
+                f"{interaction_distance_px:g}px (orange dotted outline)"
+            )
         for idx, (roi_name, payload) in enumerate(sorted(dict(store or {}).items(), key=lambda row: str(row[0]).lower())):
             fallback = self.ROI_COLORS[idx % len(self.ROI_COLORS)]
             color = self._display_overlay_color(payload if isinstance(payload, dict) else {}, fallback)
@@ -2421,6 +3583,20 @@ class BatchProcessingWizard(tk.Toplevel):
                 points = [(int(point[0]), int(point[1])) for point in list(polygon or []) if len(point) >= 2]
                 if len(points) < 3:
                     continue
+                if object_mode and interaction_distance_px > 0.0:
+                    contours = interaction_boundary_contours(
+                        [points],
+                        frame_width=image.width,
+                        frame_height=image.height,
+                        distance_px=interaction_distance_px,
+                    )
+                    for contour in contours:
+                        self._draw_dashed_preview_contour(
+                            draw,
+                            contour,
+                            fill=(255, 140, 0, 235),
+                            width=3,
+                        )
                 fill = (color[0], color[1], color[2], 68)
                 outline = (color[0], color[1], color[2], 235)
                 draw.polygon(points, fill=fill, outline=outline)
@@ -2438,6 +3614,11 @@ class BatchProcessingWizard(tk.Toplevel):
             f"Path: {item.video_path} | Group: {item.group or '-'} | Subject: {item.subject_id or '-'} | "
             f"Time: {item.time_point or '-'} | Queue: {self._queue_status_label(item)}"
         )
+        if object_mode:
+            detail += (
+                " | Object interaction: selected keypoint within "
+                f"{interaction_distance_px:g}px of nearest object edge"
+            )
         return composed, usage_text, detail
 
     def _draw_single_item_roi_override(self, item: BatchVideoItem) -> bool:
@@ -2823,6 +4004,11 @@ class BatchProcessingWizard(tk.Toplevel):
         if object_count <= 0:
             raise ValueError("Object count must be > 0.")
         roi_size_px = max(2, self._parse_nonnegative_int(self.object_roi_size_px_var.get(), "Object ROI size (px)", 20))
+        interaction_distance_px = self._parse_nonnegative_float(
+            self.object_distance_px_var.get(),
+            "Object interaction distance threshold (px)",
+            0.0,
+        )
         shape = self._normalize_object_shape(self.object_roi_shape_var.get())
         frame = self._read_first_frame(video_path)
         existing_names = sorted(
@@ -2839,15 +4025,18 @@ class BatchProcessingWizard(tk.Toplevel):
         )
         if object_names is None:
             return False
-        polygons = draw_object_rois(
+        polygons, roi_size_px = draw_object_rois(
             frame,
             object_count=object_count,
             roi_size_px=roi_size_px,
             shape=shape,
+            distance_threshold_px=interaction_distance_px,
             object_names=object_names,
             master=self,
             title=f"{title_prefix} ({shape}, {roi_size_px}px)",
+            return_size_px=True,
         )
+        self.object_roi_size_px_var.set(str(roi_size_px))
         if not polygons:
             return False
         target_store.clear()
@@ -2875,17 +4064,25 @@ class BatchProcessingWizard(tk.Toplevel):
                 f"Guided object names count ({len(object_names)}) must match object count ({object_count})."
             )
         roi_size_px = max(2, self._parse_nonnegative_int(self.object_roi_size_px_var.get(), "Object ROI size (px)", 20))
+        interaction_distance_px = self._parse_nonnegative_float(
+            self.object_distance_px_var.get(),
+            "Object interaction distance threshold (px)",
+            0.0,
+        )
         shape = self._normalize_object_shape(self.object_roi_shape_var.get())
         frame = self._read_first_frame(video_path)
-        polygons = draw_object_rois(
+        polygons, roi_size_px = draw_object_rois(
             frame,
             object_count=object_count,
             roi_size_px=roi_size_px,
             shape=shape,
+            distance_threshold_px=interaction_distance_px,
             object_names=object_names,
             master=self,
             title=title_prefix,
+            return_size_px=True,
         )
+        self.object_roi_size_px_var.set(str(roi_size_px))
         if not polygons:
             return False
         working_store: dict[str, dict[str, Any]] = {}
@@ -3182,17 +4379,27 @@ class BatchProcessingWizard(tk.Toplevel):
         )
 
     def _start_object_roi_queue_loop(self) -> None:
-        """Entry point: "Place Objects for Queue" button (object ROI loop)."""
+        """Define one object template, then place it across all included videos."""
         included = self._included_queue_items()
         if not included:
             messagebox.showwarning(
-                "Place Objects for Queue",
+                "Place Objects Across Queue",
                 "Queue at least one included video first.",
                 parent=self,
             )
             return
 
         def _on_template_confirmed(rows: list[RoiBuilderRow]) -> None:
+            self.object_count_var.set(str(len(rows)))
+            self.object_name_templates_var.set(
+                self._format_name_templates([row.name for row in rows])
+            )
+            shapes = {str(row.shape or "").strip().lower() for row in rows}
+            if len(shapes) == 1 and next(iter(shapes)) in {"circle", "square"}:
+                self.object_roi_shape_var.set(next(iter(shapes)))
+            sizes = {int(row.size_px) for row in rows if row.size_px is not None}
+            if len(sizes) == 1:
+                self.object_roi_size_px_var.set(str(next(iter(sizes))))
             controller = _BatchRoiLoopController(
                 self,
                 items=included,
@@ -3201,12 +4408,64 @@ class BatchProcessingWizard(tk.Toplevel):
             )
             controller.start()
 
-        existing_names = self._collect_known_object_roi_names()
+        try:
+            object_count = self._parse_nonnegative_int(
+                self.object_count_var.get(),
+                "Object count",
+                0,
+            )
+            if object_count <= 0:
+                raise ValueError("Object count must be > 0.")
+            default_size_px = max(
+                2,
+                self._parse_nonnegative_int(
+                    self.object_roi_size_px_var.get(),
+                    "Object ROI size (px)",
+                    20,
+                ),
+            )
+            self._parse_nonnegative_float(
+                self.object_distance_px_var.get(),
+                "Object interaction distance threshold (px)",
+                0.0,
+            )
+        except ValueError as exc:
+            messagebox.showerror("Place Objects Across Queue", str(exc), parent=self)
+            return
+
+        configured_names = self._get_object_name_templates()
+        if configured_names and len(configured_names) != object_count:
+            messagebox.showerror(
+                "Place Objects Across Queue",
+                f"Guided object names count ({len(configured_names)}) must "
+                f"match object count ({object_count}).",
+                parent=self,
+            )
+            return
+        if not configured_names:
+            configured_names = [
+                f"Object_{index + 1}"
+                for index in range(object_count)
+            ]
+        default_shape = self._normalize_object_shape(self.object_roi_shape_var.get())
+        template_rows = [
+            RoiBuilderRow(
+                name=name,
+                shape=default_shape,
+                size_px=default_size_px,
+            )
+            for name in configured_names
+        ]
         RoiBuilderDialog(
             self,
             on_confirm=_on_template_confirmed,
-            existing_roi_names=existing_names,
-            title="Place Objects for Queue",
+            existing_rows=template_rows,
+            # The same object name is intentionally reused in each video's
+            # independent ROI store, so cross-video names are not collisions.
+            existing_roi_names=(),
+            title="Place Objects Across Queue",
+            default_size_px=default_size_px,
+            size_required=True,
         )
 
     def _edit_single_video_arena_rois(self, item: BatchVideoItem) -> None:
@@ -3480,11 +4739,22 @@ class BatchProcessingWizard(tk.Toplevel):
                 if object_names:
                     object_text = f"Object ROIs: {len(object_names)} [{', '.join(object_names)}]"
                 else:
-                    object_text = "Object ROIs: none placed yet."
+                    included_items = self._included_queue_items()
+                    object_done_count = sum(
+                        1
+                        for item in included_items
+                        if item.object_rois
+                    )
+                    object_text = (
+                        f"Per-video object ROIs: {object_done_count}/"
+                        f"{len(included_items)} included videos"
+                    )
                 object_override_count = sum(
                     1
                     for item in self._included_queue_items()
-                    if item.object_rois and not self._store_matches_shared(item.object_rois, self.shared_object_rois)
+                    if self.shared_object_rois
+                    and item.object_rois
+                    and not self._store_matches_shared(item.object_rois, self.shared_object_rois)
                 )
                 if object_override_count:
                     object_text = f"{object_text} | Overrides: {object_override_count}"
@@ -3510,6 +4780,7 @@ class BatchProcessingWizard(tk.Toplevel):
 
     def _preflight_model(self) -> None:
         model_path = str(self.model_path_var.get() or "").strip()
+        self._model_preflight_error = ""
         if not model_path:
             if bool(self.use_existing_labels_var.get()):
                 capabilities = self.model_capabilities or BatchModelCapabilities(model_path="")
@@ -3518,6 +4789,9 @@ class BatchProcessingWizard(tk.Toplevel):
                     task=capabilities.task or "unknown",
                     has_keypoints=capabilities.has_keypoints,
                     keypoint_count=capabilities.keypoint_count,
+                    keypoint_names=list(capabilities.keypoint_names or []),
+                    keypoint_names_source=str(capabilities.keypoint_names_source or "unresolved"),
+                    keypoint_schema_path=str(capabilities.keypoint_schema_path or ""),
                     class_count=capabilities.class_count,
                     class_names=list(capabilities.class_names or []),
                     supports_multiclass_stats=capabilities.supports_multiclass_stats,
@@ -3528,31 +4802,111 @@ class BatchProcessingWizard(tk.Toplevel):
                         "Model preflight skipped because existing-label mode is enabled and no model path was provided."
                     )
             else:
-                messagebox.showwarning("Model Preflight", "Select a model path first.", parent=self)
-                return
+                capabilities = BatchModelCapabilities(
+                    model_path="",
+                    task="unknown",
+                    warnings=[
+                        "No model path is selected. Model inference is not ready, "
+                        "but the remaining queue, ROI, and study-design checks are shown."
+                    ],
+                )
         else:
             try:
                 capabilities = self.service.preflight_model_capabilities(model_path)
             except Exception as exc:
-                messagebox.showerror("Model Preflight", f"Preflight failed:\n{exc}", parent=self)
-                return
+                self._model_preflight_error = str(exc)
+                capabilities = BatchModelCapabilities(
+                    model_path=model_path,
+                    task="unknown",
+                    warnings=[
+                        "Model preflight failed. Model inference is blocked, but "
+                        f"the remaining checks are still shown: {exc}"
+                    ],
+                )
+
+        configured_names = self._configured_keypoint_names()
+        resolved_names = list(getattr(capabilities, "keypoint_names", []) or [])
+        expected_count = max(0, int(getattr(capabilities, "keypoint_count", 0) or 0))
+        if expected_count and resolved_names and configured_names != resolved_names:
+            notice = (
+                f"GUI keypoint names ({len(configured_names)}) do not match the validated model schema "
+                f"({expected_count}). Batch output will use the model schema: " + ", ".join(resolved_names)
+            )
+            if notice not in capabilities.warnings:
+                capabilities.warnings.append(notice)
 
         self.model_capabilities = capabilities
         self._update_model_capability_text(capabilities)
         rows = self._build_analysis_preflight_rows(capabilities)
         yes_count, partial_count, no_count = summarize_preflight_counts(rows)
+        fix_count = sum(
+            1
+            for row in rows
+            if str(row.get("will_run", "") or "").strip() == "Fix"
+        )
+        unavailable_count = max(0, no_count - fix_count)
         self.analysis_preflight_var.set(
-            f"Preflight summary: Ready={yes_count}, Needs check={partial_count}, Blocked={no_count}. Open preflight details for step-by-step guidance."
+            f"Preflight summary: Ready={yes_count}, Needs check={partial_count}, "
+            f"Fix={fix_count}, Disabled/unavailable={unavailable_count}. "
+            "Open preflight details for the exact videos and next actions."
         )
         self._show_analysis_preflight_dialog(rows)
-        self.progress_text_var.set("Model preflight completed.")
+        self.progress_text_var.set("Full model, analysis, and study-design preflight completed.")
         self._mark_session_dirty()
+
+    def _configured_keypoint_names(self) -> list[str]:
+        try:
+            raw = str(self.app.config.setup.keypoint_names_str.get() or "").strip()
+        except Exception:
+            raw = ""
+        return [token.strip() for token in raw.split(",") if token.strip()] if raw else []
+
+    def _resolve_session_keypoint_schema(self, capabilities: BatchModelCapabilities) -> tuple[list[str], str, str]:
+        """Choose a validated schema without silently truncating GUI defaults."""
+        expected = max(0, int(getattr(capabilities, "keypoint_count", 0) or 0))
+        task = str(getattr(capabilities, "task", "unknown") or "unknown").strip().lower()
+        if task == "detect":
+            return [], "not_applicable", ""
+        model_names = list(getattr(capabilities, "keypoint_names", []) or [])
+        if expected > 0 and model_names:
+            clean, error = validate_keypoint_names(model_names, expected)
+            if not error:
+                return (
+                    clean,
+                    str(getattr(capabilities, "keypoint_names_source", "model") or "model"),
+                    str(getattr(capabilities, "keypoint_schema_path", "") or ""),
+                )
+
+        configured = self._configured_keypoint_names()
+        if expected > 0:
+            clean, error = validate_keypoint_names(configured, expected)
+            if not error:
+                return clean, "gui_config", ""
+            generated = [f"kp{idx}" for idx in range(expected)]
+            self.app.log_message(
+                f"Model emits {expected} keypoints, but the GUI contains {len(configured)} names and no validated "
+                "model schema was found. Using explicit generic names: " + ", ".join(generated),
+                "WARNING",
+            )
+            return generated, "generated_generic", ""
+
+        if bool(self.use_existing_labels_var.get()) and configured:
+            return configured, "gui_config_existing_labels", ""
+        return [], "unresolved", ""
 
     def _update_model_capability_text(self, capabilities: BatchModelCapabilities) -> None:
         warnings = " | ".join(capabilities.warnings) if capabilities.warnings else "No capability warnings."
+        schema = list(getattr(capabilities, "keypoint_names", []) or [])
+        schema_text = ""
+        if schema:
+            indexed = ", ".join(f"{idx}={name}" for idx, name in enumerate(schema))
+            schema_text = (
+                f" [{indexed}] source={getattr(capabilities, 'keypoint_names_source', 'unknown')}"
+            )
         self.model_capability_var.set(
             (
-                f"Task={capabilities.task} | classes={capabilities.class_count} | keypoints={capabilities.keypoint_count} "
+                f"Task={capabilities.task} | classes={capabilities.class_count} | "
+                f"keypoints={capabilities.keypoint_count}{schema_text} "
                 f"| multiclass_stats={'yes' if capabilities.supports_multiclass_stats else 'no'} | {warnings}"
             )
         )
@@ -3631,6 +4985,12 @@ class BatchProcessingWizard(tk.Toplevel):
                 group=str(item.group or ""),
                 subject_id=str(item.subject_id or ""),
                 time_point=str(item.time_point or ""),
+                metadata_sources=dict(
+                    getattr(item, "metadata_sources", {}) or {}
+                ),
+                metadata_warnings=list(
+                    getattr(item, "metadata_warnings", []) or []
+                ),
             )
             for item in self._included_queue_items()
         ]
@@ -3642,6 +5002,16 @@ class BatchProcessingWizard(tk.Toplevel):
             object_interaction_enabled=bool(self.object_interaction_enabled_var.get()),
             object_count=max(0, int(object_count)),
             include_kpss=bool(self.include_kpss_var.get()),
+            include_mixed_effects=bool(self.include_mixed_effects_var.get()),
+            auto_detect_design=bool(self.stats_auto_detect_design_var.get()),
+            categorical_factors=tuple(
+                self._parse_stats_categorical_factors(
+                    self.stats_categorical_factors_var.get()
+                )
+            ),
+            model_preflight_error=str(
+                getattr(self, "_model_preflight_error", "") or ""
+            ),
             class_count=int(getattr(capabilities, "class_count", 0) or 0),
             enabled_metrics=self._get_enabled_metric_keys(),
             metric_specs=tuple(self.METRIC_SPECS),
@@ -3750,17 +5120,62 @@ class BatchProcessingWizard(tk.Toplevel):
     @staticmethod
     def _parse_stats_categorical_factors(raw_factors: str) -> list[str]:
         tokens = [token.strip() for token in str(raw_factors or "").split(",")]
+        aliases = {
+            "group": "group",
+            "grp": "group",
+            "cohort": "group",
+            "condition": "group",
+            "treatment": "group",
+            "time": "time_point",
+            "timepoint": "time_point",
+            "tp": "time_point",
+            "visit": "time_point",
+            "subject": "subject_id",
+            "subjectid": "subject_id",
+            "subj": "subject_id",
+            "animal": "subject_id",
+            "animalid": "subject_id",
+        }
         normalized: list[str] = []
         seen: set[str] = set()
         for token in tokens:
             if not token:
                 continue
-            normalized_key = token.lower()
-            if normalized_key in seen:
+            normalized_key = (
+                token.casefold()
+                .replace(" ", "_")
+                .replace("-", "_")
+            )
+            compact_key = normalized_key.replace("_", "")
+            canonical = aliases.get(compact_key, normalized_key)
+            if canonical in seen:
                 continue
-            seen.add(normalized_key)
-            normalized.append(token)
+            seen.add(canonical)
+            normalized.append(canonical)
         return normalized
+
+    @classmethod
+    def _validated_stats_categorical_factors(
+        cls,
+        raw_factors: str,
+    ) -> list[str]:
+        factors = cls._parse_stats_categorical_factors(raw_factors)
+        unsupported = [
+            factor
+            for factor in factors
+            if factor not in {"group", "subject_id", "time_point"}
+        ]
+        if unsupported:
+            raise ValueError(
+                "Additional categorical factor(s) are not available in the batch "
+                "metadata table: "
+                + ", ".join(unsupported)
+                + ". Use Group or Time Point, or remove these entries. "
+                "Subject ID is assigned automatically as the experimental unit."
+            )
+        # Subject ID is a repeated/independent-unit identifier, not a fixed
+        # categorical comparison factor.
+        return [factor for factor in factors if factor != "subject_id"]
 
     def _build_session(self):
         active_items = self._included_queue_items()
@@ -3785,38 +5200,13 @@ class BatchProcessingWizard(tk.Toplevel):
                 25,
             ),
         )
-        max_gap_frames = max(
-            0,
-            self._parse_nonnegative_int(
-                self.max_gap_frames_var.get(),
-                "Max frame gap",
-                5,
-            ),
+        max_det = self._parse_nonnegative_int(
+            self.max_det_var.get(),
+            "Max detections per frame",
+            300,
         )
-        min_bout_frames = max(
-            1,
-            self._parse_nonnegative_int(
-                self.min_bout_frames_var.get(),
-                "Min bout duration",
-                3,
-            ),
-        )
-        roi_max_gap_frames = max(
-            0,
-            self._parse_nonnegative_int(
-                self.roi_max_gap_frames_var.get(),
-                "ROI debounce gap",
-                max_gap_frames,
-            ),
-        )
-        roi_min_dwell_frames = max(
-            1,
-            self._parse_nonnegative_int(
-                self.roi_min_dwell_frames_var.get(),
-                "Min ROI dwell",
-                min_bout_frames,
-            ),
-        )
+        if max_det < 1:
+            raise ValueError("Max detections per frame must be >= 1.")
         raw_video_fps = str(self.video_fps_var.get() or "").strip()
         if raw_video_fps:
             try:
@@ -3833,6 +5223,99 @@ class BatchProcessingWizard(tk.Toplevel):
                 )
         else:
             video_fps = 0.0
+        temporal_threshold_unit = str(
+            self.temporal_threshold_unit_var.get() or "seconds"
+        ).strip().lower()
+        if temporal_threshold_unit not in {"seconds", "frames"}:
+            temporal_threshold_unit = "seconds"
+
+        if temporal_threshold_unit == "seconds":
+            max_gap_seconds = self._parse_nonnegative_float(
+                self.max_gap_frames_var.get(),
+                "Bout gap limit",
+                0.17,
+            )
+            min_bout_seconds = self._parse_nonnegative_float(
+                self.min_bout_frames_var.get(),
+                "Minimum bout duration",
+                0.10,
+            )
+            roi_max_gap_seconds = self._parse_nonnegative_float(
+                self.roi_max_gap_frames_var.get(),
+                "ROI gap limit",
+                max_gap_seconds,
+            )
+            roi_min_dwell_seconds = self._parse_nonnegative_float(
+                self.roi_min_dwell_frames_var.get(),
+                "Minimum ROI dwell",
+                min_bout_seconds,
+            )
+            if min_bout_seconds <= 0 or roi_min_dwell_seconds <= 0:
+                raise ValueError(
+                    "Minimum bout duration and minimum ROI dwell must be greater "
+                    "than zero seconds."
+                )
+            reference_fps = video_fps if video_fps > 0 else 30.0
+            min_bout_frames = max(
+                1, int(math.ceil((min_bout_seconds * reference_fps) - 1e-12))
+            )
+            max_gap_frames = max(
+                0, int(math.floor((max_gap_seconds * reference_fps) + 1e-12))
+            )
+            roi_min_dwell_frames = max(
+                1,
+                int(
+                    math.ceil(
+                        (roi_min_dwell_seconds * reference_fps) - 1e-12
+                    )
+                ),
+            )
+            roi_max_gap_frames = max(
+                0,
+                int(
+                    math.floor(
+                        (roi_max_gap_seconds * reference_fps) + 1e-12
+                    )
+                ),
+            )
+        else:
+            max_gap_frames = max(
+                0,
+                self._parse_nonnegative_int(
+                    self.max_gap_frames_var.get(),
+                    "Bout gap limit",
+                    5,
+                ),
+            )
+            min_bout_frames = max(
+                1,
+                self._parse_nonnegative_int(
+                    self.min_bout_frames_var.get(),
+                    "Minimum bout duration",
+                    3,
+                ),
+            )
+            roi_max_gap_frames = max(
+                0,
+                self._parse_nonnegative_int(
+                    self.roi_max_gap_frames_var.get(),
+                    "ROI gap limit",
+                    max_gap_frames,
+                ),
+            )
+            roi_min_dwell_frames = max(
+                1,
+                self._parse_nonnegative_int(
+                    self.roi_min_dwell_frames_var.get(),
+                    "Minimum ROI dwell",
+                    min_bout_frames,
+                ),
+            )
+            reference_fps = video_fps if video_fps > 0 else 30.0
+            min_bout_seconds = min_bout_frames / reference_fps
+            max_gap_seconds = max_gap_frames / reference_fps
+            roi_min_dwell_seconds = roi_min_dwell_frames / reference_fps
+            roi_max_gap_seconds = roi_max_gap_frames / reference_fps
 
         model_path = str(self.model_path_var.get() or "").strip()
         if not model_path and not use_existing_labels:
@@ -3881,21 +5364,17 @@ class BatchProcessingWizard(tk.Toplevel):
         )
         if object_interaction_enabled and object_count <= 0:
             raise ValueError("Object count must be > 0 when object interaction analytics is enabled.")
-        if object_interaction_enabled and strategy == "single":
-            if not self.shared_object_rois:
-                raise ValueError("Place shared object ROIs before running object interaction analytics.")
+        if self.shared_object_rois:
             for item in active_items:
                 if not item.object_rois:
                     item.object_rois = deepcopy(self.shared_object_rois)
-        elif strategy == "single":
-            for item in active_items:
-                if (not item.object_rois) and self.shared_object_rois:
-                    item.object_rois = deepcopy(self.shared_object_rois)
-        if object_interaction_enabled and strategy != "single":
+        if object_interaction_enabled:
             missing_items = [item.video_name for item in active_items if not item.object_rois]
             if missing_items:
                 raise ValueError(
-                    f"Object interaction is enabled, but {len(missing_items)} queued video(s) do not have object ROIs."
+                    f"Object interaction is enabled, but {len(missing_items)} "
+                    "queued video(s) do not have object ROIs. Place shared "
+                    "objects or use Place Objects Across Queue."
                 )
 
         if (not use_existing_labels) and self.model_capabilities.model_path != model_path:
@@ -3908,6 +5387,29 @@ class BatchProcessingWizard(tk.Toplevel):
         elif use_existing_labels and not model_path:
             self.model_capabilities = BatchModelCapabilities(model_path="")
 
+        keypoint_names, keypoint_names_source, keypoint_schema_path = self._resolve_session_keypoint_schema(
+            self.model_capabilities
+        )
+        reported_keypoint_count = max(0, int(self.model_capabilities.keypoint_count or 0))
+        if reported_keypoint_count > 0:
+            if roi_event_mode.startswith("keypoint") and keypoint_index >= reported_keypoint_count:
+                raise ValueError(
+                    f"ROI keypoint index {keypoint_index} is out of range for this model. "
+                    f"Valid indices are 0-{reported_keypoint_count - 1}: "
+                    + ", ".join(f"{idx}={name}" for idx, name in enumerate(keypoint_names))
+                )
+            if object_interaction_enabled and object_keypoint_index >= reported_keypoint_count:
+                raise ValueError(
+                    f"Object-interaction keypoint index {object_keypoint_index} is out of range for this model. "
+                    f"Valid indices are 0-{reported_keypoint_count - 1}: "
+                    + ", ".join(f"{idx}={name}" for idx, name in enumerate(keypoint_names))
+                )
+        elif not use_existing_labels:
+            if roi_event_mode.startswith("keypoint"):
+                raise ValueError("Keypoint-based ROI entry requires a pose model with keypoints.")
+            if object_interaction_enabled:
+                raise ValueError("Object-interaction analysis requires a pose model with keypoints.")
+
         profile_path = str(self.keybind_profile_var.get() or "").strip()
         if profile_path:
             try:
@@ -3919,6 +5421,9 @@ class BatchProcessingWizard(tk.Toplevel):
             except Exception as exc:
                 self.keybind_status_var.set(f"Keybind profile load failed; using current/default. ({exc})")
 
+        stats_categorical_factors = self._validated_stats_categorical_factors(
+            self.stats_categorical_factors_var.get()
+        )
         session = self.service.build_session(
             source_path=self.source_path_var.get(),
             roi_strategy=strategy,
@@ -3944,21 +5449,39 @@ class BatchProcessingWizard(tk.Toplevel):
             use_existing_labels=use_existing_labels,
             existing_labels_root=existing_labels_root,
             inference_batch_size=inference_batch_size,
+            max_det=max_det,
             tracker_enabled=bool(self.tracker_enabled_var.get()),
             tracker_config_path=str(self.tracker_config_path_var.get() or "").strip(),
             min_bout_frames=min_bout_frames,
             max_gap_frames=max_gap_frames,
+            behavior_bout_class_mode=(
+                "multi_label"
+                if str(self.behavior_bout_class_mode_var.get())
+                .strip()
+                .casefold()
+                .startswith("multi-label")
+                else "mutually_exclusive"
+            ),
             roi_min_dwell_frames=roi_min_dwell_frames,
             roi_max_gap_frames=roi_max_gap_frames,
+            temporal_threshold_unit=temporal_threshold_unit,
+            min_bout_seconds=min_bout_seconds,
+            max_gap_seconds=max_gap_seconds,
+            roi_min_dwell_seconds=roi_min_dwell_seconds,
+            roi_max_gap_seconds=roi_max_gap_seconds,
             video_fps=video_fps,
             save_annotated_video=bool(self.save_annotated_var.get()),
             save_confidence=False,
-            review_policy=str(self.review_policy_var.get() or "after_all").strip(),
+            review_policy=self._review_policy_key(self.review_policy_var.get()),
             stats_correction=str(self.stats_correction_var.get() or "fdr_bh").strip(),
-            stats_categorical_factors=self._parse_stats_categorical_factors(self.stats_categorical_factors_var.get()),
+            stats_categorical_factors=stats_categorical_factors,
+            stats_auto_detect_design=bool(
+                self.stats_auto_detect_design_var.get()
+            ),
             analytics_assay_preset=str(self.app.config.analytics.assay_preset_var.get() or "custom").strip() or "custom",
             analytics_enabled_metrics=sorted(self._get_enabled_metric_keys()),
             analytics_enabled_modules=sorted(self._get_preflight_enabled_modules()),
+            include_mixed_effects=bool(self.include_mixed_effects_var.get()),
             include_kpss=bool(self.include_kpss_var.get()),
             figure_output_preset=self._get_figure_output_preset_key(),
             export_publication_figures=bool(self.export_publication_figures_var.get()),
@@ -3973,6 +5496,9 @@ class BatchProcessingWizard(tk.Toplevel):
             keybind_profile_path=profile_path,
             roi_name_templates=self._get_roi_name_templates(),
             object_name_templates=self._get_object_name_templates(),
+            keypoint_names=keypoint_names,
+            keypoint_names_source=keypoint_names_source,
+            keypoint_schema_path=keypoint_schema_path,
         )
         self._current_session = session
         self._refresh_queue_tree()
@@ -4035,6 +5561,7 @@ class BatchProcessingWizard(tk.Toplevel):
                     effective_device = ""
             self.inference_device_var.set(effective_device)
             self.inference_batch_size_var.set(str(int(getattr(session, "inference_batch_size", 25) or 25)))
+            self.max_det_var.set(str(max(1, int(getattr(session, "max_det", 300) or 300))))
             self.output_path_var.set(str(session.output_path or ""))
             self.yaml_path_var.set(str(session.yaml_path or ""))
             self.keybind_profile_var.set(str(session.keybind_profile_path or ""))
@@ -4057,9 +5584,17 @@ class BatchProcessingWizard(tk.Toplevel):
             self.tracker_config_path_var.set(str(getattr(session, "tracker_config_path", "") or "botsort.yaml"))
             self.save_annotated_var.set(bool(session.save_annotated_video))
             self.save_confidence_var.set(False)
-            self.review_policy_var.set(str(session.review_policy or "after_all"))
+            self.review_policy_var.set(
+                self._review_policy_label(session.review_policy)
+            )
             self.stats_correction_var.set(str(session.stats_correction or "fdr_bh"))
             self.stats_categorical_factors_var.set(",".join(session.stats_categorical_factors or []))
+            self.stats_auto_detect_design_var.set(
+                bool(getattr(session, "stats_auto_detect_design", True))
+            )
+            self.include_mixed_effects_var.set(
+                bool(getattr(session, "include_mixed_effects", True))
+            )
             self.include_kpss_var.set(bool(session.include_kpss))
             self._set_figure_output_preset_from_key(
                 str(getattr(session, "figure_output_preset", "publication_dashboard") or "publication_dashboard")
@@ -4069,20 +5604,72 @@ class BatchProcessingWizard(tk.Toplevel):
             self.export_group_stats_overview_var.set(bool(getattr(session, "export_group_stats_overview", True)))
             self.export_individual_profiles_var.set(bool(getattr(session, "export_individual_profiles", False)))
             self.export_module_archive_var.set(bool(getattr(session, "export_module_archive", False)))
-            self.generate_video_quicklooks_var.set(bool(getattr(session, "generate_video_quicklooks", False)))
+            self.generate_video_quicklooks_var.set(bool(getattr(session, "generate_video_quicklooks", True)))
             self.single_animal_mode_var.set(bool(session.single_animal_mode))
-            loaded_bout_gap = getattr(session, "max_gap_frames", 5)
-            if loaded_bout_gap is None:
-                loaded_bout_gap = 5
-            self.max_gap_frames_var.set(str(int(loaded_bout_gap)))
-            self.min_bout_frames_var.set(str(int(getattr(session, "min_bout_frames", 3) or 3)))
-            loaded_roi_gap = getattr(session, "roi_max_gap_frames", getattr(session, "max_gap_frames", 5))
-            if loaded_roi_gap is None:
-                loaded_roi_gap = getattr(session, "max_gap_frames", 5)
-            self.roi_max_gap_frames_var.set(str(int(loaded_roi_gap)))
-            self.roi_min_dwell_frames_var.set(
-                str(int(getattr(session, "roi_min_dwell_frames", getattr(session, "min_bout_frames", 3)) or 3))
+            self.behavior_bout_class_mode_var.set(
+                "Multi-label (allow overlapping classes)"
+                if str(
+                    getattr(
+                        session,
+                        "behavior_bout_class_mode",
+                        "mutually_exclusive",
+                    )
+                    or "mutually_exclusive"
+                )
+                .strip()
+                .casefold()
+                == "multi_label"
+                else "Mutually exclusive (one class per frame)"
             )
+            loaded_temporal_unit = str(
+                getattr(session, "temporal_threshold_unit", "frames") or "frames"
+            ).strip().lower()
+            loaded_temporal_unit = (
+                "seconds" if loaded_temporal_unit == "seconds" else "frames"
+            )
+            self.temporal_threshold_unit_var.set(loaded_temporal_unit)
+            self._last_temporal_threshold_unit = loaded_temporal_unit
+            if loaded_temporal_unit == "seconds":
+                self.max_gap_frames_var.set(
+                    f"{float(getattr(session, 'max_gap_seconds', 0.17) or 0.0):g}"
+                )
+                self.min_bout_frames_var.set(
+                    f"{float(getattr(session, 'min_bout_seconds', 0.10) or 0.10):g}"
+                )
+                self.roi_max_gap_frames_var.set(
+                    f"{float(getattr(session, 'roi_max_gap_seconds', 0.17) or 0.0):g}"
+                )
+                self.roi_min_dwell_frames_var.set(
+                    f"{float(getattr(session, 'roi_min_dwell_seconds', 0.10) or 0.10):g}"
+                )
+            else:
+                loaded_bout_gap = getattr(session, "max_gap_frames", 5)
+                if loaded_bout_gap is None:
+                    loaded_bout_gap = 5
+                self.max_gap_frames_var.set(str(int(loaded_bout_gap)))
+                self.min_bout_frames_var.set(
+                    str(int(getattr(session, "min_bout_frames", 3) or 3))
+                )
+                loaded_roi_gap = getattr(
+                    session,
+                    "roi_max_gap_frames",
+                    getattr(session, "max_gap_frames", 5),
+                )
+                if loaded_roi_gap is None:
+                    loaded_roi_gap = getattr(session, "max_gap_frames", 5)
+                self.roi_max_gap_frames_var.set(str(int(loaded_roi_gap)))
+                self.roi_min_dwell_frames_var.set(
+                    str(
+                        int(
+                            getattr(
+                                session,
+                                "roi_min_dwell_frames",
+                                getattr(session, "min_bout_frames", 3),
+                            )
+                            or 3
+                        )
+                    )
+                )
             loaded_video_fps = float(getattr(session, "video_fps", 0.0) or 0.0)
             self.video_fps_var.set(f"{loaded_video_fps:g}" if loaded_video_fps > 0 else "")
             enabled_modules = {
@@ -4134,6 +5721,7 @@ class BatchProcessingWizard(tk.Toplevel):
             self._refresh_roi_event_controls()
         finally:
             self._suspend_dirty_tracking = False
+        self._refresh_results_status()
 
     def _warn_about_missing_session_paths(self, session) -> None:
         """Surface a non-blocking dialog listing paths that don't exist.
@@ -4192,8 +5780,8 @@ class BatchProcessingWizard(tk.Toplevel):
         lines.append(
             "Tip: keep your session JSON in the same folder as the data it "
             "references. The wizard stores paths relative to the session "
-            "file's location when possible, so a session + data folder "
-            "shared together usually 'just works' on a collaborator's machine."
+            "file's location when possible. Share the session file and its "
+            "referenced data folder together to preserve those relative paths."
         )
         messagebox.showwarning(
             "Session paths missing on this machine",
@@ -4272,12 +5860,21 @@ class BatchProcessingWizard(tk.Toplevel):
         self._refresh_queue_tree()
 
     @staticmethod
-    def _classify_batch_finish(cancelled: bool, message: str) -> str:
+    def _classify_batch_finish(
+        cancelled: bool,
+        message: str = "",
+        payload: dict | None = None,
+    ) -> str:
+        """Resolve the explicit pipeline outcome, with legacy cancellation fallback."""
+        raw_status = str((payload or {}).get("status", "") or "").strip().lower()
+        valid_statuses = {status.value for status in OperationStatus}
         if cancelled:
-            return "cancelled"
-        if str(message or "").strip().lower().startswith("batch run failed"):
-            return "failed"
-        return "success"
+            return OperationStatus.CANCELLED.value
+        if raw_status in valid_statuses:
+            return raw_status
+        # Older service implementations did not provide a status. Preserve
+        # their successful callback behavior without parsing human messages.
+        return OperationStatus.SUCCESS.value
 
     def _on_batch_finish(self, session, cancelled: bool, message: str, payload: dict | None) -> None:
         self._current_session = session
@@ -4287,7 +5884,7 @@ class BatchProcessingWizard(tk.Toplevel):
         if session_json_path:
             self._mark_session_clean(session_json_path)
         workbook_path = str((payload or {}).get("workbook_path", "")).strip()
-        finish_state = self._classify_batch_finish(cancelled, message)
+        finish_state = self._classify_batch_finish(cancelled, message, payload)
         if workbook_path:
             self.progress_text_var.set(f"{message} Workbook: {workbook_path}")
         else:
@@ -4295,21 +5892,29 @@ class BatchProcessingWizard(tk.Toplevel):
         self.run_button.config(state=tk.NORMAL)
         self.resume_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
+        if hasattr(self, "finalize_button"):
+            self.finalize_button.config(state=tk.NORMAL)
+        if hasattr(self, "review_button"):
+            self.review_button.config(state=tk.NORMAL)
+        if hasattr(self, "review_roi_button"):
+            self.review_roi_button.config(state=tk.NORMAL)
         if finish_state == "cancelled":
             self.app.log_message("Batch run cancelled by user.", "WARNING")
         elif finish_state == "failed":
             self.app.log_message(message, "ERROR")
+        elif finish_state == "partial":
+            self.app.log_message(message, "WARNING")
         else:
             self.app.log_message("Batch run completed.", "INFO")
         if workbook_path:
             message = f"{message}\n\nWorkbook: {workbook_path}"
-        if finish_state == "cancelled":
+        if finish_state in {"cancelled", "partial"}:
             messagebox.showwarning("Batch Processing", message, parent=self)
         elif finish_state == "failed":
             messagebox.showerror("Batch Processing", message, parent=self)
         else:
             messagebox.showinfo("Batch Processing", message, parent=self)
-        if finish_state == "success" and str(session.review_policy).strip().lower() == "after_all":
+        if finish_state in {"success", "partial"} and str(session.review_policy).strip().lower() == "after_all":
             queued = [
                 item
                 for item in self.queue_items
@@ -4329,12 +5934,155 @@ class BatchProcessingWizard(tk.Toplevel):
                     except Exception:
                         pass
                     self._open_selected_video_review()
+        if all(
+            hasattr(self, name)
+            for name in ("output_path_var", "results_status_var", "service")
+        ):
+            self._refresh_results_status()
 
     def _start_batch_run(self) -> None:
         self._launch_batch_run(resume=False)
 
     def _start_batch_resume(self) -> None:
         self._launch_batch_run(resume=True)
+
+    def _on_finalization_finish(
+        self,
+        session,
+        cancelled: bool,
+        message: str,
+        payload: dict | None,
+    ) -> None:
+        self._current_session = session
+        self._last_run_payload = payload
+        self._refresh_queue_tree()
+        session_json_path = str(
+            (payload or {}).get("session_json_path", "") or ""
+        ).strip()
+        if session_json_path:
+            self._mark_session_clean(session_json_path)
+        workbook_path = str(
+            (payload or {}).get("workbook_path", "") or ""
+        ).strip()
+        finish_state = self._classify_batch_finish(cancelled, message, payload)
+        self.run_button.config(state=tk.NORMAL)
+        self.resume_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+        self.finalize_button.config(state=tk.NORMAL)
+        self.review_button.config(state=tk.NORMAL)
+        self.review_roi_button.config(state=tk.NORMAL)
+        self._refresh_results_status()
+
+        if workbook_path:
+            self.progress_text_var.set(
+                f"{message} Final workbook: {workbook_path}"
+            )
+            display_message = f"{message}\n\nFinal workbook: {workbook_path}"
+        else:
+            self.progress_text_var.set(message)
+            display_message = message
+
+        if finish_state == "cancelled":
+            self.app.log_message("Batch result finalization cancelled.", "WARNING")
+            messagebox.showwarning(
+                "Finalize Reviewed Results", display_message, parent=self
+            )
+        elif finish_state == "failed":
+            self.app.log_message(message, "ERROR")
+            messagebox.showerror(
+                "Finalize Reviewed Results", display_message, parent=self
+            )
+        else:
+            self.app.log_message(
+                "Batch results finalized from authoritative outputs.", "INFO"
+            )
+            messagebox.showinfo(
+                "Finalize Reviewed Results", display_message, parent=self
+            )
+
+    def _start_finalize_reviewed_results(self) -> None:
+        if self.service.is_running():
+            messagebox.showwarning(
+                "Finalize Reviewed Results",
+                "Wait for the current batch operation to finish first.",
+                parent=self,
+            )
+            return
+        try:
+            session = self._build_session()
+            for item in session.videos or []:
+                if not bool(getattr(item, "excluded", False)):
+                    self._refresh_item_review_status(item)
+            policy = str(session.review_policy or "after_all").strip().lower()
+            if policy != "skip":
+                pending = [
+                    item
+                    for item in session.videos or []
+                    if not bool(getattr(item, "excluded", False))
+                    and (
+                        str(getattr(item, "bout_review_status", "") or "").strip()
+                        not in {"completed", "not_required"}
+                        or str(
+                            getattr(item, "roi_review_status", "") or ""
+                        ).strip()
+                        not in {"completed", "not_required"}
+                    )
+                ]
+                if pending:
+                    preview = "\n".join(
+                        f"- {item.video_name}: bouts={item.bout_review_status}, "
+                        f"ROI={item.roi_review_status}"
+                        for item in pending[:8]
+                    )
+                    if len(pending) > 8:
+                        preview += f"\n- ...and {len(pending) - 8} more"
+                    messagebox.showwarning(
+                        "Finalize Reviewed Results",
+                        "Required reviews are still incomplete:\n"
+                        f"{preview}\n\nFinish these reviews before finalizing.",
+                        parent=self,
+                    )
+                    self._refresh_queue_tree()
+                    self._refresh_results_status()
+                    return
+            saved_path = self.service.save_session(
+                session,
+                file_path=self._session_file_path
+                or self._default_session_save_path(),
+            )
+            self._mark_session_clean(str(saved_path))
+        except Exception as exc:
+            messagebox.showerror(
+                "Finalize Reviewed Results", str(exc), parent=self
+            )
+            return
+
+        started = self.service.start_finalize_reviewed_results(
+            session,
+            on_progress=self._on_batch_progress,
+            on_finish=self._on_finalization_finish,
+        )
+        if not started:
+            messagebox.showwarning(
+                "Finalize Reviewed Results",
+                "A batch operation is already in progress.",
+                parent=self,
+            )
+            return
+        self.progress_bar["value"] = 0
+        self.progress_text_var.set(
+            "Validating reviews before rebuilding batch results..."
+        )
+        self.results_status_var.set(
+            "FINALIZING: Rebuilding workbook, statistics, and figures from "
+            "authoritative outputs."
+        )
+        self.run_button.config(state=tk.DISABLED)
+        self.resume_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL)
+        self.finalize_button.config(state=tk.DISABLED)
+        self.review_button.config(state=tk.DISABLED)
+        self.review_roi_button.config(state=tk.DISABLED)
 
     def _launch_batch_run(self, *, resume: bool) -> None:
         context_label = "resuming the batch run" if resume else "starting the batch run"
@@ -4386,6 +6134,12 @@ class BatchProcessingWizard(tk.Toplevel):
         self.run_button.config(state=tk.DISABLED)
         self.resume_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
+        if hasattr(self, "finalize_button"):
+            self.finalize_button.config(state=tk.DISABLED)
+        if hasattr(self, "review_button"):
+            self.review_button.config(state=tk.DISABLED)
+        if hasattr(self, "review_roi_button"):
+            self.review_roi_button.config(state=tk.DISABLED)
         self.app.log_message("Resumed batch run." if resume else "Started batch run.", "INFO")
 
     def _stop_batch_run(self) -> None:
@@ -4432,22 +6186,281 @@ class BatchProcessingWizard(tk.Toplevel):
         return base_dir / f"{Path(item.video_path).stem}_roi_event_review.csv"
 
     @staticmethod
+    def _reviewed_roi_validation_path(item: BatchVideoItem) -> Path:
+        base_dir = Path(str(item.analytics_output_dir or "").strip())
+        return base_dir / f"{Path(item.video_path).stem}_reviewed_roi_validation.json"
+
+    @staticmethod
     def _roi_events_source_path(item: BatchVideoItem) -> Path:
         base_dir = Path(str(item.analytics_output_dir or "").strip())
         return base_dir / f"{Path(item.video_path).stem}_roi_events.csv"
 
     @staticmethod
     def _is_bout_review_complete(review_df: pd.DataFrame | None) -> bool:
-        if review_df is None or review_df.empty or "status" not in review_df.columns:
+        if review_df is None or review_df.empty or "Bout ID" not in review_df.columns:
             return False
-        return int((review_df["status"].astype(str) == "unreviewed").sum()) == 0
+        bout_ids = review_df["Bout ID"].astype(str).str.strip()
+        if (bout_ids == "").any() or bout_ids.duplicated().any():
+            return False
+        status_column = "status" if "status" in review_df.columns else "Review Status"
+        if status_column not in review_df.columns:
+            return False
+        statuses = review_df[status_column].astype(str).str.strip().str.lower()
+        return bool(statuses.isin({"confirmed", "rejected", "corrected"}).all())
+
+    def _load_bout_review_status_table(self, item: BatchVideoItem) -> pd.DataFrame | None:
+        detailed_path = Path(str(item.detailed_bouts_csv or "").strip()).expanduser()
+        if not detailed_path.is_file():
+            return None
+        try:
+            raw_source = pd.read_csv(detailed_path)
+            raw = normalize_detected_bouts(raw_source, source_video=item.video_path)
+            paths = BoutReviewPaths.from_authoritative(self._review_bouts_autosave_path(item))
+            if paths.decisions.is_file() or paths.workspace.is_file():
+                decisions = load_review_decisions(paths.authoritative)
+                return build_review_workspace(raw, decisions)
+            if not paths.authoritative.is_file():
+                return None
+            saved = pd.read_csv(paths.authoritative)
+            # Canonical authoritative outputs contain stable IDs and only exist
+            # after all raw bouts have terminal decisions. A legacy state table
+            # is migrated against the raw rows before it can count as complete.
+            if "status" not in saved.columns and "Bout ID" in saved.columns:
+                if "Review Status" not in saved.columns:
+                    return None
+                return saved
+            migrated = migrate_legacy_review_workspace(
+                raw,
+                saved,
+                source_video=item.video_path,
+            )
+            return normalize_bout_confirmation_dataframe(migrated)
+        except Exception as exc:
+            try:
+                self._log(f"Bout review status could not be validated for {item.video_name}: {exc}", "WARNING")
+            except Exception:
+                pass
+            return None
 
     @staticmethod
     def _is_roi_review_complete(review_df: pd.DataFrame | None) -> bool:
         if review_df is None or review_df.empty or "Review Status" not in review_df.columns:
             return False
-        unresolved = review_df["Review Status"].astype(str).str.strip().replace("", "detected")
-        return int((unresolved == "detected").sum()) == 0
+        statuses = (
+            review_df["Review Status"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .replace("", "detected")
+        )
+        return bool(statuses.isin({"confirmed", "corrected"}).all())
+
+    def _is_roi_review_materialized(self, item: BatchVideoItem) -> bool:
+        validation_path = self._reviewed_roi_validation_path(item)
+        if not validation_path.is_file():
+            return False
+        try:
+            payload = json.loads(validation_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        return str(payload.get("status", "")).strip() in {"valid", "valid_empty"}
+
+    @staticmethod
+    def _read_optional_csv(path_value: object) -> pd.DataFrame:
+        path_text = str(path_value or "").strip()
+        if not path_text:
+            return pd.DataFrame()
+        path = Path(path_text).expanduser()
+        if not path.is_file():
+            return pd.DataFrame()
+        try:
+            return pd.read_csv(path)
+        except Exception:
+            return pd.DataFrame()
+
+    @staticmethod
+    def _csv_requires_review(path_value: object) -> bool:
+        """Treat unreadable sources as requiring attention; empty tables do not."""
+
+        path_text = str(path_value or "").strip()
+        if not path_text:
+            return False
+        path = Path(path_text).expanduser()
+        if not path.is_file():
+            return False
+        try:
+            # Review eligibility only needs to know whether one data row
+            # exists. Avoid loading a potentially multi-million-row
+            # batch_results.csv into the Tk event loop.
+            return not pd.read_csv(path, nrows=1).empty
+        except pd.errors.EmptyDataError:
+            return False
+        except Exception:
+            return True
+
+    def _integrated_behavior_review_required(
+        self,
+        item: BatchVideoItem,
+    ) -> bool:
+        output_dir = Path(str(item.analytics_output_dir or "")).expanduser()
+        manifest_path = output_dir / "run_manifest.json"
+        if not manifest_path.is_file():
+            return False
+        try:
+            manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8-sig")
+            )
+        except Exception:
+            return False
+        outputs = (
+            manifest.get("outputs")
+            if isinstance(manifest.get("outputs"), dict)
+            else {}
+        )
+        video_payload = (
+            manifest.get("video")
+            if isinstance(manifest.get("video"), dict)
+            else {}
+        )
+        base_name = str(video_payload.get("base_name") or "").strip()
+        candidates = [
+            outputs.get("raw_detailed_bouts_csv"),
+            outputs.get("detailed_bouts_csv"),
+            outputs.get("batch_results_csv"),
+            output_dir / f"{base_name}_detailed_bouts.csv"
+            if base_name
+            else "",
+            output_dir / "batch_results.csv",
+        ]
+        for raw_path in candidates:
+            text = str(raw_path or "").strip()
+            if not text:
+                continue
+            candidate = Path(text).expanduser()
+            if not candidate.is_absolute():
+                candidate = output_dir / candidate
+            if not candidate.is_file():
+                portable = output_dir / candidate.name
+                candidate = portable if portable.is_file() else candidate
+            if self._csv_requires_review(candidate):
+                return True
+        return False
+
+    def _integrated_spatial_review_required(
+        self,
+        item: BatchVideoItem,
+    ) -> bool:
+        output_dir = Path(str(item.analytics_output_dir or "")).expanduser()
+        manifest_path = output_dir / "run_manifest.json"
+        if not manifest_path.is_file():
+            return False
+        try:
+            manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8-sig")
+            )
+        except Exception:
+            return False
+        outputs = (
+            manifest.get("outputs")
+            if isinstance(manifest.get("outputs"), dict)
+            else {}
+        )
+        roi_files = (
+            outputs.get("raw_roi_metrics_files")
+            if isinstance(outputs.get("raw_roi_metrics_files"), dict)
+            else outputs.get("roi_metrics_files")
+            if isinstance(outputs.get("roi_metrics_files"), dict)
+            else {}
+        )
+        object_files = (
+            outputs.get("raw_object_interaction_files")
+            if isinstance(outputs.get("raw_object_interaction_files"), dict)
+            else outputs.get("object_interaction_files")
+            if isinstance(outputs.get("object_interaction_files"), dict)
+            else {}
+        )
+        candidates = [
+            roi_files.get("dwell_events"),
+            roi_files.get("exclusive_dwell_events"),
+            object_files.get("dwell_events"),
+        ]
+        for raw_path in candidates:
+            text = str(raw_path or "").strip()
+            if not text:
+                continue
+            candidate = Path(text).expanduser()
+            if not candidate.is_absolute():
+                candidate = output_dir / candidate
+            if not candidate.is_file():
+                portable = output_dir / candidate.name
+                candidate = portable if portable.is_file() else candidate
+            if self._csv_requires_review(candidate):
+                return True
+        return False
+
+    def _materialize_completed_roi_review(
+        self,
+        item: BatchVideoItem,
+        review_df: pd.DataFrame,
+    ) -> dict[str, Any]:
+        if not self._is_roi_review_complete(review_df):
+            raise ROIReviewValidationError(
+                "Every ROI event must be confirmed or corrected before finalization."
+            )
+        output_dir = Path(str(item.analytics_output_dir or "").strip()).expanduser()
+        manifest_path = output_dir / "run_manifest.json"
+        if not manifest_path.is_file():
+            raise ROIReviewValidationError(
+                f"Cannot finalize ROI review because the run manifest is missing: {manifest_path}"
+            )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ROIReviewValidationError(
+                f"Cannot read ROI run manifest {manifest_path}: {exc}"
+            ) from exc
+        parameters = manifest.get("parameters") if isinstance(manifest.get("parameters"), dict) else {}
+        outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
+        roi_files = (
+            outputs.get("raw_roi_metrics_files")
+            if isinstance(outputs.get("raw_roi_metrics_files"), dict)
+            else outputs.get("roi_metrics_files")
+            if isinstance(outputs.get("roi_metrics_files"), dict)
+            else {}
+        )
+        overview_path = (
+            roi_files.get("exclusive_entries_exits")
+            or roi_files.get("entries_exits")
+            or ""
+        )
+        per_track_path = (
+            roi_files.get("exclusive_entries_exits_by_track")
+            or roi_files.get("entries_exits_by_track")
+            or ""
+        )
+        artifacts = save_reviewed_roi_bundle(
+            review_df,
+            output_dir=output_dir,
+            video_name=Path(item.video_path).stem,
+            fps=float(parameters.get("fps") or 0.0),
+            min_dwell_frames=max(
+                1,
+                int(parameters.get("roi_min_dwell_frames") or 1),
+            ),
+            max_gap_frames=max(
+                0,
+                int(parameters.get("roi_max_gap_frames") or 0),
+            ),
+            raw_overview_df=self._read_optional_csv(overview_path),
+            raw_per_track_df=self._read_optional_csv(per_track_path),
+        )
+        updated_manifest = register_authoritative_roi_review_in_manifest(
+            manifest,
+            artifacts,
+            review_workspace_path=str(self._review_roi_autosave_path(item)),
+        )
+        safe_write_json(manifest_path, updated_manifest, indent=2)
+        return artifacts
 
     @staticmethod
     def _combine_review_status(bout_status: str, roi_status: str) -> str:
@@ -4473,21 +6486,28 @@ class BatchProcessingWizard(tk.Toplevel):
 
     def _refresh_item_review_status(self, item: BatchVideoItem) -> None:
         if str(item.review_status or "").strip() == "skipped":
-            item.bout_review_status = "skipped"
-            item.roi_review_status = "skipped"
-            return
+            active_policy = "skip"
+            if hasattr(self, "review_policy_var"):
+                active_policy = self._review_policy_key(
+                    self.review_policy_var.get()
+                )
+            if active_policy == "skip":
+                item.bout_review_status = "skipped"
+                item.roi_review_status = "skipped"
+                return
+            item.review_status = "pending"
+            item.bout_review_status = "pending"
+            item.roi_review_status = "pending"
 
-        bout_required = bool(str(item.detailed_bouts_csv or "").strip())
+        bout_required = self._csv_requires_review(
+            item.detailed_bouts_csv
+        ) or self._integrated_behavior_review_required(item)
         roi_source_path = self._roi_events_source_path(item)
-        roi_required = roi_source_path.is_file()
+        roi_required = self._csv_requires_review(
+            roi_source_path
+        ) or self._integrated_spatial_review_required(item)
 
-        bout_review_df = None
-        bout_autosave = self._review_bouts_autosave_path(item)
-        if bout_autosave.is_file():
-            try:
-                bout_review_df = normalize_bout_confirmation_dataframe(pd.read_csv(bout_autosave))
-            except Exception:
-                bout_review_df = None
+        bout_review_df = self._load_bout_review_status_table(item)
 
         roi_review_df = None
         roi_autosave = self._review_roi_autosave_path(item)
@@ -4496,6 +6516,21 @@ class BatchProcessingWizard(tk.Toplevel):
                 roi_review_df = normalize_roi_event_dataframe(pd.read_csv(roi_autosave))
             except Exception:
                 roi_review_df = None
+        integrated_status: dict[str, Any] = {}
+        integrated_status_path = (
+            Path(str(item.analytics_output_dir or ""))
+            / "bout_review_workspace"
+            / "last_review_status.json"
+        )
+        if integrated_status_path.is_file():
+            try:
+                payload = json.loads(
+                    integrated_status_path.read_text(encoding="utf-8-sig")
+                )
+                if isinstance(payload, dict):
+                    integrated_status = payload
+            except Exception:
+                integrated_status = {}
 
         if not bout_required and not roi_required:
             item.bout_review_status = "not_required"
@@ -4503,18 +6538,57 @@ class BatchProcessingWizard(tk.Toplevel):
             item.review_status = "not_required"
             return
 
-        bout_done = (not bout_required) or self._is_bout_review_complete(bout_review_df)
-        roi_done = (not roi_required) or self._is_roi_review_complete(roi_review_df)
+        integrated_bout = str(
+            integrated_status.get("behavior", "")
+        ).strip().casefold()
+        integrated_roi = str(
+            integrated_status.get(
+                "spatial",
+                integrated_status.get("roi", ""),
+            )
+        ).strip().casefold()
+        bout_done = (
+            (not bout_required)
+            or integrated_bout == "complete"
+            or self._is_bout_review_complete(bout_review_df)
+        )
+        roi_review_complete = self._is_roi_review_complete(roi_review_df)
+        roi_done = (
+            (not roi_required)
+            or integrated_roi == "complete"
+            or (
+                roi_review_complete
+                and self._is_roi_review_materialized(item)
+            )
+        )
 
         item.bout_review_status = (
             "not_required"
             if not bout_required
-            else ("completed" if bout_done else ("in_progress" if bout_review_df is not None else "queued"))
+            else (
+                "completed"
+                if bout_done
+                else (
+                    "in_progress"
+                    if bout_review_df is not None
+                    or integrated_bout == "provisional"
+                    else "queued"
+                )
+            )
         )
         item.roi_review_status = (
             "not_required"
             if not roi_required
-            else ("completed" if roi_done else ("in_progress" if roi_review_df is not None else "queued"))
+            else (
+                "completed"
+                if roi_done
+                else (
+                    "in_progress"
+                    if roi_review_df is not None
+                    or integrated_roi == "provisional"
+                    else "queued"
+                )
+            )
         )
 
         if bout_done and roi_done:
@@ -4524,7 +6598,133 @@ class BatchProcessingWizard(tk.Toplevel):
 
         item.review_status = self._combine_review_status(item.bout_review_status, item.roi_review_status)
 
+    def _launch_integrated_review_for_item(
+        self,
+        item: BatchVideoItem,
+        *,
+        mode: str,
+        event_kind: str,
+        wait: bool,
+    ) -> bool:
+        manifest_path = (
+            Path(str(item.analytics_output_dir or "")) / "run_manifest.json"
+        )
+        if not manifest_path.is_file():
+            return False
+
+        if mode == BEHAVIOR_MODE:
+            item.bout_review_status = "in_progress"
+        else:
+            item.roi_review_status = "in_progress"
+        item.review_status = self._combine_review_status(
+            item.bout_review_status,
+            item.roi_review_status,
+        )
+        self._refresh_queue_tree()
+
+        def _on_exit(return_code: int, status: dict[str, Any]) -> None:
+            if return_code != 0:
+                self._log(
+                    f"Integrated review workspace exited with code "
+                    f"{return_code} for {item.video_name}.",
+                    "ERROR",
+                )
+                messagebox.showerror(
+                    "Batch Review",
+                    "The integrated review workspace closed unexpectedly for "
+                    f"{item.video_name} (exit code {return_code}). SQLite edits "
+                    "already committed remain recoverable.",
+                    parent=self,
+                )
+                return
+            status_key = "behavior" if mode == BEHAVIOR_MODE else "spatial"
+            final_status = str(
+                status.get(status_key, "provisional") if status else "provisional"
+            )
+            if mode == BEHAVIOR_MODE:
+                item.bout_review_status = (
+                    "completed" if final_status == "complete" else "in_progress"
+                )
+            else:
+                item.roi_review_status = (
+                    "completed" if final_status == "complete" else "in_progress"
+                )
+            if final_status == "complete":
+                try:
+                    manifest = json.loads(
+                        manifest_path.read_text(encoding="utf-8-sig")
+                    )
+                    outputs = (
+                        manifest.get("outputs")
+                        if isinstance(manifest.get("outputs"), dict)
+                        else {}
+                    )
+                    if mode == BEHAVIOR_MODE:
+                        item.detailed_bouts_csv = str(
+                            outputs.get("reviewed_bouts_csv")
+                            or outputs.get("detailed_bouts_csv")
+                            or item.detailed_bouts_csv
+                        )
+                        item.summary_bouts_csv = str(
+                            outputs.get("reviewed_bouts_summary_csv")
+                            or outputs.get("summary_csv")
+                            or item.summary_bouts_csv
+                        )
+                    self._mark_batch_results_stale(
+                        reason=f"Integrated review changed {item.video_name}."
+                    )
+                except Exception as exc:
+                    self._log(
+                        "Review completed but the batch queue could not reload "
+                        f"{item.video_name}'s manifest: {exc}",
+                        "WARNING",
+                    )
+            item.review_status = self._combine_review_status(
+                item.bout_review_status,
+                item.roi_review_status,
+            )
+            self._refresh_queue_tree()
+            self._mark_session_dirty()
+
+        try:
+            launch_reviewer(
+                self,
+                manifest_path,
+                mode=mode,
+                event_kind=event_kind,
+                wait=wait,
+                on_exit=_on_exit,
+            )
+        except ReviewLaunchError as exc:
+            message = str(exc)
+            if "already open" in message.casefold():
+                messagebox.showwarning(
+                    "Batch Review",
+                    message,
+                    parent=self,
+                )
+                return True
+            self._log(
+                "Integrated reviewer unavailable; opening the legacy batch "
+                f"reviewer for {item.video_name}: {exc}",
+                "WARNING",
+            )
+            return False
+        return True
+
     def _open_video_review_for_item(self, item: BatchVideoItem, *, wait: bool = False) -> bool:
+        # Prefer the run-manifest adapter before touching queue-cached paths.
+        # Those cached absolute paths may be stale after a batch folder moves
+        # to another computer, while the integrated loader can recover the
+        # analytics tables from project-relative manifest fallbacks.
+        if self._launch_integrated_review_for_item(
+            item,
+            mode=BEHAVIOR_MODE,
+            event_kind=BEHAVIOR,
+            wait=wait,
+        ):
+            return True
+
         detailed_csv = str(item.detailed_bouts_csv or "").strip()
         if not detailed_csv:
             messagebox.showwarning("Batch Review", "No detailed bouts CSV found for this video yet.", parent=self)
@@ -4548,13 +6748,6 @@ class BatchProcessingWizard(tk.Toplevel):
         keybinds = self._resolve_review_keybinds()
         behavior_map = self._build_behavior_map(bouts_df)
         autosave_path = self._review_bouts_autosave_path(item)
-        if autosave_path.is_file():
-            try:
-                reviewed_df = pd.read_csv(autosave_path)
-                if not reviewed_df.empty:
-                    bouts_df = reviewed_df
-            except Exception:
-                pass
 
         def _on_review_saved(review_df: pd.DataFrame) -> None:
             try:
@@ -4563,6 +6756,34 @@ class BatchProcessingWizard(tk.Toplevel):
                 self._mark_session_dirty()
             except Exception:
                 pass
+
+        def _on_save_result(result) -> None:
+            if result.succeeded:
+                item.bout_review_status = "completed"
+                manifest_path = Path(str(item.analytics_output_dir or "")) / "run_manifest.json"
+                if manifest_path.is_file():
+                    try:
+                        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                        manifest = register_authoritative_review_in_manifest(
+                            manifest,
+                            result.artifacts,
+                        )
+                        safe_write_json(manifest_path, manifest, indent=2)
+                    except Exception as exc:
+                        self._log(
+                            f"Bout review completed but run manifest update failed for {item.video_name}: {exc}",
+                            "WARNING",
+                        )
+                self._mark_batch_results_stale(
+                    reason=f"Bout review changed for {item.video_name}."
+                )
+            elif result.status is OperationStatus.PARTIAL:
+                item.bout_review_status = "in_progress"
+            else:
+                return
+            item.review_status = self._combine_review_status(item.bout_review_status, item.roi_review_status)
+            self._refresh_queue_tree()
+            self._mark_session_dirty()
 
         item.bout_review_status = "in_progress"
         item.review_status = self._combine_review_status(item.bout_review_status, item.roi_review_status)
@@ -4575,6 +6796,7 @@ class BatchProcessingWizard(tk.Toplevel):
             keybinds=keybinds,
             autosave_path=str(autosave_path),
             on_review_saved=_on_review_saved,
+            on_save_result=_on_save_result,
             context_label=f"{item.video_id} | {item.video_name}",
         )
         if wait and tool is not None and tool.winfo_exists():
@@ -4593,6 +6815,13 @@ class BatchProcessingWizard(tk.Toplevel):
         self._open_video_review_for_item(item)
 
     def _open_roi_event_review_for_item(self, item: BatchVideoItem, *, wait: bool = False) -> bool:
+        if self._launch_integrated_review_for_item(
+            item,
+            mode=SPATIAL_MODE,
+            event_kind=ROI_CONCURRENT,
+            wait=wait,
+        ):
+            return True
         source_path = self._roi_events_source_path(item)
         if not source_path.is_file():
             messagebox.showwarning(
@@ -4625,11 +6854,37 @@ class BatchProcessingWizard(tk.Toplevel):
 
         def _on_review_saved(review_df: pd.DataFrame) -> None:
             try:
+                if self._is_roi_review_complete(review_df):
+                    artifacts = self._materialize_completed_roi_review(item, review_df)
+                    self.progress_text_var.set(
+                        "ROI review finalized for "
+                        f"{item.video_name}: {int(artifacts.get('qualified_visit_count', 0))} "
+                        "dwell-qualified visit(s). Rebuild batch results when all reviews are complete."
+                    )
+                    self._mark_batch_results_stale(
+                        reason=f"ROI review changed for {item.video_name}."
+                    )
                 self._refresh_item_review_status(item)
                 self._refresh_queue_tree()
                 self._mark_session_dirty()
-            except Exception:
-                pass
+            except ROIReviewValidationError as exc:
+                item.roi_review_status = "invalid"
+                item.review_status = "in_progress"
+                self.progress_text_var.set(f"ROI review needs correction for {item.video_name}: {exc}")
+                self.app.log_message(
+                    f"ROI review validation failed for {item.video_name}: {exc}",
+                    "WARNING",
+                )
+                self._refresh_queue_tree()
+            except Exception as exc:
+                item.roi_review_status = "invalid"
+                item.review_status = "in_progress"
+                self.progress_text_var.set(f"ROI review finalization failed for {item.video_name}: {exc}")
+                self.app.log_message(
+                    f"ROI review finalization failed for {item.video_name}: {exc}",
+                    "ERROR",
+                )
+                self._refresh_queue_tree()
 
         item.roi_review_status = "in_progress"
         item.review_status = self._combine_review_status(item.bout_review_status, item.roi_review_status)

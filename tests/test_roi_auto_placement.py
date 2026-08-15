@@ -155,6 +155,19 @@ class TestAutoPlacementPositions(unittest.TestCase):
 
 
 class TestAutoPlacementShapes(unittest.TestCase):
+    def test_explicit_size_is_applied_per_row(self) -> None:
+        placed = auto_place_rois(
+            [
+                {"name": "dish", "shape": SHAPE_CIRCLE, "size_px": 80},
+                {"name": "square", "shape": SHAPE_SQUARE, "size_px": 60},
+            ],
+            frame_width=800,
+            frame_height=600,
+        )
+        self.assertEqual(placed[0]["r"], 40)
+        self.assertEqual(placed[1]["w"], 60)
+        self.assertEqual(placed[1]["h"], 60)
+
     def test_polygon_default_vertex_count(self) -> None:
         placed = auto_place_rois(
             [_row("hex", SHAPE_POLYGON)],  # default vertex count

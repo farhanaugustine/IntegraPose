@@ -1,7 +1,6 @@
-"""Tests for clip_export.py — Tab 7 sub-cluster clip generator.
+"""Tests for the Tab 7 sub-cluster clip exporter.
 
-The actual MP4 writing requires cv2; we don't run that path in CI. What
-we DO test:
+The main test set covers:
 
   - Label parsing (namespaced strings → (class_id, sub_id), with sane
     fallbacks for noise / malformed)
@@ -11,9 +10,8 @@ we DO test:
   - Error paths: missing video file, missing required df columns,
     cv2 unavailable
 
-These cover ~80% of the "did I refactor it correctly" surface without
-needing OpenCV. The end-to-end clip-writing test runs only when cv2
-and a tiny test video are available.
+The end-to-end clip-writing test runs only when OpenCV and a temporary test
+video are available.
 """
 
 from __future__ import annotations

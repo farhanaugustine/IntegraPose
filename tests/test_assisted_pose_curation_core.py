@@ -2,11 +2,13 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from integra_pose.plugins.plugin_assisted_pose_curation.core import (
     ACTIVE_LEARNING_CONTEXT_SCALE,
+    ACTIVE_LEARNING_SCORING_MAX_DET,
     ActiveLearningCandidate,
     PosePoint,
     PROVENANCE_ASSIST_ACCEPTED,
@@ -63,6 +65,16 @@ def test_pose_encode_decode_roundtrip():
     assert round(decoded[1].x or 0.0, 2) == 30.0
     assert round(decoded[1].y or 0.0, 2) == 40.0
     assert decoded[1].v == VISIBILITY_OCCLUDED
+
+
+def test_pose_decode_rejects_extra_suffix_and_non_finite_values():
+    valid = "0 0.5 0.5 0.2 0.2 0.4 0.4 2"
+    with pytest.raises(ValueError, match="exactly 8 tokens"):
+        decode_pose_label_line(f"{valid} 0.95", ["Nose"], 100, 100)
+    with pytest.raises(ValueError, match="finite"):
+        decode_pose_label_line("0 0.5 0.5 0.2 0.2 nan 0.4 2", ["Nose"], 100, 100)
+    with pytest.raises(ValueError, match="0,0 coordinate sentinel"):
+        decode_pose_label_line("0 0.5 0.5 0.2 0.2 0.4 0.4 0", ["Nose"], 100, 100)
 
 
 def test_pose_bbox_xyxy_returns_box_for_visible_points():
@@ -250,6 +262,7 @@ def test_write_active_learning_candidates_csv_includes_source_video_columns(tmp_
             ActiveLearningCandidate(
                 frame_index=12,
                 source_video_path="mouse_trial_A.mp4",
+                source_video_id="0123456789abcdef",
                 image_name="mouse_trial_A__frame_000012.jpg",
                 nearest_reference_distance=0.123,
                 nearest_reference_image="reviewed_mouse_trial_A__frame_000001.jpg",
@@ -274,6 +287,7 @@ def test_write_active_learning_candidates_csv_includes_source_video_columns(tmp_
             "min_frame_gap": 15,
             "context_crop_scale": 2.0,
             "assist_conf_threshold": 0.25,
+            "scoring_max_det": ACTIVE_LEARNING_SCORING_MAX_DET,
             "reviewed_reference_count": 12,
         },
     )
@@ -283,11 +297,14 @@ def test_write_active_learning_candidates_csv_includes_source_video_columns(tmp_
     assert "score_weight_uncertainty" in text
     assert "source_video_path" in text
     assert "source_video_name" in text
+    assert "source_video_id" in text
+    assert "scoring_max_det" in text
     assert "nearest_reference_distance" in text
     assert "nearest_selected_distance" in text
     assert "al_20260325T120000Z_deadbeef" in text
     assert "models/assist.pt" in text
     assert "mouse_trial_A.mp4" in text
+    assert "0123456789abcdef" in text
     assert "reviewed_mouse_trial_A__frame_000001.jpg" in text
     assert "mouse_trial_B__frame_000020.jpg" in text
 

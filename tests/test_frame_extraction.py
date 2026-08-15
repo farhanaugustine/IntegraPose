@@ -1,6 +1,6 @@
-"""Tests for ADP-4 Commit G — frame extraction helpers.
+"""Tests for representative-frame extraction helpers.
 
-The actual cv2 path needs a real video; we don't ship one. So:
+The OpenCV integration test creates a temporary synthetic video. Coverage:
 
   - Pure-logic tests for ``_frame_indices_for_bout`` (which frames to
     pick for a bout of a given size, edge cases) — no cv2 needed.

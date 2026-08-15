@@ -1,12 +1,22 @@
 import ast
-import cv2
-import pandas as pd
-import numpy as np
 import os
 import re
+import uuid
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
+import pandas as pd
 from tqdm import tqdm
+
+from integra_pose.utils.frame_identity import (
+    FrameIdentityError,
+    load_frame_label_manifest,
+    parse_frame_index,
+    resolve_frame_label_indices,
+)
+
 
 def draw_star(image, center, color, size):
     """Draws a 5-pointed star on the image."""
@@ -31,27 +41,37 @@ def draw_star(image, center, color, size):
 
 
 def _extract_frame_index(filename: str):
-    """Extract a zero/one-based frame token without treating video IDs as frames."""
+    """Compatibility wrapper around the shared frame-identity parser."""
     stem = os.path.splitext(os.path.basename(str(filename)))[0]
     if not stem:
         return None
+    parsed = parse_frame_index(filename)
+    if parsed is None:
+        return None
 
-    # Prefer explicit frame/image markers used by this app and common exporters:
-    # video_frame000123.txt, video_frame_000123.txt, img-000123.txt.
-    marker = re.search(r'(?i)(?:^|[_\-.])(?:frame|frm|image|img)[_\-]?(\d+)(?:$|[_\-.])', stem)
-    if marker:
-        return int(marker.group(1))
-
-    # Numeric-only stems are common for extracted-frame tools: 000123.txt.
-    if re.fullmatch(r'\d+', stem):
-        return int(stem)
-
-    # Keep backward compatibility for suffix-numbered label files while avoiding
-    # short subject/trial IDs like mouse_1.txt being silently interpreted as frames.
-    suffix = re.search(r'[_\-](\d{3,})$', stem)
-    if suffix:
-        return int(suffix.group(1))
+    # Preserve the historical single-file safeguard for short subject IDs such
+    # as ``mouse_1.txt``. Directory readers use the complete filename set below,
+    # where legacy base-file conventions can be resolved without guessing.
+    if stem.isdigit() or re.search(r'(?i)(?:^|[_\-.])(?:frame|frm|image|img)[_\-]?\d+$', stem):
+        return parsed
+    suffix = re.search(r'[_\-](\d+)$', stem)
+    if suffix and len(suffix.group(1)) >= 3:
+        return parsed
     return None
+
+
+def _matches_frame_source(filename: str, source_stem: str) -> bool:
+    stem = os.path.splitext(os.path.basename(str(filename)))[0]
+    if stem.isdigit() or re.fullmatch(r"(?i)(?:frame|frm|image|img)[_-]?\d+", stem):
+        return True
+    source_text = str(source_stem or "").strip()
+    if not source_text:
+        return True
+    if stem.casefold() == source_text.casefold():
+        return True
+    if not stem.casefold().startswith(source_text.casefold()):
+        return False
+    return stem[len(source_text):].startswith(("_", "-", "."))
 
 
 def _looks_like_track_column(series: pd.Series) -> bool:
@@ -132,6 +152,10 @@ def _load_labels_csv_track_map(yolo_txt_folder: str, *, frame_count: int = 0) ->
             row_map[frame_idx].append(int(rounded))
         else:
             row_map[frame_idx].append(None)
+    # IntegraPose manifests declare zero-based frame indices explicitly. Only
+    # legacy folders without a manifest may use the historical one-based guess.
+    if load_frame_label_manifest(yolo_txt_folder):
+        return dict(row_map)
     normalized = _normalize_detection_schedule_frames(
         [(frame_idx, str(frame_idx)) for frame_idx in sorted(row_map.keys())],
         frame_count=frame_count,
@@ -882,7 +906,12 @@ def _build_object_frame_lookup(per_frame_df: Optional[pd.DataFrame]) -> Dict[int
     return dict(frame_lookup)
 
 
-def _build_detection_schedule(yolo_txt_folder: str, *, frame_count: int = 0) -> List[Tuple[int, str]]:
+def _build_detection_schedule(
+    yolo_txt_folder: str,
+    *,
+    frame_count: int = 0,
+    source: str | None = None,
+) -> List[Tuple[int, str]]:
     """
     Build an ordered list mapping frame indices to YOLO detection text files.
     The list is sorted by frame index to allow sequential consumption without loading files into memory.
@@ -896,16 +925,42 @@ def _build_detection_schedule(yolo_txt_folder: str, *, frame_count: int = 0) -> 
     if not detection_files:
         return []
 
-    def _sort_key(filename: str) -> Tuple[int, str]:
-        frame_idx = _extract_frame_index(filename)
-        return (frame_idx if frame_idx is not None else np.iinfo(np.int32).max, filename)
+    manifest = load_frame_label_manifest(yolo_txt_folder)
+    manifest_source = str(manifest.get('source_stem') or '').strip()
+    source_stem = os.path.splitext(os.path.basename(str(source or '')))[0]
+    if manifest_source and source_stem and manifest_source.casefold() != source_stem.casefold():
+        raise FrameIdentityError(
+            f"Frame-label manifest source {manifest_source!r} does not match video {source_stem!r}."
+        )
+    scoped_source = source_stem or manifest_source
+    scoped_files = [
+        filename for filename in detection_files if _matches_frame_source(filename, scoped_source)
+    ]
+    skipped_source_files = sorted(set(detection_files) - set(scoped_files))
+    if skipped_source_files:
+        print(
+            f"Warning: skipped {len(skipped_source_files)} TXT file(s) that do not belong "
+            f"to source {scoped_source!r} (e.g. {', '.join(skipped_source_files[:3])})."
+        )
+    source_hint = source or manifest_source or None
+    frame_map = resolve_frame_label_indices(scoped_files, source=source_hint)
+    skipped = sorted(set(scoped_files) - set(frame_map))
+    if skipped:
+        examples = ", ".join(skipped[:3])
+        print(
+            f"Warning: skipped {len(skipped)} auxiliary/unparseable TXT file(s) "
+            f"while building the detection schedule (e.g. {examples})."
+        )
 
-    schedule: List[Tuple[int, str]] = []
-    for filename in sorted(detection_files, key=_sort_key):
-        frame_idx = _extract_frame_index(filename)
-        if frame_idx is None:
-            continue
-        schedule.append((frame_idx, os.path.join(yolo_txt_folder, filename)))
+    schedule = sorted(
+        (
+            (frame_idx, os.path.join(yolo_txt_folder, filename))
+            for filename, frame_idx in frame_map.items()
+        ),
+        key=lambda item: (item[0], item[1]),
+    )
+    if manifest:
+        return schedule
     return _normalize_detection_schedule_frames(schedule, frame_count=frame_count)
 
 
@@ -978,6 +1033,49 @@ def _parse_detection_file(
 
     return detections_df
 
+
+def _dashboard_track_id(track_value, *, single_animal_mode: bool) -> int:
+    """Return the track identity used by the analytics dashboard."""
+    if single_animal_mode:
+        return 0
+    try:
+        return int(track_value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _rendering_video_path(output_path: str) -> str:
+    """Return a unique sibling path that preserves the requested container suffix."""
+    final_path = os.path.abspath(os.fspath(output_path))
+    output_dir = os.path.dirname(final_path)
+    filename = os.path.basename(final_path)
+    stem, suffix = os.path.splitext(filename)
+    suffix = suffix or ".mp4"
+    return os.path.join(
+        output_dir,
+        f".{stem}.{uuid.uuid4().hex}.rendering{suffix}",
+    )
+
+
+def _remove_rendering_video(path: str) -> None:
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _rendered_video_is_readable(path: str) -> bool:
+    """Confirm that a finalized container can be opened and yields a frame."""
+    capture = cv2.VideoCapture(path)
+    try:
+        if not capture.isOpened():
+            return False
+        ok, frame = capture.read()
+        return bool(ok and frame is not None and frame.size)
+    finally:
+        capture.release()
+
 def create_annotated_video(
     video_path,
     output_path,
@@ -989,6 +1087,7 @@ def create_annotated_video(
     object_rois=None,
     object_metrics=None,
     object_events=None,
+    single_animal_mode: bool = False,
 ) -> bool:
     """
     Creates an annotated video with bounding boxes, track IDs, ROIs, a sidebar dashboard,
@@ -1005,6 +1104,8 @@ def create_annotated_video(
         object_rois (dict, optional): Dictionary of stimulus/object ROI polygons.
         object_metrics (dict, optional): Object interaction summary/per-frame metrics.
         object_events (dict, optional): Object entry/exit events for dynamic counters.
+        single_animal_mode (bool, optional): Canonicalize rendered detections to
+            Track 0, matching single-animal bout construction and ROI/object metrics.
 
     Returns:
         bool: True when the annotated video is written successfully; False otherwise.
@@ -1042,7 +1143,11 @@ def create_annotated_video(
     sidebar_header_scale = max(0.58, min(0.78, target_video_height / 920.0))
     sidebar_text_scale = max(0.46, min(0.6, target_video_height / 1120.0))
 
-    detection_schedule = _build_detection_schedule(yolo_txt_folder, frame_count=frame_count)
+    detection_schedule = _build_detection_schedule(
+        yolo_txt_folder,
+        frame_count=frame_count,
+        source=video_path,
+    )
     labels_csv_track_map = _load_labels_csv_track_map(yolo_txt_folder, frame_count=frame_count)
     detection_idx = 0
     detection_len = len(detection_schedule)
@@ -1438,19 +1543,28 @@ def create_annotated_video(
     sidebar_header_scale = max(0.58, min(0.8, total_height / 920.0))
     sidebar_text_scale = max(0.46, min(0.62, total_height / 1120.0))
 
+    final_output_path = os.path.abspath(os.fspath(output_path))
+    rendering_output_path = _rendering_video_path(final_output_path)
     writer = None
     chosen_codec = None
     for codec in ('mp4v', 'avc1', 'MJPG'):
         fourcc = cv2.VideoWriter_fourcc(*codec)
-        candidate = cv2.VideoWriter(output_path, fourcc, fps, (total_width, total_height))
+        candidate = cv2.VideoWriter(
+            rendering_output_path,
+            fourcc,
+            fps,
+            (total_width, total_height),
+        )
         if candidate.isOpened():
             writer = candidate
             chosen_codec = codec
             break
         candidate.release()
+        _remove_rendering_video(rendering_output_path)
     if writer is None or not writer.isOpened():
         print("FATAL: Could not open video writer. Video will not be saved.")
         cap.release()
+        _remove_rendering_video(rendering_output_path)
         return False
     if chosen_codec and chosen_codec != 'avc1':
         print(f"Info: Using codec '{chosen_codec}' for annotated video export.")
@@ -1476,6 +1590,7 @@ def create_annotated_video(
     pbar = tqdm(total=pbar_total, desc="Creating Annotated Video")
     current_frame_idx = 0
     frames_written = 0
+    render_failed = False
 
     try:
         while cap.isOpened():
@@ -1592,11 +1707,10 @@ def create_annotated_video(
 
             if detections_df is not None and not detections_df.empty:
                 for _, row in detections_df.iterrows():
-                    track_val = row.get('track_id', 0)
-                    try:
-                        track_id = int(track_val)
-                    except (TypeError, ValueError):
-                        track_id = 0
+                    track_id = _dashboard_track_id(
+                        row.get('track_id', 0),
+                        single_animal_mode=single_animal_mode,
+                    )
                     x_center, y_center, w, h = row['x_center'], row['y_center'], row['w'], row['h']
                     if not np.all(np.isfinite([x_center, y_center, w, h])):
                         continue
@@ -1644,11 +1758,10 @@ def create_annotated_video(
             if detections_df is not None and not detections_df.empty:
                 seen_tracks = set()
                 for _, det_row in detections_df.iterrows():
-                    track_val = det_row.get('track_id', 0)
-                    try:
-                        track_id = int(track_val)
-                    except (TypeError, ValueError):
-                        track_id = 0
+                    track_id = _dashboard_track_id(
+                        det_row.get('track_id', 0),
+                        single_animal_mode=single_animal_mode,
+                    )
                     if track_id in seen_tracks:
                         continue
                     seen_tracks.add(track_id)
@@ -1837,10 +1950,25 @@ def create_annotated_video(
             current_frame_idx += 1
     except Exception as exc:
         print(f"ERROR: Annotated video render failed: {exc}")
-        return False
+        render_failed = True
     finally:
         pbar.close()
         cap.release()
         writer.release()
 
-    return frames_written > 0
+    if render_failed or frames_written <= 0:
+        _remove_rendering_video(rendering_output_path)
+        return False
+    if not _rendered_video_is_readable(rendering_output_path):
+        print(
+            "ERROR: Annotated video container did not finalize into a readable file."
+        )
+        _remove_rendering_video(rendering_output_path)
+        return False
+    try:
+        os.replace(rendering_output_path, final_output_path)
+    except OSError as exc:
+        print(f"ERROR: Could not publish finalized annotated video: {exc}")
+        _remove_rendering_video(rendering_output_path)
+        return False
+    return True

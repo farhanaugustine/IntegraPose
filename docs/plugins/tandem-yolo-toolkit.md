@@ -188,6 +188,8 @@ Training uses full-video windows. Inference uses streaming windows so latency re
 
 Each run writes into **Run project folder / Run name**. The run folder contains `config.json`, `training_log.csv`, `history.json`, `last_checkpoint.pt`, `best_model.pt`, and `best_model_macro_f1.pt`. `training_log.csv` is updated once per epoch with validation metrics and hardware telemetry, and the live log/progress bar shows epoch progress while the process runs. Use **Resume from last checkpoint** to continue from `last_checkpoint.pt`.
 
+TandemYTC loads checkpoints in PyTorch weights-only mode. A legacy checkpoint that requires executable pickle objects is blocked by default. Only for a checkpoint from a trusted source, set `INTEGRAPOSE_ALLOW_UNSAFE_MODEL_LOAD=1` before launching IntegraPose; otherwise regenerate or convert the checkpoint with a current runtime.
+
 Use **Stop gracefully** to request a clean training stop. TandemYTC writes `stop_training.flag`; the trainer checks it before epochs and during training, then exits through the normal checkpoint/log path. **Kill** force-stops the process and should only be used if the graceful stop does not respond.
 
 ## Infer

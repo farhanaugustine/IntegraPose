@@ -15,6 +15,16 @@ from collections import Counter, defaultdict
 from itertools import combinations
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from integra_pose.utils.frame_identity import (
+    FrameIdentityError,
+    load_frame_label_manifest,
+    resolve_frame_label_indices,
+)
+from integra_pose.utils.yolo_pose_labels import (
+    load_pose_label_schema,
+    parse_yolo_pose_label,
+)
+
 logger = logging.getLogger(__name__)
 
 class BoutAnalysisError(Exception):
@@ -58,15 +68,11 @@ def _get_frame_from_filename_robust(filename):
     Robustly extracts a frame number from a filename.
     Looks for digits following the last underscore in the filename.
     """
-    match = re.search(r'_(\d+)\.txt$', filename)
-    if match:
-        return int(match.group(1))
-
-    matches = re.findall(r'\d+', filename)
-    if matches:
-        return int(matches[-1])
-        
-    return None
+    try:
+        resolved = resolve_frame_label_indices([filename])
+    except FrameIdentityError:
+        return None
+    return resolved.get(os.path.basename(str(filename)))
 
 def _normalize_class_names(names: Any) -> Dict[Any, str]:
     """Coerce class name payloads from YAML into an indexable mapping."""
@@ -149,20 +155,27 @@ def _load_yaml_config(yaml_path: Any) -> Tuple[Dict[Any, str], Dict[str, List[np
     )
 
 
-def _load_labels_csv_row_map(yolo_txt_folder: str) -> Dict[int, List[Dict[str, Optional[float]]]]:
+def _load_labels_csv_row_map(yolo_txt_folder: str) -> Dict[int, List[Dict[str, Any]]]:
     csv_path = os.path.join(yolo_txt_folder, "labels.csv")
     if not os.path.isfile(csv_path):
         return {}
 
-    row_map: Dict[int, List[Dict[str, Optional[float]]]] = defaultdict(list)
+    row_map: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     try:
         with open(csv_path, "r", encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
-            for row in reader:
+            for csv_line, row in enumerate(reader, start=2):
                 try:
-                    frame = int(float(row.get("frame", "")))
-                except (TypeError, ValueError):
-                    continue
+                    frame_raw = float(row.get("frame", ""))
+                except (TypeError, ValueError) as exc:
+                    raise BoutAnalysisError(
+                        f"labels.csv has an invalid frame at line {csv_line}."
+                    ) from exc
+                if not np.isfinite(frame_raw) or frame_raw < 0 or abs(frame_raw - round(frame_raw)) > 1e-6:
+                    raise BoutAnalysisError(
+                        f"labels.csv frame must be a nonnegative integer at line {csv_line}."
+                    )
+                frame = int(round(frame_raw))
                 raw_conf = row.get("bbox_conf", "")
                 conf_value: Optional[float] = None
                 if raw_conf not in (None, ""):
@@ -184,15 +197,38 @@ def _load_labels_csv_row_map(yolo_txt_folder: str) -> Dict[int, List[Dict[str, O
                             rounded_track = round(parsed_track)
                             if abs(parsed_track - rounded_track) <= 1e-6:
                                 track_value = int(rounded_track)
-                row_map[frame].append(
-                    {
-                        "bbox_conf": conf_value,
-                        "track_id": track_value,
-                    }
-                )
+                metadata: Dict[str, Any] = {
+                    "bbox_conf": conf_value,
+                    "track_id": track_value,
+                    "csv_line": csv_line,
+                }
+                numeric_columns = {
+                    "class_id": "class_id",
+                    "x_center_n": "x_center",
+                    "y_center_n": "y_center",
+                    "width_n": "w",
+                    "height_n": "h",
+                }
+                for csv_column, metadata_key in numeric_columns.items():
+                    raw_value = row.get(csv_column, "")
+                    if raw_value in (None, ""):
+                        continue
+                    try:
+                        parsed_value = float(raw_value)
+                    except (TypeError, ValueError) as exc:
+                        raise BoutAnalysisError(
+                            f"labels.csv has invalid {csv_column} at line {csv_line}."
+                        ) from exc
+                    if not np.isfinite(parsed_value):
+                        raise BoutAnalysisError(
+                            f"labels.csv has non-finite {csv_column} at line {csv_line}."
+                        )
+                    metadata[metadata_key] = parsed_value
+                row_map[frame].append(metadata)
+    except BoutAnalysisError:
+        raise
     except Exception as exc:
-        logger.warning("Failed to load labels.csv row map from %s: %s", csv_path, exc)
-        return {}
+        raise BoutAnalysisError(f"Failed to load labels.csv from {csv_path}: {exc}") from exc
     return row_map
 
 
@@ -223,6 +259,7 @@ def load_and_preprocess_data(
     single_animal_mode=False,
     class_names=None,
     roi_polygons=None,
+    source_video=None,
 ):
     """
     Load detection text files into a DataFrame with optional YAML-backed metadata.
@@ -250,19 +287,44 @@ def load_and_preprocess_data(
     class_names = _normalize_class_names(class_names) or yaml_class_names
     roi_polygons = _normalize_roi_polygons(roi_polygons) or yaml_roi_polygons
 
-    all_files = [f for f in os.listdir(yolo_txt_folder) if f.endswith('.txt')]
+    all_files = [
+        f
+        for f in os.listdir(yolo_txt_folder)
+        if f.lower().endswith('.txt') and not f.startswith('.')
+    ]
     if not all_files:
         raise BoutAnalysisError(f"No .txt files found in {yolo_txt_folder}")
 
-    def _frame_sort_key(filename):
-        frame_idx = _get_frame_from_filename_robust(filename)
-        return (frame_idx if frame_idx is not None else float('inf'), filename)
+    try:
+        frame_manifest = load_frame_label_manifest(yolo_txt_folder)
+        if frame_manifest and source_video:
+            declared_stem = str(frame_manifest.get("source_stem") or "").strip()
+            actual_stem = os.path.splitext(os.path.basename(str(source_video)))[0]
+            if declared_stem and declared_stem.casefold() != actual_stem.casefold():
+                raise BoutAnalysisError(
+                    "The label manifest belongs to a different source "
+                    f"({declared_stem!r}, expected {actual_stem!r})."
+                )
+        frame_index_by_file = resolve_frame_label_indices(all_files, source=source_video)
+    except FrameIdentityError as exc:
+        raise BoutAnalysisError(str(exc)) from exc
 
-    all_files = sorted(all_files, key=_frame_sort_key)
+    skipped_files = sorted(set(all_files) - set(frame_index_by_file))
+    all_files = sorted(
+        frame_index_by_file,
+        key=lambda filename: (frame_index_by_file[filename], filename.casefold()),
+    )
+    if not all_files:
+        examples = ", ".join(skipped_files[:3])
+        raise BoutAnalysisError(
+            "No frame-indexed detection TXT files were found"
+            + (f" (ignored: {examples})" if examples else "")
+            + "."
+        )
 
-    skipped_files = []
     skipped_lines = 0
     labels_csv_row_map = _load_labels_csv_row_map(yolo_txt_folder)
+    pose_schema = load_pose_label_schema(yolo_txt_folder)
     single_animal_confidence_warning_emitted = False
 
     def _looks_like_track_id(value: float) -> bool:
@@ -471,25 +533,10 @@ def load_and_preprocess_data(
         raise ValueError("Unable to interpret YOLO remainder payload.")
 
     records = []
+    parsed_counts_by_frame: Counter = Counter()
     for filename in all_files:
         try:
-            frame_num = None
-            try:
-                frame_num = _get_frame_from_filename_robust(filename)  # type: ignore[name-defined]
-            except Exception:
-                pass
-            if frame_num is None:
-                import re as _re
-                m1 = _re.search(r'frame_(\d+)\.txt$', filename)
-                m2 = _re.search(r'_(\d+)\.txt$', filename)
-                m3 = _re.search(r'(\d+)\.txt$', filename)
-                for m_ in (m1, m2, m3):
-                    if m_:
-                        frame_num = int(m_.group(1)); break
-            if frame_num is None:
-                logging.warning("Skipping detection file without frame index: %s", filename)
-                skipped_files.append(filename)
-                continue
+            frame_num = int(frame_index_by_file[filename])
 
             filepath = os.path.join(yolo_txt_folder, filename)
             frame_records = []
@@ -501,34 +548,92 @@ def load_and_preprocess_data(
                     if not stripped:
                         continue
                     parts = stripped.split()
-                    if len(parts) < 3:
-                        skipped_lines += 1
-                        continue
+                    if len(parts) < 5:
+                        raise BoutAnalysisError(
+                            f"Malformed detection at {filename}:{line_idx}: expected at least 5 columns."
+                        )
                     try:
                         values = [float(part) for part in parts]
-                    except ValueError:
-                        skipped_lines += 1
-                        continue
+                    except ValueError as exc:
+                        raise BoutAnalysisError(
+                            f"Malformed numeric value at {filename}:{line_idx}."
+                        ) from exc
+                    if not np.isfinite(values[:5]).all():
+                        raise BoutAnalysisError(
+                            f"Non-finite class or bounding box value at {filename}:{line_idx}."
+                        )
+                    if values[0] < 0 or abs(values[0] - round(values[0])) > 1e-6:
+                        raise BoutAnalysisError(
+                            f"Class ID must be a nonnegative integer at {filename}:{line_idx}."
+                        )
 
-                    class_id = int(round(values[0])) if len(values) > 0 else 0
+                    class_id = int(round(values[0]))
                     x_center = values[1] if len(values) > 1 else np.nan
                     y_center = values[2] if len(values) > 2 else np.nan
                     w = values[3] if len(values) > 3 else np.nan
                     h = values[4] if len(values) > 4 else np.nan
 
+                    if not (0.0 <= x_center <= 1.0 and 0.0 <= y_center <= 1.0):
+                        raise BoutAnalysisError(
+                            f"Bounding box center must be normalized at {filename}:{line_idx}."
+                        )
+                    if not (0.0 < w <= 1.0 and 0.0 < h <= 1.0):
+                        raise BoutAnalysisError(
+                            f"Bounding box size must be normalized and positive at {filename}:{line_idx}."
+                        )
+
                     remainder = values[5:]
                     row_meta = frame_row_meta[valid_detection_idx] if valid_detection_idx < len(frame_row_meta) else {}
                     fallback_confidence = row_meta.get("bbox_conf") if isinstance(row_meta, dict) else None
                     fallback_track_id = row_meta.get("track_id") if isinstance(row_meta, dict) else None
+                    if row_meta:
+                        csv_line = row_meta.get("csv_line", "?")
+                        expected_class = row_meta.get("class_id")
+                        if expected_class is not None and abs(float(expected_class) - class_id) > 1e-6:
+                            raise BoutAnalysisError(
+                                f"TXT/CSV class mismatch at {filename}:{line_idx} and labels.csv:{csv_line}."
+                            )
+                        for field_name, observed in (
+                            ("x_center", x_center),
+                            ("y_center", y_center),
+                            ("w", w),
+                            ("h", h),
+                        ):
+                            expected_value = row_meta.get(field_name)
+                            if expected_value is not None and abs(float(expected_value) - float(observed)) > 1e-6:
+                                raise BoutAnalysisError(
+                                    f"TXT/CSV {field_name} mismatch at {filename}:{line_idx} "
+                                    f"and labels.csv:{csv_line}."
+                                )
                     try:
-                        det_confidence, kp_vals, keypoint_dim, track_id = _split_remainder(
-                            remainder,
-                            fallback_confidence=fallback_confidence,
-                            fallback_track_id=fallback_track_id if isinstance(fallback_track_id, int) else None,
-                        )
-                    except ValueError:
-                        skipped_lines += 1
-                        continue
+                        if pose_schema is not None:
+                            parsed = parse_yolo_pose_label(
+                                parts,
+                                keypoint_count=pose_schema.keypoint_count,
+                                schema=pose_schema,
+                            )
+                            det_confidence = (
+                                parsed.bbox_confidence
+                                if parsed.bbox_confidence is not None
+                                else fallback_confidence
+                            )
+                            kp_vals = [value for point in parsed.keypoints for value in point]
+                            keypoint_dim = int(pose_schema.keypoint_dimensions)
+                            track_id = (
+                                parsed.track_id
+                                if parsed.track_id is not None
+                                else int(fallback_track_id or 0)
+                            )
+                        else:
+                            det_confidence, kp_vals, keypoint_dim, track_id = _split_remainder(
+                                remainder,
+                                fallback_confidence=fallback_confidence,
+                                fallback_track_id=fallback_track_id if isinstance(fallback_track_id, int) else None,
+                            )
+                    except ValueError as exc:
+                        raise BoutAnalysisError(
+                            f"Malformed detection payload at {filename}:{line_idx}: {exc}"
+                        ) from exc
 
                     step = keypoint_dim if keypoint_dim in (2, 3) else 3
                     keypoints = []
@@ -548,8 +653,12 @@ def load_and_preprocess_data(
                         'keypoints': keypoints,
                         'confidence': det_confidence,
                         'keypoint_dim': keypoint_dim,
+                        'source_label_file': filename,
+                        'source_label_line': int(line_idx),
+                        'detection_ordinal': int(valid_detection_idx),
                     }
                     valid_detection_idx += 1
+                    parsed_counts_by_frame[int(frame_num)] += 1
                     if single_animal_mode:
                         frame_records.append(record)
                     else:
@@ -575,10 +684,17 @@ def load_and_preprocess_data(
                         )
                         single_animal_confidence_warning_emitted = True
                 records.append(best_record)
-        except FileNotFoundError:
-            continue
-        except Exception:
-            continue
+            if frame_row_meta and valid_detection_idx != len(frame_row_meta):
+                raise BoutAnalysisError(
+                    f"TXT/CSV detection-count mismatch for frame {frame_num}: "
+                    f"TXT has {valid_detection_idx}, labels.csv has {len(frame_row_meta)}."
+                )
+        except BoutAnalysisError:
+            raise
+        except OSError as exc:
+            raise BoutAnalysisError(f"Could not read detection file {filename}: {exc}") from exc
+        except Exception as exc:
+            raise BoutAnalysisError(f"Failed to parse detection file {filename}: {exc}") from exc
 
     if skipped_files:
         examples = ", ".join(sorted(set(skipped_files))[:3])
@@ -587,12 +703,35 @@ def load_and_preprocess_data(
     if skipped_lines:
         logging.warning("Skipped %d malformed detection lines while parsing YOLO TXT files.", skipped_lines)
 
+    if labels_csv_row_map:
+        expected_counts = Counter(
+            {int(frame): len(rows) for frame, rows in labels_csv_row_map.items()}
+        )
+        if parsed_counts_by_frame != expected_counts:
+            raise BoutAnalysisError(
+                "TXT/CSV frame inventory mismatch: "
+                f"TXT={dict(sorted(parsed_counts_by_frame.items()))}, "
+                f"labels.csv={dict(sorted(expected_counts.items()))}."
+            )
+
     if not records:
         raise BoutAnalysisError("No valid detection files could be processed. Please check filename format and content.")
 
     full_df = pd.DataFrame.from_records(records)
     full_df['track_id'] = pd.to_numeric(full_df['track_id'], errors='coerce').fillna(0).astype(int)
     full_df = full_df.sort_values(by=['track_id', 'frame']).reset_index(drop=True)
+
+    duplicate_track_frames = full_df.duplicated(subset=['track_id', 'frame'], keep=False)
+    if not single_animal_mode and bool(duplicate_track_frames.any()):
+        examples = (
+            full_df.loc[duplicate_track_frames, ['frame', 'track_id', 'source_label_file']]
+            .head(4)
+            .to_dict('records')
+        )
+        raise BoutAnalysisError(
+            "Multiple detections share the same track ID and frame; tracker identity is ambiguous: "
+            f"{examples}"
+        )
 
     if not single_animal_mode and not full_df.empty:
         try:
@@ -620,6 +759,13 @@ def _build_presence_segments(
     gap_threshold: int = 0,
     min_duration: int = 1,
 ) -> list[tuple[int, int]]:
+    """Return inclusive presence intervals after applying temporal debounce.
+
+    ``gap_threshold`` is the number of absent frames that may be bridged.  A
+    returned ``(start, end)`` pair therefore represents the inferred visit
+    interval, including any bridged frames, while the per-frame membership
+    columns continue to preserve the raw geometry classifications.
+    """
     ordered = sorted({int(frame) for frame in frames})
     if not ordered:
         return []
@@ -641,6 +787,74 @@ def _build_presence_segments(
 
     if end - start + 1 >= min_len:
         segments.append((start, end))
+    return segments
+
+
+def _build_label_segments(
+    observations: Sequence[Tuple[int, str]],
+    *,
+    gap_threshold: int = 0,
+    min_duration: int = 1,
+) -> list[tuple[str, int, int]]:
+    """Debounce an exclusive frame label into inclusive, non-overlapping visits.
+
+    Empty labels are treated as dropout and may be bridged.  A different
+    non-empty label is explicit evidence of a transition and therefore always
+    closes the preceding primary-label visit; this prevents contradictory
+    primary ROI visits from overlapping after debounce.
+    """
+    normalized = sorted((int(frame), str(label or "").strip()) for frame, label in observations)
+    if not normalized:
+        return []
+
+    max_gap = max(0, int(gap_threshold or 0))
+    min_len = max(1, int(min_duration or 1))
+    segments: list[tuple[str, int, int]] = []
+    active_label = ""
+    start_frame: Optional[int] = None
+    last_active_frame: Optional[int] = None
+
+    def _close() -> None:
+        nonlocal active_label, start_frame, last_active_frame
+        if (
+            active_label
+            and start_frame is not None
+            and last_active_frame is not None
+            and last_active_frame - start_frame + 1 >= min_len
+        ):
+            segments.append((active_label, start_frame, last_active_frame))
+        active_label = ""
+        start_frame = None
+        last_active_frame = None
+
+    for frame, label in normalized:
+        if not active_label:
+            if label:
+                active_label = label
+                start_frame = frame
+                last_active_frame = frame
+            continue
+
+        assert last_active_frame is not None
+        if frame - last_active_frame > max_gap + 1:
+            _close()
+            if label:
+                active_label = label
+                start_frame = frame
+                last_active_frame = frame
+            continue
+
+        if not label:
+            continue
+        if label != active_label:
+            _close()
+            active_label = label
+            start_frame = frame
+            last_active_frame = frame
+            continue
+        last_active_frame = frame
+
+    _close()
     return segments
 
 
@@ -700,6 +914,29 @@ def assign_roi_membership(
     gap_threshold = max(0, int(max_gap_frames or 0))
     min_dwell_frames = max(1, int(min_dwell_frames or 1))
 
+    if mode.startswith("keypoint"):
+        keypoint_lengths = [
+            len(value)
+            for value in per_frame_df.get("keypoints", pd.Series(dtype=object)).tolist()
+            if isinstance(value, (list, tuple))
+        ]
+        available_count = max(keypoint_lengths, default=0)
+        if available_count <= 0:
+            raise ValueError(
+                f"ROI event mode '{mode}' requires pose keypoints, but none were found in the loaded labels."
+            )
+        requested_indices = []
+        if mode == "keypoint_index":
+            requested_indices = [kp_idx]
+        elif mode == "keypoint_ratio" and kp_idx_list:
+            requested_indices = list(kp_idx_list)
+        invalid = [idx for idx in requested_indices if idx >= available_count]
+        if invalid:
+            raise ValueError(
+                f"ROI keypoint index/indices {invalid} are out of range for {available_count} loaded keypoints "
+                f"(valid range 0-{available_count - 1})."
+            )
+
     def _to_pixel_coordinate(value, scale):
         if pd.isna(value):
             return None
@@ -752,6 +989,15 @@ def assign_roi_membership(
                 'last_frame': None,
             },
         )
+
+        # Hysteresis is meaningful only while observations are temporally
+        # contiguous (allowing the user-configured dropout tolerance).  If a
+        # track disappears for longer than that tolerance, require fresh entry
+        # evidence instead of allowing stale "inside" state to satisfy the
+        # lower exit threshold on its return.
+        previous_frame = state.get('last_frame')
+        if previous_frame is not None and frame_num - int(previous_frame) > gap_threshold + 1:
+            state['active_rois'] = {}
 
         keypoints = row.get('keypoints', None)
         kp_entries: List[Tuple[float, float, float]] = []
@@ -901,7 +1147,6 @@ def assign_roi_membership(
         active_rois_next = {}
         membership_names: List[str] = []
         preferred_roi = ''
-        preferred_score = -1.0
         preferred_area = float('inf')
 
         for roi_name, mask, area in roi_info:
@@ -909,7 +1154,6 @@ def assign_roi_membership(
             prev_active = prev_info is not None
             cinfo = coverage_info.get(roi_name, {})
             box_ratio = float(cinfo.get("bbox_ratio", 0.0))
-            combined_ratio = float(cinfo.get("combined_ratio", box_ratio))
             kp_ratio = float(cinfo.get("kp_ratio", 0.0))
             center_inside = bool(cinfo.get("center_inside", center_inside_map.get(roi_name, False)))
             kp_any_inside = bool(cinfo.get("kp_any_inside", False))
@@ -920,39 +1164,31 @@ def assign_roi_membership(
             if mode == "bbox_only":
                 should_enter = center_inside or box_ratio >= entry_threshold
                 should_stay = center_inside or box_ratio > exit_threshold
-                current_score = (2.0 if center_inside else 0.0) + box_ratio
             elif mode == "keypoint_index":
                 if has_keypoints:
                     should_enter = kp_index_inside
                     should_stay = kp_index_inside
-                    current_score = (2.0 if kp_index_inside else 0.0) + kp_ratio
                 else:
                     should_enter = center_inside or box_ratio >= entry_threshold
                     should_stay = center_inside or box_ratio > exit_threshold
-                    current_score = (2.0 if center_inside else 0.0) + box_ratio
             elif mode == "keypoint_any":
                 if has_keypoints:
                     should_enter = kp_any_inside
                     should_stay = kp_any_inside
-                    current_score = (2.0 if kp_any_inside else 0.0) + kp_ratio
                 else:
                     should_enter = center_inside or box_ratio >= entry_threshold
                     should_stay = center_inside or box_ratio > exit_threshold
-                    current_score = (2.0 if center_inside else 0.0) + box_ratio
             elif mode == "keypoint_ratio":
                 if has_keypoints:
                     should_enter = kp_set_ratio >= kp_ratio_threshold if kp_idx_list else kp_ratio >= kp_ratio_threshold
                     stay_threshold = min(exit_threshold, kp_ratio_threshold) if exit_threshold >= 0 else kp_ratio_threshold
                     should_stay = kp_set_ratio > stay_threshold if kp_idx_list else kp_ratio > stay_threshold
-                    current_score = (2.0 if center_inside else 0.0) + max(kp_set_ratio, kp_ratio)
                 else:
                     should_enter = center_inside or box_ratio >= entry_threshold
                     should_stay = center_inside or box_ratio > exit_threshold
-                    current_score = (2.0 if center_inside else 0.0) + box_ratio
             else:
                 should_enter = center_inside or box_ratio >= entry_threshold or kp_ratio >= entry_threshold
                 should_stay = center_inside or box_ratio > exit_threshold or kp_ratio > exit_threshold
-                current_score = (2.0 if center_inside else 0.0) + combined_ratio + kp_ratio
 
             if prev_active:
                 if should_stay:
@@ -961,12 +1197,8 @@ def assign_roi_membership(
                     membership_names.append(roi_name)
                 else:
                     exit_events.append({'frame': frame_num, 'track_id': track_id, 'roi_name': roi_name})
-                if should_stay and (
-                    current_score > preferred_score
-                    or (abs(current_score - preferred_score) <= 1e-6 and area < preferred_area)
-                ):
+                if should_stay and area < preferred_area:
                     preferred_roi = roi_name
-                    preferred_score = current_score
                     preferred_area = area
                 continue
 
@@ -974,9 +1206,8 @@ def assign_roi_membership(
                 active_rois_next[roi_name] = {'start_frame': frame_num, 'last_frame': frame_num}
                 membership_names.append(roi_name)
                 entry_events.append({'frame': frame_num, 'track_id': track_id, 'roi_name': roi_name})
-                if current_score > preferred_score or (abs(current_score - preferred_score) <= 1e-6 and area < preferred_area):
+                if area < preferred_area:
                     preferred_roi = roi_name
-                    preferred_score = current_score
                     preferred_area = area
 
         # If no ROI selected for primary but memberships exist, pick the smallest-area active ROI.
@@ -1059,6 +1290,8 @@ def compute_object_interactions(
     per_frame_columns = [
         "Object Interaction ROI",
         "Object Interaction Memberships",
+        "Qualified Object Interaction ROI",
+        "Qualified Object Interaction Memberships",
         "Object Contact ROI",
         "Object Contact Memberships",
         "Object Proximity ROI",
@@ -1072,6 +1305,10 @@ def compute_object_interactions(
         "Exits",
         "Frames Interacting",
         "Time Interacting (s)",
+        "Raw Interaction Frames",
+        "Raw Interaction Time (s)",
+        "Qualified Interaction Frames",
+        "Qualified Interaction Time (s)",
         "Frames Contact",
         "Time Contact (s)",
         "Frames Proximity Only",
@@ -1081,6 +1318,8 @@ def compute_object_interactions(
         "Mean Dwell Duration (s)",
         "Median Dwell Duration (frames)",
         "Median Dwell Duration (s)",
+        "Minimum Dwell (Frames)",
+        "Maximum Gap (Frames)",
     ]
     per_track_columns = [
         "Track ID",
@@ -1089,6 +1328,10 @@ def compute_object_interactions(
         "Exits",
         "Frames Interacting",
         "Time Interacting (s)",
+        "Raw Interaction Frames",
+        "Raw Interaction Time (s)",
+        "Qualified Interaction Frames",
+        "Qualified Interaction Time (s)",
         "Frames Contact",
         "Time Contact (s)",
         "Frames Proximity Only",
@@ -1098,6 +1341,8 @@ def compute_object_interactions(
         "Mean Dwell Duration (s)",
         "Median Dwell Duration (frames)",
         "Median Dwell Duration (s)",
+        "Minimum Dwell (Frames)",
+        "Maximum Gap (Frames)",
     ]
     dwell_columns = [
         "Track ID",
@@ -1154,7 +1399,12 @@ def compute_object_interactions(
     df_base = per_frame_df.copy() if per_frame_df is not None else pd.DataFrame()
     for col in per_frame_columns:
         if col not in df_base.columns:
-            if col in {"Object Interaction Memberships", "Object Contact Memberships", "Object Proximity Memberships"}:
+            if col in {
+                "Object Interaction Memberships",
+                "Qualified Object Interaction Memberships",
+                "Object Contact Memberships",
+                "Object Proximity Memberships",
+            }:
                 df_base[col] = [() for _ in range(len(df_base))]
             elif col == "Object Interaction Distance (px)":
                 df_base[col] = np.nan
@@ -1239,6 +1489,21 @@ def compute_object_interactions(
 
     object_info.sort(key=lambda row: row[3])
     kp_idx = max(0, int(keypoint_index or 0))
+    keypoint_lengths = [
+        len(value)
+        for value in work_df.get("keypoints", pd.Series(dtype=object)).tolist()
+        if isinstance(value, (list, tuple))
+    ]
+    available_keypoint_count = max(keypoint_lengths, default=0)
+    if available_keypoint_count <= 0:
+        raise ValueError(
+            "Object-interaction analysis requires pose keypoints, but none were found in the loaded labels."
+        )
+    if kp_idx >= available_keypoint_count:
+        raise ValueError(
+            f"Object-interaction keypoint index {kp_idx} is out of range for {available_keypoint_count} loaded "
+            f"keypoints (valid range 0-{available_keypoint_count - 1})."
+        )
     threshold_px = max(0.0, float(distance_threshold_px or 0.0))
     has_valid_fps = bool(fps and fps > 0)
     gap_threshold = max(0, int(max_gap_frames or 0))
@@ -1500,6 +1765,7 @@ def compute_object_interactions(
     exit_events = []
     per_track_entries = defaultdict(Counter)
     per_track_exits = defaultdict(Counter)
+    qualified_interactions_by_track_frame: Dict[Tuple[int, int], set[str]] = defaultdict(set)
     for track_idx, track_id in enumerate(sorted(interaction_frames_by_track.keys()), start=1):
         _check_stop_interval(stop_check, track_idx, stage="Object interaction event summarization", interval=32)
         for object_name in sorted(interaction_frames_by_track[track_id].keys()):
@@ -1520,10 +1786,27 @@ def compute_object_interactions(
                     object_name,
                     {"start_frame": int(start_frame), "last_frame": int(end_frame)},
                 )
+                for frame in range(int(start_frame), int(end_frame) + 1):
+                    qualified_interactions_by_track_frame[(int(track_id), int(frame))].add(str(object_name))
 
     df_result = df_base.copy()
     df_result["Object Interaction ROI"] = df_result.index.map(assignments).fillna("")
     df_result["Object Interaction Memberships"] = [memberships_map.get(idx, ()) for idx in df_result.index]
+    qualified_primary_names: list[str] = []
+    qualified_membership_values: list[Tuple[str, ...]] = []
+    for row_index, row in df_result.iterrows():
+        try:
+            lookup_key = (int(row.get("track_id")), int(row.get("frame")))
+        except (TypeError, ValueError):
+            memberships = ()
+        else:
+            memberships = tuple(sorted(qualified_interactions_by_track_frame.get(lookup_key, set())))
+        raw_primary = str(assignments.get(row_index, "") or "").strip()
+        primary = raw_primary if raw_primary in memberships else (memberships[0] if memberships else "")
+        qualified_primary_names.append(primary)
+        qualified_membership_values.append(memberships)
+    df_result["Qualified Object Interaction ROI"] = qualified_primary_names
+    df_result["Qualified Object Interaction Memberships"] = qualified_membership_values
     df_result["Object Contact ROI"] = df_result.index.map(contact_assignments).fillna("")
     df_result["Object Contact Memberships"] = [contact_memberships_map.get(idx, ()) for idx in df_result.index]
     df_result["Object Proximity ROI"] = df_result.index.map(proximity_assignments).fillna("")
@@ -1543,6 +1826,12 @@ def compute_object_interactions(
         total_frames = int(frame_counts.get(object_name, 0))
         events_df = dwell_by_object.get_group(object_name) if dwell_by_object is not None and object_name in dwell_by_object.groups else None
         dwell_events_count = int(len(events_df)) if events_df is not None else 0
+        qualified_frames = (
+            int(pd.to_numeric(events_df["Duration (Frames)"], errors="coerce").fillna(0).sum())
+            if events_df is not None
+            else 0
+        )
+        qualified_time_s = (qualified_frames / fps) if has_valid_fps else np.nan
         mean_dwell_frames = float(events_df["Duration (Frames)"].mean()) if events_df is not None and dwell_events_count else np.nan
         mean_dwell_s = float(events_df["Duration (s)"].mean()) if events_df is not None and dwell_events_count and has_valid_fps else np.nan
         median_dwell_frames = float(events_df["Duration (Frames)"].median()) if events_df is not None and dwell_events_count else np.nan
@@ -1554,6 +1843,10 @@ def compute_object_interactions(
                 "Exits": int(exits.get(object_name, 0)),
                 "Frames Interacting": total_frames,
                 "Time Interacting (s)": (total_frames / fps) if has_valid_fps else np.nan,
+                "Raw Interaction Frames": total_frames,
+                "Raw Interaction Time (s)": (total_frames / fps) if has_valid_fps else np.nan,
+                "Qualified Interaction Frames": qualified_frames,
+                "Qualified Interaction Time (s)": qualified_time_s,
                 "Frames Contact": int(contact_frame_counts.get(object_name, 0)),
                 "Time Contact (s)": (float(contact_frame_counts.get(object_name, 0)) / fps) if has_valid_fps else np.nan,
                 "Frames Proximity Only": int(proximity_frame_counts.get(object_name, 0)),
@@ -1563,6 +1856,8 @@ def compute_object_interactions(
                 "Mean Dwell Duration (s)": mean_dwell_s,
                 "Median Dwell Duration (frames)": median_dwell_frames,
                 "Median Dwell Duration (s)": median_dwell_s,
+                "Minimum Dwell (Frames)": min_dwell_frames,
+                "Maximum Gap (Frames)": gap_threshold,
             }
         )
     summary_df = pd.DataFrame(summary_rows, columns=summary_columns)
@@ -1579,6 +1874,12 @@ def compute_object_interactions(
                 else None
             )
             dwell_events_count = int(len(events_df)) if events_df is not None else 0
+            qualified_frames = (
+                int(pd.to_numeric(events_df["Duration (Frames)"], errors="coerce").fillna(0).sum())
+                if events_df is not None
+                else 0
+            )
+            qualified_time_s = (qualified_frames / fps) if has_valid_fps else np.nan
             mean_dwell_frames = float(events_df["Duration (Frames)"].mean()) if events_df is not None and dwell_events_count else np.nan
             mean_dwell_s = float(events_df["Duration (s)"].mean()) if events_df is not None and dwell_events_count and has_valid_fps else np.nan
             median_dwell_frames = float(events_df["Duration (Frames)"].median()) if events_df is not None and dwell_events_count else np.nan
@@ -1591,6 +1892,10 @@ def compute_object_interactions(
                     "Exits": int(per_track_exits[track_id].get(object_name, 0)),
                     "Frames Interacting": frames,
                     "Time Interacting (s)": (frames / fps) if has_valid_fps else np.nan,
+                    "Raw Interaction Frames": frames,
+                    "Raw Interaction Time (s)": (frames / fps) if has_valid_fps else np.nan,
+                    "Qualified Interaction Frames": qualified_frames,
+                    "Qualified Interaction Time (s)": qualified_time_s,
                     "Frames Contact": int(per_track_contact_frames[track_id].get(object_name, 0)),
                     "Time Contact (s)": (float(per_track_contact_frames[track_id].get(object_name, 0)) / fps) if has_valid_fps else np.nan,
                     "Frames Proximity Only": int(per_track_proximity_frames[track_id].get(object_name, 0)),
@@ -1600,6 +1905,8 @@ def compute_object_interactions(
                     "Mean Dwell Duration (s)": mean_dwell_s,
                     "Median Dwell Duration (frames)": median_dwell_frames,
                     "Median Dwell Duration (s)": median_dwell_s,
+                    "Minimum Dwell (Frames)": min_dwell_frames,
+                    "Maximum Gap (Frames)": gap_threshold,
                 }
             )
     per_track_df = pd.DataFrame(per_track_rows, columns=per_track_columns)
@@ -1619,7 +1926,11 @@ def compute_object_interactions(
             distance_df = distance_df.dropna(subset=["track_id"])
             distance_df["track_id"] = distance_df["track_id"].astype(int)
             distance_df["frame"] = distance_df["frame"].astype(int)
-            distance_df = distance_df.sort_values(["track_id", "object_roi", "frame"]).reset_index(drop=True)
+            distance_df = (
+                distance_df.sort_values(["track_id", "object_roi", "frame"])
+                .drop_duplicates(subset=["track_id", "object_roi", "frame"], keep="last")
+                .reset_index(drop=True)
+            )
 
             state_rows: List[Dict[str, Any]] = []
             event_rows: List[Dict[str, Any]] = []
@@ -1627,18 +1938,36 @@ def compute_object_interactions(
                 prev_frame = None
                 prev_dist = np.nan
                 current_event: Dict[str, Any] | None = None
+
+                def _finish_motion_event(event: Dict[str, Any]) -> None:
+                    rates = event.pop("_rates")
+                    changes = event.pop("_changes")
+                    frame_deltas = event.pop("_frame_deltas")
+                    duration_frames = int(sum(frame_deltas))
+                    event["Duration (Frames)"] = duration_frames
+                    event["Duration (s)"] = (duration_frames / fps) if has_valid_fps else np.nan
+                    event["Mean Delta Distance (px/frame)"] = (
+                        float(np.average(rates, weights=frame_deltas)) if rates else np.nan
+                    )
+                    event["Total Distance Change (px)"] = float(np.sum(changes)) if changes else np.nan
+                    event_rows.append(event)
+
                 for row in group.itertuples(index=False):
                     frame = int(getattr(row, "frame"))
                     curr_dist = float(getattr(row, "distance_px")) if pd.notna(getattr(row, "distance_px")) else np.nan
                     delta = np.nan
+                    distance_change = np.nan
+                    frame_delta = 0
                     state = "neutral"
                     if (
                         prev_frame is not None
-                        and frame == prev_frame + 1
+                        and 0 < frame - int(prev_frame) <= gap_threshold + 1
                         and np.isfinite(prev_dist)
                         and np.isfinite(curr_dist)
                     ):
-                        delta = float(curr_dist - prev_dist)
+                        frame_delta = int(frame - int(prev_frame))
+                        distance_change = float(curr_dist - prev_dist)
+                        delta = distance_change / frame_delta
                         if delta < 0:
                             state = "approach"
                         elif delta > 0:
@@ -1652,6 +1981,8 @@ def compute_object_interactions(
                             "Frame": frame,
                             "Distance (px)": curr_dist,
                             "Delta Distance (px/frame)": delta,
+                            "Distance Change (px)": distance_change,
+                            "Frame Delta": frame_delta,
                             "State": state,
                         }
                     )
@@ -1660,48 +1991,35 @@ def compute_object_interactions(
                         if (
                             current_event is not None
                             and current_event["State"] == state
-                            and frame == current_event["End Frame"] + 1
+                            and prev_frame is not None
+                            and int(prev_frame) == current_event["End Frame"]
                         ):
                             current_event["End Frame"] = frame
-                            current_event["_deltas"].append(float(delta))
+                            current_event["_rates"].append(float(delta))
+                            current_event["_changes"].append(float(distance_change))
+                            current_event["_frame_deltas"].append(int(frame_delta))
                         else:
                             if current_event is not None:
-                                deltas = current_event.pop("_deltas")
-                                duration_frames = int(current_event["End Frame"] - current_event["Start Frame"] + 1)
-                                current_event["Duration (Frames)"] = duration_frames
-                                current_event["Duration (s)"] = (duration_frames / fps) if has_valid_fps else np.nan
-                                current_event["Mean Delta Distance (px/frame)"] = float(np.mean(deltas)) if deltas else np.nan
-                                current_event["Total Distance Change (px)"] = float(np.sum(deltas)) if deltas else np.nan
-                                event_rows.append(current_event)
+                                _finish_motion_event(current_event)
                             current_event = {
                                 "Track ID": int(track_id),
                                 "Object ROI": str(object_name),
                                 "State": state,
-                                "Start Frame": frame,
+                                "Start Frame": int(prev_frame) if prev_frame is not None else frame,
                                 "End Frame": frame,
-                                "_deltas": [float(delta)],
+                                "_rates": [float(delta)],
+                                "_changes": [float(distance_change)],
+                                "_frame_deltas": [int(frame_delta)],
                             }
                     else:
                         if current_event is not None:
-                            deltas = current_event.pop("_deltas")
-                            duration_frames = int(current_event["End Frame"] - current_event["Start Frame"] + 1)
-                            current_event["Duration (Frames)"] = duration_frames
-                            current_event["Duration (s)"] = (duration_frames / fps) if has_valid_fps else np.nan
-                            current_event["Mean Delta Distance (px/frame)"] = float(np.mean(deltas)) if deltas else np.nan
-                            current_event["Total Distance Change (px)"] = float(np.sum(deltas)) if deltas else np.nan
-                            event_rows.append(current_event)
+                            _finish_motion_event(current_event)
                             current_event = None
 
                     prev_frame = frame
                     prev_dist = curr_dist
                 if current_event is not None:
-                    deltas = current_event.pop("_deltas")
-                    duration_frames = int(current_event["End Frame"] - current_event["Start Frame"] + 1)
-                    current_event["Duration (Frames)"] = duration_frames
-                    current_event["Duration (s)"] = (duration_frames / fps) if has_valid_fps else np.nan
-                    current_event["Mean Delta Distance (px/frame)"] = float(np.mean(deltas)) if deltas else np.nan
-                    current_event["Total Distance Change (px)"] = float(np.sum(deltas)) if deltas else np.nan
-                    event_rows.append(current_event)
+                    _finish_motion_event(current_event)
 
             state_df = pd.DataFrame(state_rows)
             approach_retreat_events_df = pd.DataFrame(event_rows, columns=approach_retreat_event_columns)
@@ -1723,11 +2041,25 @@ def compute_object_interactions(
                     state_df["Delta Distance (px/frame)"],
                     np.nan,
                 )
-                state_df["DeltaValid"] = np.where(
-                    np.isfinite(state_df["Delta Distance (px/frame)"]),
-                    state_df["Delta Distance (px/frame)"],
+                state_df["DistanceChangeValid"] = np.where(
+                    np.isfinite(state_df["Distance Change (px)"]),
+                    state_df["Distance Change (px)"],
                     0.0,
                 )
+                state_df["ApproachFrameWeight"] = np.where(
+                    state_df["IsApproach"], state_df["Frame Delta"], 0
+                )
+                state_df["RetreatFrameWeight"] = np.where(
+                    state_df["IsRetreat"], state_df["Frame Delta"], 0
+                )
+
+                def _weighted_motion_rate(group: pd.DataFrame, column: str) -> float:
+                    values = pd.to_numeric(group[column], errors="coerce")
+                    weights = pd.to_numeric(group["Frame Delta"], errors="coerce")
+                    valid = values.notna() & weights.notna() & (weights > 0)
+                    if not bool(valid.any()):
+                        return np.nan
+                    return float(np.average(values.loc[valid], weights=weights.loc[valid]))
 
                 event_counts_track = defaultdict(lambda: {"Approach Events": 0, "Retreat Events": 0})
                 if not approach_retreat_events_df.empty:
@@ -1740,8 +2072,8 @@ def compute_object_interactions(
 
                 track_rows: List[Dict[str, Any]] = []
                 for (track_id, object_name), g in state_df.groupby(["Track ID", "Object ROI"]):
-                    approach_frames = int(g["IsApproach"].sum())
-                    retreat_frames = int(g["IsRetreat"].sum())
+                    approach_frames = int(g["ApproachFrameWeight"].sum())
+                    retreat_frames = int(g["RetreatFrameWeight"].sum())
                     key = (int(track_id), str(object_name))
                     events_meta = event_counts_track.get(key, {"Approach Events": 0, "Retreat Events": 0})
                     track_rows.append(
@@ -1754,13 +2086,9 @@ def compute_object_interactions(
                             "Retreat Frames": retreat_frames,
                             "Approach Time (s)": (approach_frames / fps) if has_valid_fps else np.nan,
                             "Retreat Time (s)": (retreat_frames / fps) if has_valid_fps else np.nan,
-                            "Mean Approach Rate (px/frame)": float(g["ApproachRate"].dropna().mean())
-                            if g["ApproachRate"].dropna().size
-                            else np.nan,
-                            "Mean Retreat Rate (px/frame)": float(g["RetreatRate"].dropna().mean())
-                            if g["RetreatRate"].dropna().size
-                            else np.nan,
-                            "Net Distance Change (px)": float(g["DeltaValid"].sum()),
+                            "Mean Approach Rate (px/frame)": _weighted_motion_rate(g, "ApproachRate"),
+                            "Mean Retreat Rate (px/frame)": _weighted_motion_rate(g, "RetreatRate"),
+                            "Net Distance Change (px)": float(g["DistanceChangeValid"].sum()),
                         }
                     )
                 approach_retreat_track_df = pd.DataFrame(track_rows, columns=approach_retreat_track_columns)
@@ -1771,8 +2099,8 @@ def compute_object_interactions(
 
                 summary_rows_ar: List[Dict[str, Any]] = []
                 for object_name, g in state_df.groupby("Object ROI"):
-                    approach_frames = int(g["IsApproach"].sum())
-                    retreat_frames = int(g["IsRetreat"].sum())
+                    approach_frames = int(g["ApproachFrameWeight"].sum())
+                    retreat_frames = int(g["RetreatFrameWeight"].sum())
                     object_track = approach_retreat_track_df[approach_retreat_track_df["Object ROI"] == object_name]
                     summary_rows_ar.append(
                         {
@@ -1783,13 +2111,9 @@ def compute_object_interactions(
                             "Retreat Frames": retreat_frames,
                             "Approach Time (s)": (approach_frames / fps) if has_valid_fps else np.nan,
                             "Retreat Time (s)": (retreat_frames / fps) if has_valid_fps else np.nan,
-                            "Mean Approach Rate (px/frame)": float(g["ApproachRate"].dropna().mean())
-                            if g["ApproachRate"].dropna().size
-                            else np.nan,
-                            "Mean Retreat Rate (px/frame)": float(g["RetreatRate"].dropna().mean())
-                            if g["RetreatRate"].dropna().size
-                            else np.nan,
-                            "Net Distance Change (px)": float(g["DeltaValid"].sum()),
+                            "Mean Approach Rate (px/frame)": _weighted_motion_rate(g, "ApproachRate"),
+                            "Mean Retreat Rate (px/frame)": _weighted_motion_rate(g, "RetreatRate"),
+                            "Net Distance Change (px)": float(g["DistanceChangeValid"].sum()),
                         }
                     )
                 approach_retreat_summary_df = pd.DataFrame(summary_rows_ar, columns=approach_retreat_summary_columns)
@@ -1815,6 +2139,7 @@ def analyze_bouts(
     fps,
     roi_column=None,
     stop_check: Optional[Callable[[], bool]] = None,
+    bout_class_mode: str = "mutually_exclusive",
 ):
     """Analyzes the preprocessed data to identify and summarize behavioral bouts.
 
@@ -1829,6 +2154,18 @@ def analyze_bouts(
             "resolve it from the workflow's Video FPS field before calling."
         )
     fps = float(fps)
+    bout_class_mode = str(
+        bout_class_mode or "mutually_exclusive"
+    ).strip().casefold()
+    if bout_class_mode in {"exclusive", "single", "single_label"}:
+        bout_class_mode = "mutually_exclusive"
+    elif bout_class_mode in {"multilabel", "multi-label", "concurrent"}:
+        bout_class_mode = "multi_label"
+    if bout_class_mode not in {"mutually_exclusive", "multi_label"}:
+        raise ValueError(
+            "analyze_bouts: bout_class_mode must be "
+            "'mutually_exclusive' or 'multi_label'."
+        )
     if per_frame_df is None or per_frame_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -1836,14 +2173,27 @@ def analyze_bouts(
     if not required_cols.issubset(per_frame_df.columns):
         return pd.DataFrame(), pd.DataFrame()
 
+    max_gap_frames = max(0, int(max_gap_frames or 0))
+    min_bout_frames = max(1, int(min_bout_frames or 1))
     use_roi = bool(roi_column) and roi_column in per_frame_df.columns
+    use_qualified_roi = bool(
+        use_roi
+        and "Qualified ROI Name" in per_frame_df.columns
+        and "Qualified ROI Memberships" in per_frame_df.columns
+    )
 
-    has_valid_fps = True
-    fps_value = float(fps) if has_valid_fps else 0.0
+    fps_value = float(fps)
 
     columns = ["track_id", "frame", "class_id"]
-    if use_roi:
-        columns.append(roi_column)
+    for optional_column in (
+        "confidence",
+        roi_column if use_roi else None,
+        "ROI Memberships" if use_roi else None,
+        "Qualified ROI Name" if use_qualified_roi else None,
+        "Qualified ROI Memberships" if use_qualified_roi else None,
+    ):
+        if optional_column and optional_column in per_frame_df.columns and optional_column not in columns:
+            columns.append(optional_column)
     df = per_frame_df[columns].copy()
 
     df["track_id"] = pd.to_numeric(df["track_id"], errors="coerce")
@@ -1862,96 +2212,204 @@ def analyze_bouts(
             return ""
         return text
 
+    def _normalize_memberships(value) -> Tuple[str, ...]:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return ()
+        if isinstance(value, str):
+            name = _normalize_roi(value)
+            return (name,) if name else ()
+        if isinstance(value, (list, tuple, set)):
+            return tuple(
+                dict.fromkeys(
+                    name
+                    for name in (_normalize_roi(item) for item in value)
+                    if name
+                )
+            )
+        name = _normalize_roi(value)
+        return (name,) if name else ()
+
     if use_roi:
-        df["_roi_label"] = df[roi_column].map(_normalize_roi)
-        # Ensure one ROI label per (track, class, frame) so ROI metadata is deterministic.
-        df = (
-            df.groupby(["track_id", "class_id", "frame"], as_index=False)["_roi_label"]
-            .agg(lambda values: next((v for v in values if v), ""))
-        )
+        df["_raw_roi_label"] = df[roi_column].map(_normalize_roi)
+        raw_memberships_column = "ROI Memberships" if "ROI Memberships" in df.columns else roi_column
+        df["_raw_roi_memberships"] = df[raw_memberships_column].map(_normalize_memberships)
+        if use_qualified_roi:
+            df["_qualified_roi_label"] = df["Qualified ROI Name"].map(_normalize_roi)
+            df["_qualified_roi_memberships"] = df["Qualified ROI Memberships"].map(_normalize_memberships)
+
+    # Mutually exclusive mode preserves the historical IntegraPose contract:
+    # one behavior state per track/frame, selected deterministically by
+    # confidence. Multi-label mode instead retains one row per
+    # track/frame/class so legitimately concurrent behavior channels can form
+    # independent, overlapping bouts.
+    df["_source_order"] = np.arange(len(df), dtype=int)
+    frame_class_counts = df.groupby(["track_id", "frame"])["class_id"].transform("nunique")
+    df["_class_conflict"] = frame_class_counts > 1
+    if "confidence" in df.columns:
+        df["_confidence_rank"] = pd.to_numeric(df["confidence"], errors="coerce").fillna(-np.inf)
     else:
-        df = df.drop_duplicates(subset=["track_id", "class_id", "frame"])
+        df["_confidence_rank"] = -np.inf
+    sort_columns = [
+        "track_id",
+        "frame",
+        "_confidence_rank",
+        "_source_order",
+    ]
+    df = df.sort_values(
+        sort_columns,
+        ascending=[True, True, False, True],
+        kind="stable",
+    )
+    dedupe_columns = (
+        ["track_id", "frame"]
+        if bout_class_mode == "mutually_exclusive"
+        else ["track_id", "frame", "class_id"]
+    )
+    df = (
+        df.drop_duplicates(subset=dedupe_columns, keep="first")
+        .sort_values(["track_id", "frame", "class_id"], kind="stable")
+    )
 
     detailed_bouts = []
-    grouped = df.groupby("track_id")
+    grouped = (
+        df.groupby("track_id")
+        if bout_class_mode == "mutually_exclusive"
+        else df.groupby(["track_id", "class_id"])
+    )
 
-    for track_idx, (track_id, track_df) in enumerate(tqdm(grouped, desc="Analyzing Bouts per Animal"), start=1):
-        _check_stop_interval(stop_check, track_idx, stage="Bout analysis", interval=8)
-        track_df = track_df.sort_values("frame")
-        for class_idx, (class_id, class_group) in enumerate(track_df.groupby("class_id"), start=1):
-            _check_stop_interval(stop_check, class_idx, stage="Bout analysis", interval=16)
-            if class_group.empty:
-                continue
-
-            class_name = class_names.get(class_id) or class_names.get(str(class_id)) or f"Class_{class_id}"
-            frames = class_group["frame"].to_numpy(dtype=int)
-            roi_labels = (
-                class_group["_roi_label"].to_numpy(dtype=object) if use_roi else None
+    def _resolve_class_name(class_id: int) -> str:
+        if isinstance(class_names, dict):
+            return (
+                class_names.get(class_id)
+                or class_names.get(str(class_id))
+                or f"Class_{class_id}"
             )
+        if isinstance(class_names, (list, tuple)) and 0 <= int(class_id) < len(class_names):
+            return str(class_names[int(class_id)])
+        return f"Class_{class_id}"
 
-            gaps = np.diff(frames) > max_gap_frames + 1
-            breaks = gaps
+    def _summarize_roi(
+        rows: pd.DataFrame,
+        *,
+        label_column: str,
+        memberships_column: str,
+    ) -> tuple[str, Tuple[str, ...]]:
+        labels = [
+            _normalize_roi(value)
+            for value in rows[label_column].tolist()
+            if _normalize_roi(value)
+        ]
+        memberships: list[str] = []
+        for value in rows[memberships_column].tolist():
+            memberships.extend(_normalize_memberships(value))
+        unique_memberships = tuple(dict.fromkeys(memberships))
+        if not labels:
+            return "", unique_memberships
+        counts = Counter(labels)
+        max_count = max(counts.values())
+        candidates = {name for name, count in counts.items() if count == max_count}
+        primary = next(name for name in labels if name in candidates)
+        return str(primary), unique_memberships
 
-            bout_ends = np.where(breaks)[0]
-            bout_starts_indices = np.insert(bout_ends + 1, 0, 0)
-            bout_ends_indices = np.append(bout_ends, len(frames) - 1)
+    def _append_bout(track_id: int, bout_rows: pd.DataFrame) -> None:
+        if bout_rows.empty:
+            return
+        bout_start_frame = int(bout_rows["frame"].iloc[0])
+        bout_end_frame = int(bout_rows["frame"].iloc[-1])
+        duration_frames = int(bout_end_frame - bout_start_frame + 1)
+        if duration_frames < min_bout_frames:
+            return
 
-            for start_idx, end_idx in zip(bout_starts_indices, bout_ends_indices):
-                bout_start_frame = int(frames[start_idx])
-                bout_end_frame = int(frames[end_idx])
-                duration_frames = int(bout_end_frame - bout_start_frame + 1)
+        observed_frames = int(bout_rows["frame"].nunique())
+        bridged_frames = max(0, duration_frames - observed_frames)
+        frame_values = bout_rows["frame"].to_numpy(dtype=int)
+        missing_runs = np.maximum(np.diff(frame_values) - 1, 0) if len(frame_values) > 1 else np.array([], dtype=int)
+        maximum_bridged_gap = int(missing_runs.max()) if missing_runs.size else 0
+        class_id = int(bout_rows["class_id"].iloc[0])
+        entry = {
+            "Track ID": int(track_id),
+            "Class ID": class_id,
+            "Behavior": _resolve_class_name(class_id),
+            "Start Frame": bout_start_frame,
+            "End Frame": bout_end_frame,
+            "Duration (Frames)": duration_frames,
+            "Observed Frames": observed_frames,
+            "Bridged Frames": bridged_frames,
+            "Observed Fraction": float(observed_frames / duration_frames),
+            "Maximum Bridged Gap (Frames)": maximum_bridged_gap,
+            "Resolved Class-Conflict Frames": (
+                int(bout_rows["_class_conflict"].sum())
+                if bout_class_mode == "mutually_exclusive"
+                else 0
+            ),
+            "Concurrent Class Frames": (
+                int(bout_rows["_class_conflict"].sum())
+                if bout_class_mode == "multi_label"
+                else 0
+            ),
+            "Start Time (s)": bout_start_frame / fps_value,
+            "End Time (s)": bout_end_frame / fps_value,
+            "Duration (s)": duration_frames / fps_value,
+        }
+        if use_roi:
+            raw_primary, raw_memberships = _summarize_roi(
+                bout_rows,
+                label_column="_raw_roi_label",
+                memberships_column="_raw_roi_memberships",
+            )
+            if use_qualified_roi:
+                qualified_primary, qualified_memberships = _summarize_roi(
+                    bout_rows,
+                    label_column="_qualified_roi_label",
+                    memberships_column="_qualified_roi_memberships",
+                )
+                entry["ROI Name"] = qualified_primary
+                entry["ROI Memberships"] = qualified_memberships
+                entry["Raw ROI Name"] = raw_primary
+                entry["Raw ROI Memberships"] = raw_memberships
+                entry["ROI Context Semantics"] = "dwell_qualified"
+            else:
+                entry["ROI Name"] = raw_primary
+                entry["ROI Memberships"] = raw_memberships
+                entry["ROI Context Semantics"] = "raw_membership"
+        detailed_bouts.append(entry)
 
-                if duration_frames < min_bout_frames:
-                    continue
-
-                if has_valid_fps:
-                    start_time = bout_start_frame / fps_value
-                    end_time = bout_end_frame / fps_value
-                    duration_time = duration_frames / fps_value
-                else:
-                    start_time = np.nan
-                    end_time = np.nan
-                    duration_time = np.nan
-
-                entry = {
-                    "Track ID": int(track_id),
-                    "Behavior": class_name,
-                    "Start Frame": bout_start_frame,
-                    "End Frame": bout_end_frame,
-                    "Duration (Frames)": duration_frames,
-                    "Start Time (s)": start_time,
-                    "End Time (s)": end_time,
-                    "Duration (s)": duration_time,
-                }
-                if use_roi and roi_labels is not None and roi_labels.size:
-                    roi_slice = roi_labels[start_idx:end_idx + 1]
-                    non_empty = [label for label in roi_slice if label]
-                    memberships = tuple(dict.fromkeys(non_empty))
-                    primary_roi = ""
-                    if non_empty:
-                        counts = Counter(non_empty)
-                        max_count = max(counts.values())
-                        candidates = {roi for roi, count in counts.items() if count == max_count}
-                        if len(candidates) == 1:
-                            primary_roi = next(iter(candidates))
-                        else:
-                            for roi in non_empty:
-                                if roi in candidates:
-                                    primary_roi = roi
-                                    break
-                    entry["ROI Name"] = str(primary_roi)
-                    entry["ROI Memberships"] = memberships
-                elif use_roi:
-                    entry["ROI Name"] = ""
-                    entry["ROI Memberships"] = ()
-                detailed_bouts.append(entry)
+    for track_idx, (group_key, track_df) in enumerate(tqdm(grouped, desc="Analyzing Bouts per Animal"), start=1):
+        _check_stop_interval(stop_check, track_idx, stage="Bout analysis", interval=8)
+        track_id = (
+            int(group_key[0])
+            if bout_class_mode == "multi_label"
+            else int(group_key)
+        )
+        track_df = track_df.sort_values("frame", kind="stable")
+        current_indices: list[int] = []
+        previous_frame: int | None = None
+        previous_class: int | None = None
+        for row_idx, (frame_index, row) in enumerate(track_df.iterrows(), start=1):
+            _check_stop_interval(stop_check, row_idx, stage="Bout analysis", interval=64)
+            frame = int(row["frame"])
+            class_id = int(row["class_id"])
+            continues_current = bool(
+                current_indices
+                and previous_class == class_id
+                and previous_frame is not None
+                and frame - previous_frame <= max_gap_frames + 1
+            )
+            if not continues_current and current_indices:
+                _append_bout(int(track_id), track_df.loc[current_indices])
+                current_indices = []
+            current_indices.append(frame_index)
+            previous_frame = frame
+            previous_class = class_id
+        if current_indices:
+            _append_bout(int(track_id), track_df.loc[current_indices])
 
     if not detailed_bouts:
         return pd.DataFrame(), pd.DataFrame()
 
     detailed_bouts_df = pd.DataFrame(detailed_bouts)
 
-    summary_group_cols = ['Track ID', 'Behavior']
+    summary_group_cols = ['Track ID', 'Class ID', 'Behavior']
     if use_roi:
         summary_group_cols.append('ROI Name')
 
@@ -1972,6 +2430,7 @@ def compute_roi_metrics(
     max_gap_frames=0,
     min_dwell_frames=1,
     stop_check: Optional[Callable[[], bool]] = None,
+    _include_exclusive: bool = True,
 ):
     roi_column = roi_column or ''
     if per_frame_df.empty or 'track_id' not in per_frame_df.columns or 'frame' not in per_frame_df.columns:
@@ -1987,9 +2446,7 @@ def compute_roi_metrics(
 
     entries = Counter()
     exits = Counter()
-    transitions = Counter()
     frame_counts = Counter()
-    per_track_transitions = defaultdict(Counter)
 
     def _new_roi_stats():
         return {
@@ -2009,6 +2466,7 @@ def compute_roi_metrics(
     all_roi_names = set()
     has_class_column = 'class_id' in per_frame_df.columns
     presence_frames_by_track = defaultdict(lambda: defaultdict(list))
+    primary_observations_by_track = defaultdict(list)
 
     def _normalise_primary(value):
         if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -2037,6 +2495,45 @@ def compute_roi_metrics(
             if name:
                 memberships.append(name)
         return tuple(sorted(set(memberships)))
+
+    def _attach_exclusive_outputs(result: dict) -> dict:
+        if not _include_exclusive or not roi_column or roi_column not in per_frame_df.columns:
+            return result
+        exclusive_input = per_frame_df.copy()
+        exclusive_input["ROI Memberships"] = [
+            (name,) if name else ()
+            for name in (_normalise_primary(value) for value in exclusive_input[roi_column].tolist())
+        ]
+        exclusive = compute_roi_metrics(
+            exclusive_input,
+            roi_column,
+            fps,
+            class_names,
+            max_gap_frames=max_gap_frames,
+            min_dwell_frames=min_dwell_frames,
+            stop_check=stop_check,
+            _include_exclusive=False,
+        )
+        if not isinstance(exclusive, dict):
+            return result
+        for key in (
+            "entries_exits",
+            "entries_exits_by_track",
+            "dwell_events",
+            "roi_behavior_summary",
+            "roi_behavior_by_track",
+        ):
+            frame = result.get(key)
+            if isinstance(frame, pd.DataFrame):
+                frame = frame.copy()
+                frame["Occupancy Semantics"] = "concurrent_membership"
+                result[key] = frame
+            exclusive_frame = exclusive.get(key)
+            if isinstance(exclusive_frame, pd.DataFrame):
+                exclusive_frame = exclusive_frame.copy()
+                exclusive_frame["Occupancy Semantics"] = "exclusive_primary"
+                result[f"exclusive_{key}"] = exclusive_frame
+        return result
 
     def _resolve_behavior(class_id):
         if class_id is None or (isinstance(class_id, float) and np.isnan(class_id)):
@@ -2124,7 +2621,6 @@ def compute_roi_metrics(
         _check_stop_interval(stop_check, track_idx, stage="ROI metric aggregation", interval=8)
         track_df = track_df.sort_values('frame')
         active_rois: Dict[str, Dict[str, int]] = {}
-        prev_primary = None
         last_frame = None
 
         for row_idx, (_, row) in enumerate(track_df.iterrows(), start=1):
@@ -2137,9 +2633,9 @@ def compute_roi_metrics(
                     roi_stats['Exits'] += 1
                     _record_dwell(track_id, roi_name, info['start_frame'], info['last_frame'])
                 active_rois = {}
-                prev_primary = None
             memberships = _normalise_memberships(row.get(membership_column))
             primary_roi = _normalise_primary(row.get(roi_column))
+            primary_observations_by_track[track_id].append((frame, primary_roi or ""))
             class_id = row['class_id'] if has_class_column else None
             behavior_name = _resolve_behavior(class_id) if has_class_column else None
 
@@ -2182,11 +2678,6 @@ def compute_roi_metrics(
                 membership_set.add(primary_roi)
                 all_roi_names.add(primary_roi)
 
-            if prev_primary and primary_roi and prev_primary != primary_roi:
-                transitions[(prev_primary, primary_roi)] += 1
-                per_track_transitions[track_id][(prev_primary, primary_roi)] += 1
-
-            prev_primary = primary_roi
             last_frame = frame
 
         # Close any lingering ROI memberships after the last frame.
@@ -2202,6 +2693,8 @@ def compute_roi_metrics(
     exits = Counter()
     dwell_records = []
     roi_dwell_totals = defaultdict(lambda: {'events': 0, 'frames': 0, 'time': 0.0})
+    qualified_memberships_by_track_frame: Dict[Tuple[int, int], set[str]] = defaultdict(set)
+    qualified_primary_by_track_frame: Dict[Tuple[int, int], str] = {}
     for track_stats in per_track_stats.values():
         for stats in track_stats.values():
             stats['Entries'] = 0
@@ -2224,28 +2717,62 @@ def compute_roi_metrics(
                 roi_stats['Entries'] += 1
                 roi_stats['Exits'] += 1
                 _record_dwell(track_id, roi_name, start_frame, end_frame)
+                for frame in range(int(start_frame), int(end_frame) + 1):
+                    qualified_memberships_by_track_frame[(int(track_id), int(frame))].add(str(roi_name))
+
+    # ROI-to-ROI transitions use the exclusive primary ROI label, with the
+    # same gap and minimum-duration rules as entry/exit events.  Concurrent
+    # memberships remain available in ``ROI Memberships`` and are counted
+    # independently above; only the primary sequence is exclusive.
+    transitions = Counter()
+    per_track_transitions = defaultdict(Counter)
+    for track_id in sorted(primary_observations_by_track.keys()):
+        visits = _build_label_segments(
+            primary_observations_by_track[track_id],
+            gap_threshold=gap_threshold,
+            min_duration=min_dwell_frames,
+        )
+        previous_name = ""
+        for roi_name, start_frame, end_frame in visits:
+            for frame in range(int(start_frame), int(end_frame) + 1):
+                qualified_primary_by_track_frame[(int(track_id), int(frame))] = str(roi_name)
+            if previous_name and roi_name != previous_name:
+                transitions[(previous_name, roi_name)] += 1
+                per_track_transitions[track_id][(previous_name, roi_name)] += 1
+            previous_name = roi_name
 
     if not all_roi_names:
         empty_overview_cols = [
             'ROI Name', 'Entries', 'Exits', 'Frames in ROI', 'Time in ROI (s)',
+            'Raw Occupancy Frames', 'Raw Occupancy Time (s)',
             'Dwell Events', 'Mean Dwell Duration (frames)', 'Mean Dwell Duration (s)',
             'Median Dwell Duration (frames)', 'Median Dwell Duration (s)', 'Total Dwell Frames',
-            'Total Dwell Time (s)'
+            'Total Dwell Time (s)', 'Qualified Dwell Frames', 'Qualified Dwell Time (s)',
+            'Minimum Dwell (Frames)', 'Maximum Gap (Frames)',
         ]
-        return {
+        empty_result = {
             'entries_exits': pd.DataFrame(columns=empty_overview_cols),
             'transitions': pd.DataFrame(columns=['From ROI', 'To ROI', 'Transition Count']),
             'entries_exits_by_track': pd.DataFrame(columns=[
                 'Track ID', 'ROI Name', 'Entries', 'Exits', 'Frames in ROI', 'Time in ROI (s)',
+                'Raw Occupancy Frames', 'Raw Occupancy Time (s)',
                 'Dwell Events', 'Mean Dwell Duration (frames)', 'Mean Dwell Duration (s)',
                 'Median Dwell Duration (frames)', 'Median Dwell Duration (s)',
-                'Total Dwell Frames', 'Total Dwell Time (s)'
+                'Total Dwell Frames', 'Total Dwell Time (s)', 'Qualified Dwell Frames',
+                'Qualified Dwell Time (s)', 'Minimum Dwell (Frames)', 'Maximum Gap (Frames)',
             ]),
             'dwell_events': pd.DataFrame(columns=['Track ID', 'ROI Name', 'Start Frame', 'End Frame', 'Duration (Frames)', 'Duration (s)']),
             'transitions_by_track': pd.DataFrame(columns=['Track ID', 'From ROI', 'To ROI', 'Transition Count']),
             'roi_behavior_summary': pd.DataFrame(columns=['ROI Name', 'Behavior', 'Frames in ROI', 'Time in ROI (s)', 'Occupancy Within ROI (%)']),
-            'roi_behavior_by_track': pd.DataFrame(columns=['Track ID', 'ROI Name', 'Behavior', 'Frames in ROI', 'Time in ROI (s)'])
+            'roi_behavior_by_track': pd.DataFrame(columns=['Track ID', 'ROI Name', 'Behavior', 'Frames in ROI', 'Time in ROI (s)']),
+            'qualified_memberships_by_track_frame': {},
+            'qualified_primary_by_track_frame': {},
+            'qualification_parameters': {
+                'max_gap_frames': gap_threshold,
+                'min_dwell_frames': min_dwell_frames,
+            },
         }
+        return _attach_exclusive_outputs(empty_result)
 
     dwell_events_df = pd.DataFrame(dwell_records)
     if not dwell_events_df.empty:
@@ -2273,6 +2800,8 @@ def compute_roi_metrics(
             'Exits': exits.get(roi_name, 0),
             'Frames in ROI': total_frames,
             'Time in ROI (s)': (total_frames / fps) if has_valid_fps else np.nan,
+            'Raw Occupancy Frames': total_frames,
+            'Raw Occupancy Time (s)': (total_frames / fps) if has_valid_fps else np.nan,
             'Dwell Events': dwell_events_count,
             'Mean Dwell Duration (frames)': mean_dwell_frames,
             'Mean Dwell Duration (s)': mean_dwell_s,
@@ -2280,6 +2809,10 @@ def compute_roi_metrics(
             'Median Dwell Duration (s)': roi_median_s.get(roi_name, np.nan) if not dwell_events_df.empty else np.nan,
             'Total Dwell Frames': dwell_totals['frames'],
             'Total Dwell Time (s)': dwell_totals['time'] if has_valid_fps else np.nan,
+            'Qualified Dwell Frames': dwell_totals['frames'],
+            'Qualified Dwell Time (s)': dwell_totals['time'] if has_valid_fps else np.nan,
+            'Minimum Dwell (Frames)': min_dwell_frames,
+            'Maximum Gap (Frames)': gap_threshold,
         })
     entries_exits_df = pd.DataFrame(overview_rows).sort_values('ROI Name').reset_index(drop=True)
 
@@ -2298,11 +2831,17 @@ def compute_roi_metrics(
                 'Exits': stats['Exits'],
                 'Frames in ROI': stats['Total Frames'],
                 'Time in ROI (s)': (stats['Total Frames'] / fps) if has_valid_fps else np.nan,
+                'Raw Occupancy Frames': stats['Total Frames'],
+                'Raw Occupancy Time (s)': (stats['Total Frames'] / fps) if has_valid_fps else np.nan,
                 'Dwell Events': dwell_events_count,
                 'Mean Dwell Duration (frames)': mean_dwell_frames,
                 'Mean Dwell Duration (s)': mean_dwell_s,
                 'Total Dwell Frames': stats['Total Dwell Frames'],
                 'Total Dwell Time (s)': stats['Total Dwell Time (s)'] if has_valid_fps else np.nan,
+                'Qualified Dwell Frames': stats['Total Dwell Frames'],
+                'Qualified Dwell Time (s)': stats['Total Dwell Time (s)'] if has_valid_fps else np.nan,
+                'Minimum Dwell (Frames)': min_dwell_frames,
+                'Maximum Gap (Frames)': gap_threshold,
             })
     per_track_df = pd.DataFrame(per_track_rows)
     if not per_track_df.empty:
@@ -2326,9 +2865,11 @@ def compute_roi_metrics(
     else:
         per_track_df = pd.DataFrame(columns=[
             'Track ID', 'ROI Name', 'Entries', 'Exits', 'Frames in ROI', 'Time in ROI (s)',
+            'Raw Occupancy Frames', 'Raw Occupancy Time (s)',
             'Dwell Events', 'Mean Dwell Duration (frames)', 'Mean Dwell Duration (s)',
             'Total Dwell Frames', 'Total Dwell Time (s)', 'Median Dwell Duration (s)',
-            'Median Dwell Duration (frames)'
+            'Median Dwell Duration (frames)', 'Qualified Dwell Frames',
+            'Qualified Dwell Time (s)', 'Minimum Dwell (Frames)', 'Maximum Gap (Frames)',
         ])
 
     transition_rows = []
@@ -2401,7 +2942,7 @@ def compute_roi_metrics(
     else:
         per_track_behavior_df = pd.DataFrame(columns=['Track ID', 'ROI Name', 'Behavior', 'Frames in ROI', 'Time in ROI (s)'])
 
-    return {
+    result = {
         'entries_exits': entries_exits_df,
         'transitions': transitions_df,
         'entries_exits_by_track': per_track_df,
@@ -2409,7 +2950,17 @@ def compute_roi_metrics(
         'transitions_by_track': per_track_transitions_df,
         'roi_behavior_summary': roi_behavior_df,
         'roi_behavior_by_track': per_track_behavior_df,
+        'qualified_memberships_by_track_frame': {
+            key: tuple(sorted(values))
+            for key, values in qualified_memberships_by_track_frame.items()
+        },
+        'qualified_primary_by_track_frame': dict(qualified_primary_by_track_frame),
+        'qualification_parameters': {
+            'max_gap_frames': gap_threshold,
+            'min_dwell_frames': min_dwell_frames,
+        },
     }
+    return _attach_exclusive_outputs(result)
 
 def save_bout_summary_to_excel(detailed_bouts_df, output_folder, class_names, fps, video_name):
     """
@@ -2585,19 +3136,39 @@ def generate_analytics_dashboard(output_folder, video_name, detailed_bouts_df, s
         _render_empty(ax, 'Average Bout Duration (s) by Behavior')
 
     ax = axes[2]
-    roi_overview = roi_metrics.get('entries_exits')
-    if roi_overview is not None and not roi_overview.empty and 'Time in ROI (s)' in roi_overview.columns:
-        time_series = roi_overview.set_index('ROI Name')['Time in ROI (s)'].fillna(0).sort_values(ascending=False)
+    roi_overview = roi_metrics.get('exclusive_entries_exits')
+    if roi_overview is None or roi_overview.empty:
+        roi_overview = roi_metrics.get('entries_exits')
+    roi_time_column = next(
+        (
+            column
+            for column in (
+                'Qualified Dwell Time (s)',
+                'Total Dwell Time (s)',
+                'Raw Occupancy Time (s)',
+                'Time in ROI (s)',
+            )
+            if roi_overview is not None and column in roi_overview.columns
+        ),
+        None,
+    )
+    if roi_overview is not None and not roi_overview.empty and roi_time_column:
+        time_series = roi_overview.set_index('ROI Name')[roi_time_column].fillna(0).sort_values(ascending=False)
+        roi_time_title = (
+            'Dwell-Qualified Time per ROI (s)'
+            if roi_time_column in {'Qualified Dwell Time (s)', 'Total Dwell Time (s)'}
+            else 'Raw Occupancy Time per ROI (s)'
+        )
         if not time_series.empty:
             ax.bar(time_series.index, time_series.values, color='#C44E52')
             ax.set_xlabel('ROI Name')
             ax.set_ylabel('Seconds')
             _format_x_labels(ax)
         else:
-            _render_empty(ax, 'Total Time Spent per ROI (s)')
-        ax.set_title('Total Time Spent per ROI (s)')
+            _render_empty(ax, roi_time_title)
+        ax.set_title(roi_time_title)
     else:
-        _render_empty(ax, 'Total Time Spent per ROI (s)')
+        _render_empty(ax, 'Dwell-Qualified Time per ROI (s)')
 
     ax = axes[3]
     transitions_df = roi_metrics.get('transitions')
@@ -2637,6 +3208,50 @@ def generate_analytics_dashboard(output_folder, video_name, detailed_bouts_df, s
     finally:
         plt.close(fig)
 
+
+def _attach_qualified_roi_context(per_frame_df: pd.DataFrame, roi_metrics: dict | None) -> pd.DataFrame:
+    """Attach dwell-qualified ROI context without overwriting raw membership."""
+
+    if per_frame_df is None:
+        return pd.DataFrame()
+    out = per_frame_df.copy()
+    membership_lookup = (
+        roi_metrics.get("qualified_memberships_by_track_frame", {})
+        if isinstance(roi_metrics, dict)
+        else {}
+    )
+    primary_lookup = (
+        roi_metrics.get("qualified_primary_by_track_frame", {})
+        if isinstance(roi_metrics, dict)
+        else {}
+    )
+    if "track_id" not in out.columns or "frame" not in out.columns:
+        out["Qualified ROI Name"] = ""
+        out["Qualified ROI Memberships"] = [() for _ in range(len(out))]
+        return out
+
+    qualified_names: list[str] = []
+    qualified_memberships: list[Tuple[str, ...]] = []
+    for track_value, frame_value in zip(out["track_id"].tolist(), out["frame"].tolist()):
+        try:
+            key = (int(track_value), int(frame_value))
+        except (TypeError, ValueError):
+            qualified_names.append("")
+            qualified_memberships.append(())
+            continue
+        memberships = tuple(membership_lookup.get(key, ()) or ())
+        primary = str(primary_lookup.get(key, "") or "").strip()
+        if primary and primary not in memberships:
+            memberships = tuple(dict.fromkeys((primary, *memberships)))
+        if not primary and memberships:
+            primary = str(memberships[0])
+        qualified_names.append(primary)
+        qualified_memberships.append(memberships)
+    out["Qualified ROI Name"] = qualified_names
+    out["Qualified ROI Memberships"] = qualified_memberships
+    return out
+
+
 def save_analysis_outputs(
     per_frame_df,
     yaml_path,
@@ -2654,6 +3269,7 @@ def save_analysis_outputs(
     roi_max_gap_frames=0,
     roi_min_dwell_frames=1,
     stop_check: Optional[Callable[[], bool]] = None,
+    bout_class_mode: str = "mutually_exclusive",
 ):
     if fps is None or not (float(fps) > 0):
         raise ValueError(
@@ -2701,73 +3317,6 @@ def save_analysis_outputs(
     class_names = _infer_class_names_from_dataframe(per_frame_df, class_names)
 
     _raise_if_stop_requested(stop_check, "Analysis export")
-    detailed_bouts_df, summary_df = analyze_bouts(
-        per_frame_df,
-        class_names,
-        max_gap_frames,
-        min_bout_frames,
-        fps,
-        roi_column=roi_column,
-        stop_check=stop_check,
-    )
-
-    if run_id is None:
-        import uuid
-
-        run_id = uuid.uuid4().hex
-
-    if detailed_bouts_df is not None and not detailed_bouts_df.empty:
-        detailed_bouts_df = detailed_bouts_df.copy()
-        if "Run ID" not in detailed_bouts_df.columns:
-            detailed_bouts_df.insert(0, "Run ID", str(run_id))
-        else:
-            detailed_bouts_df["Run ID"] = str(run_id)
-
-        if "Bout ID" not in detailed_bouts_df.columns:
-            import uuid
-
-            def _make_bout_id(row):
-                roi_name = row.get("ROI Name", "") if isinstance(row, dict) else ""
-                if roi_name is None:
-                    roi_name = ""
-                name = (
-                    f"{run_id}|{row.get('Track ID')}|{row.get('Behavior')}|"
-                    f"{row.get('Start Frame')}|{row.get('End Frame')}|{roi_name}"
-                )
-                return str(uuid.uuid5(uuid.NAMESPACE_URL, name))
-
-            detailed_bouts_df.insert(
-                1,
-                "Bout ID",
-                [
-                    _make_bout_id(row)
-                    for row in detailed_bouts_df.to_dict(orient="records")
-                ],
-            )
-
-    if summary_df is not None and not summary_df.empty:
-        summary_df = summary_df.copy()
-        if "Run ID" not in summary_df.columns:
-            summary_df.insert(0, "Run ID", str(run_id))
-        else:
-            summary_df["Run ID"] = str(run_id)
-
-    if not detailed_bouts_df.empty:
-        detailed_csv_path = os.path.join(output_folder, f"{video_name}_detailed_bouts.csv")
-        summary_csv_path = os.path.join(output_folder, f"{video_name}_summary.csv")
-        try:
-            detailed_bouts_df.to_csv(detailed_csv_path, index=False)
-            summary_df.to_csv(summary_csv_path, index=False)
-            logger.info(f"Saved detailed bouts to {detailed_csv_path}")
-            logger.info(f"Saved summary to {summary_csv_path}")
-        except Exception as e:
-            logger.error(f"Failed to save CSV files: {e}")
-    else:
-        logger.warning("No bouts detected, skipping CSV generation")
-
-    _raise_if_stop_requested(stop_check, "Analysis export")
-    bout_summary_excel_path = save_bout_summary_to_excel(detailed_bouts_df, output_folder, class_names, fps, video_name)
-
     roi_metrics = (
         compute_roi_metrics(
             per_frame_df,
@@ -2781,6 +3330,145 @@ def save_analysis_outputs(
         if roi_column
         else None
     )
+    analysis_per_frame_df = (
+        _attach_qualified_roi_context(per_frame_df, roi_metrics)
+        if roi_column
+        else per_frame_df
+    )
+
+    detailed_bouts_df, summary_df = analyze_bouts(
+        analysis_per_frame_df,
+        class_names,
+        max_gap_frames,
+        min_bout_frames,
+        fps,
+        roi_column=roi_column,
+        stop_check=stop_check,
+        bout_class_mode=bout_class_mode,
+    )
+    if detailed_bouts_df is None or len(detailed_bouts_df.columns) == 0:
+        detailed_columns = [
+            "Track ID",
+            "Class ID",
+            "Behavior",
+            "Start Frame",
+            "End Frame",
+            "Duration (Frames)",
+            "Observed Frames",
+            "Bridged Frames",
+            "Observed Fraction",
+            "Maximum Bridged Gap (Frames)",
+            "Resolved Class-Conflict Frames",
+            "Concurrent Class Frames",
+            "Start Time (s)",
+            "End Time (s)",
+            "Duration (s)",
+        ]
+        if roi_column:
+            detailed_columns.extend(
+                [
+                    "ROI Name",
+                    "ROI Memberships",
+                    "Raw ROI Name",
+                    "Raw ROI Memberships",
+                    "ROI Context Semantics",
+                ]
+            )
+        detailed_bouts_df = pd.DataFrame(columns=detailed_columns)
+    if summary_df is None or len(summary_df.columns) == 0:
+        summary_columns = ["Track ID", "Class ID", "Behavior"]
+        if roi_column:
+            summary_columns.append("ROI Name")
+        summary_columns.extend(
+            ["Bout_Count", "Total_Duration_s", "Mean_Duration_s"]
+        )
+        summary_df = pd.DataFrame(columns=summary_columns)
+
+    if run_id is None:
+        import uuid
+
+        run_id = uuid.uuid4().hex
+
+    detailed_bouts_df = detailed_bouts_df.copy()
+    if "Run ID" not in detailed_bouts_df.columns:
+        detailed_bouts_df.insert(0, "Run ID", str(run_id))
+    else:
+        detailed_bouts_df["Run ID"] = str(run_id)
+
+    if "Bout ID" not in detailed_bouts_df.columns:
+        import uuid
+
+        def _make_bout_id(row):
+            roi_name = row.get("ROI Name", "") if isinstance(row, dict) else ""
+            if roi_name is None:
+                roi_name = ""
+            name = (
+                f"{run_id}|{row.get('Track ID')}|{row.get('Class ID')}|"
+                f"{row.get('Behavior')}|"
+                f"{row.get('Start Frame')}|{row.get('End Frame')}|{roi_name}"
+            )
+            return str(uuid.uuid5(uuid.NAMESPACE_URL, name))
+
+        detailed_bouts_df.insert(
+            1,
+            "Bout ID",
+            [
+                _make_bout_id(row)
+                for row in detailed_bouts_df.to_dict(orient="records")
+            ],
+        )
+    detailed_bouts_df["Interval Semantics"] = "inclusive_start_and_end_frames"
+    normalized_bout_class_mode = str(
+        bout_class_mode or "mutually_exclusive"
+    ).strip().casefold()
+    if normalized_bout_class_mode in {
+        "multilabel",
+        "multi-label",
+        "concurrent",
+    }:
+        normalized_bout_class_mode = "multi_label"
+    elif normalized_bout_class_mode in {"exclusive", "single", "single_label"}:
+        normalized_bout_class_mode = "mutually_exclusive"
+    construction_semantics = (
+        "independent_class_channels_with_missing_frame_gap_fill"
+        if normalized_bout_class_mode == "multi_label"
+        else "mutually_exclusive_observed_states_with_missing_frame_gap_fill"
+    )
+    detailed_bouts_df["Bout Construction Semantics"] = construction_semantics
+    detailed_bouts_df["Behavior Bout Class Mode"] = normalized_bout_class_mode
+    detailed_bouts_df["Minimum Bout Basis"] = "inclusive_post_gap_span"
+    detailed_bouts_df["Detection Max Gap (Frames)"] = int(max_gap_frames)
+    detailed_bouts_df["Detection Min Bout (Frames)"] = int(min_bout_frames)
+    detailed_bouts_df["Analysis FPS"] = float(fps)
+
+    summary_df = summary_df.copy()
+    if "Run ID" not in summary_df.columns:
+        summary_df.insert(0, "Run ID", str(run_id))
+    else:
+        summary_df["Run ID"] = str(run_id)
+    summary_df["Detection Max Gap (Frames)"] = int(max_gap_frames)
+    summary_df["Detection Min Bout (Frames)"] = int(min_bout_frames)
+    summary_df["Bout Construction Semantics"] = construction_semantics
+    summary_df["Behavior Bout Class Mode"] = normalized_bout_class_mode
+    summary_df["Minimum Bout Basis"] = "inclusive_post_gap_span"
+    summary_df["Analysis FPS"] = float(fps)
+
+    detailed_csv_path = os.path.join(output_folder, f"{video_name}_detailed_bouts.csv")
+    summary_csv_path = os.path.join(output_folder, f"{video_name}_summary.csv")
+    try:
+        detailed_bouts_df.to_csv(detailed_csv_path, index=False)
+        summary_df.to_csv(summary_csv_path, index=False)
+        logger.info(f"Saved detailed bouts to {detailed_csv_path}")
+        logger.info(f"Saved summary to {summary_csv_path}")
+        if detailed_bouts_df.empty:
+            logger.info(
+                "No bouts met the configured minimum; saved schema-valid empty bout tables."
+            )
+    except Exception as e:
+        logger.error(f"Failed to save CSV files: {e}")
+
+    _raise_if_stop_requested(stop_check, "Analysis export")
+    bout_summary_excel_path = save_bout_summary_to_excel(detailed_bouts_df, output_folder, class_names, fps, video_name)
 
     if roi_metrics:
         roi_metric_files = {}
@@ -2788,6 +3476,11 @@ def save_analysis_outputs(
             ('entries_exits', 'roi_overview'),
             ('entries_exits_by_track', 'roi_per_track'),
             ('dwell_events', 'roi_dwell_events'),
+            ('exclusive_entries_exits', 'roi_exclusive_overview'),
+            ('exclusive_entries_exits_by_track', 'roi_exclusive_per_track'),
+            ('exclusive_dwell_events', 'roi_exclusive_dwell_events'),
+            ('exclusive_roi_behavior_summary', 'roi_exclusive_behavior_summary'),
+            ('exclusive_roi_behavior_by_track', 'roi_exclusive_behavior_by_track'),
             ('transitions', 'roi_transitions'),
             ('transitions_by_track', 'roi_transitions_per_track'),
             ('roi_behavior_summary', 'roi_behavior_summary'),
@@ -2816,7 +3509,7 @@ def save_analysis_outputs(
     _raise_if_stop_requested(stop_check, "Analysis export")
     module_outputs = run_optional_modules(
         enabled_modules=enabled_modules,
-        per_frame_df=per_frame_df,
+        per_frame_df=analysis_per_frame_df,
         detailed_bouts_df=detailed_bouts_df,
         summary_df=summary_df,
         roi_metrics=roi_metrics,
@@ -2868,6 +3561,13 @@ class AnalyticsModuleContext:
         self._module_dirs: Dict[str, str] = {}
         self.behavior_to_class_id = self._invert_class_names()
         self.session_duration_s = self._compute_session_duration()
+        self.track_ids = self._resolve_track_ids()
+        self.track_count = max(len(self.track_ids), 1)
+        self.session_exposure_s = (
+            float(self.session_duration_s) * self.track_count
+            if np.isfinite(self.session_duration_s)
+            else float('nan')
+        )
         self.visual_prefs = visual_preferences or {}
         self.stop_check = stop_check
         self.roi_events = self.roi_metrics.get('events', {}) if isinstance(self.roi_metrics, dict) else {}
@@ -2898,6 +3598,16 @@ class AnalyticsModuleContext:
             if pd.notna(max_time):
                 return float(max_time)
         return float('nan')
+
+    def _resolve_track_ids(self) -> tuple[int, ...]:
+        for frame in (self.per_frame_df, self.detailed_bouts_df):
+            column = 'track_id' if 'track_id' in frame.columns else ('Track ID' if 'Track ID' in frame.columns else None)
+            if column is None:
+                continue
+            values = pd.to_numeric(frame[column], errors='coerce').dropna().astype(int).unique().tolist()
+            if values:
+                return tuple(sorted(values))
+        return ()
 
     def get_module_dir(self, key: str) -> str:
         if key not in self._module_dirs:
@@ -3490,22 +4200,51 @@ def _module_roi_time_heatmap(context: AnalyticsModuleContext, bin_size_seconds: 
     module_dir = context.get_module_dir('roi_time_heatmap')
     fps = max(context.fps, 1e-6)
     roi_col = context.roi_column
-    roi_df = (
-        df[['frame', 'track_id', roi_col]]
-        .dropna(subset=[context.roi_column])
-        .drop_duplicates(subset=['frame', 'track_id'])
-    )
+    membership_col = 'ROI Memberships' if 'ROI Memberships' in df.columns else roi_col
+    roi_rows: List[Dict[str, Any]] = []
+    for _, row in df[['frame', 'track_id', membership_col]].drop_duplicates(
+        subset=['frame', 'track_id']
+    ).iterrows():
+        names = _parse_membership_names(row.get(membership_col))
+        for roi_name in names:
+            roi_rows.append(
+                {
+                    'frame': row.get('frame'),
+                    'track_id': row.get('track_id'),
+                    roi_col: roi_name,
+                }
+            )
+    roi_df = pd.DataFrame(roi_rows)
     if roi_df.empty:
         return {}
 
+    roi_df['frame'] = pd.to_numeric(roi_df['frame'], errors='coerce')
+    roi_df = roi_df.dropna(subset=['frame'])
+    if roi_df.empty:
+        return {}
     roi_df['Time (s)'] = roi_df['frame'] / fps
     roi_df['Time Bin'] = (roi_df['Time (s)'] // bin_size_seconds).astype(int)
-    occupancy = roi_df.groupby([roi_col, 'Time Bin']).size().reset_index(name='Frame_Count')
+    occupancy = roi_df.groupby([roi_col, 'Time Bin']).agg(
+        Frame_Count=('frame', 'size'),
+        Tracks_Contributing=('track_id', 'nunique'),
+    ).reset_index()
     occupancy['Time Bin Start (s)'] = occupancy['Time Bin'] * bin_size_seconds
     occupancy['Time Bin End (s)'] = occupancy['Time Bin Start (s)'] + bin_size_seconds
     occupancy['Time in ROI (s)'] = occupancy['Frame_Count'] / fps
+    occupancy['Mean Time per Contributing Track (s)'] = np.where(
+        occupancy['Tracks_Contributing'] > 0,
+        occupancy['Time in ROI (s)'] / occupancy['Tracks_Contributing'],
+        np.nan,
+    )
     occupancy_csv = os.path.join(module_dir, f"{context.video_name}_roi_time_heatmap.csv")
-    occupancy[[roi_col, 'Time Bin Start (s)', 'Time Bin End (s)', 'Time in ROI (s)']].to_csv(occupancy_csv, index=False)
+    occupancy[[
+        roi_col,
+        'Time Bin Start (s)',
+        'Time Bin End (s)',
+        'Time in ROI (s)',
+        'Tracks_Contributing',
+        'Mean Time per Contributing Track (s)',
+    ]].to_csv(occupancy_csv, index=False)
 
     pivot = occupancy.pivot(index=roi_col, columns='Time Bin Start (s)', values='Time in ROI (s)').fillna(0.0)
     pivot_csv = os.path.join(module_dir, f"{context.video_name}_roi_time_heatmap_matrix.csv")
@@ -4133,20 +4872,60 @@ def _build_pairwise_preference_rows(
     return pd.DataFrame(rows)
 
 
+def _build_pairwise_preference_by_track(
+    summary_df: pd.DataFrame,
+    *,
+    events_df: pd.DataFrame,
+    source_label: str,
+    name_col: str,
+    measure_specs: Sequence[Tuple[str, str]],
+) -> pd.DataFrame:
+    if summary_df.empty or 'Track ID' not in summary_df.columns:
+        return pd.DataFrame()
+    rows: List[pd.DataFrame] = []
+    for track_id, track_summary in summary_df.groupby('Track ID', dropna=False):
+        first_frames: Dict[str, int] = {}
+        if not events_df.empty and 'Track ID' in events_df.columns:
+            track_events = events_df[
+                (pd.to_numeric(events_df['Track ID'], errors='coerce') == pd.to_numeric(track_id, errors='coerce'))
+                & (events_df['Event Type'] == 'entry')
+            ]
+            if not track_events.empty:
+                first_frames = track_events.groupby('Target Name')['Frame'].min().astype(int).to_dict()
+        pairwise = _build_pairwise_preference_rows(
+            track_summary,
+            source_label=source_label,
+            name_col=name_col,
+            measure_specs=measure_specs,
+            first_event_frames=first_frames,
+        )
+        if pairwise.empty:
+            continue
+        track_numeric = pd.to_numeric(track_id, errors='coerce')
+        pairwise.insert(1, 'Track ID', int(track_numeric) if pd.notna(track_numeric) else track_id)
+        rows.append(pairwise)
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
 def _module_preference_indices(context: AnalyticsModuleContext) -> Dict[str, Any]:
     module_dir = context.get_module_dir("preference_indices")
-    session_duration = context.session_duration_s if np.isfinite(context.session_duration_s) else np.nan
+    session_exposure = context.session_exposure_s if np.isfinite(context.session_exposure_s) else np.nan
     files: Dict[str, str] = {}
 
-    zone_summary = _coerce_dataframe(context.roi_metrics.get("entries_exits") if isinstance(context.roi_metrics, dict) else None)
+    roi_payload = context.roi_metrics if isinstance(context.roi_metrics, dict) else {}
+    zone_summary = _coerce_dataframe(roi_payload.get("exclusive_entries_exits"))
+    if zone_summary.empty:
+        zone_summary = _coerce_dataframe(roi_payload.get("entries_exits"))
     zone_events = _event_records_to_df(context.roi_events, name_key="roi_name", source_label="zone")
     if not zone_summary.empty and "ROI Name" in zone_summary.columns:
         zone_summary = zone_summary.copy()
         zone_summary["Percent of Session"] = np.where(
-            np.isfinite(session_duration) & (session_duration > 0.0),
-            pd.to_numeric(zone_summary.get("Time in ROI (s)"), errors="coerce") / float(session_duration),
+            np.isfinite(session_exposure) & (session_exposure > 0.0),
+            pd.to_numeric(zone_summary.get("Time in ROI (s)"), errors="coerce") / float(session_exposure),
             np.nan,
         )
+        zone_summary["Tracks in Analysis"] = int(context.track_count)
+        zone_summary["Available Track-Time (s)"] = session_exposure
         first_zone_frames = {}
         if not zone_events.empty:
             entries_df = zone_events[zone_events["Event Type"] == "entry"]
@@ -4175,15 +4954,35 @@ def _module_preference_indices(context: AnalyticsModuleContext) -> Dict[str, Any
             pairwise_zone.to_csv(pairwise_zone_path, index=False)
             files["zone_pairwise"] = pairwise_zone_path
 
+        zone_by_track = _coerce_dataframe(roi_payload.get("exclusive_entries_exits_by_track"))
+        if zone_by_track.empty:
+            zone_by_track = _coerce_dataframe(roi_payload.get("entries_exits_by_track"))
+        pairwise_zone_by_track = _build_pairwise_preference_by_track(
+            zone_by_track,
+            events_df=zone_events,
+            source_label="zone",
+            name_col="ROI Name",
+            measure_specs=(
+                ("Time in ROI (s)", "Time Preference"),
+                ("Entries", "Entry Preference"),
+            ),
+        )
+        if not pairwise_zone_by_track.empty:
+            path = os.path.join(module_dir, f"{context.video_name}_zone_preference_pairwise_by_track.csv")
+            pairwise_zone_by_track.to_csv(path, index=False)
+            files["zone_pairwise_by_track"] = path
+
     object_summary = _coerce_dataframe(context.object_summary_df)
     object_events = _event_records_to_df(context.object_events, name_key="object_roi", source_label="object")
     if not object_summary.empty and "Object ROI" in object_summary.columns:
         object_summary = object_summary.copy()
         object_summary["Percent of Session"] = np.where(
-            np.isfinite(session_duration) & (session_duration > 0.0),
-            pd.to_numeric(object_summary.get("Time Interacting (s)"), errors="coerce") / float(session_duration),
+            np.isfinite(session_exposure) & (session_exposure > 0.0),
+            pd.to_numeric(object_summary.get("Time Interacting (s)"), errors="coerce") / float(session_exposure),
             np.nan,
         )
+        object_summary["Tracks in Analysis"] = int(context.track_count)
+        object_summary["Available Track-Time (s)"] = session_exposure
         first_object_frames = {}
         if not object_events.empty:
             entries_df = object_events[object_events["Event Type"] == "entry"]
@@ -4212,6 +5011,23 @@ def _module_preference_indices(context: AnalyticsModuleContext) -> Dict[str, Any
             pairwise_object.to_csv(pairwise_object_path, index=False)
             files["object_pairwise"] = pairwise_object_path
 
+        pairwise_object_by_track = _build_pairwise_preference_by_track(
+            _coerce_dataframe(context.object_per_track_df),
+            events_df=object_events,
+            source_label="object",
+            name_col="Object ROI",
+            measure_specs=(
+                ("Time Interacting (s)", "Interaction Preference"),
+                ("Time Contact (s)", "Contact Preference"),
+                ("Time Proximity Only (s)", "Proximity Preference"),
+                ("Entries", "Entry Preference"),
+            ),
+        )
+        if not pairwise_object_by_track.empty:
+            path = os.path.join(module_dir, f"{context.video_name}_object_preference_pairwise_by_track.csv")
+            pairwise_object_by_track.to_csv(path, index=False)
+            files["object_pairwise_by_track"] = path
+
     return {"files": files} if files else {}
 
 
@@ -4223,20 +5039,26 @@ def _module_latency_metrics(context: AnalyticsModuleContext) -> Dict[str, Any]:
     roi_event_df = _event_records_to_df(context.roi_events, name_key="roi_name", source_label="zone")
     if not roi_event_df.empty:
         zone_rows: List[Dict[str, Any]] = []
-        for target_name, group in roi_event_df.groupby("Target Name"):
+        roi_event_df["Track ID"] = pd.to_numeric(roi_event_df["Track ID"], errors="coerce").fillna(0).astype(int)
+        for (track_id, target_name), group in roi_event_df.groupby(["Track ID", "Target Name"]):
             entries = sorted(group.loc[group["Event Type"] == "entry", "Frame"].astype(int).tolist())
             exits = sorted(group.loc[group["Event Type"] == "exit", "Frame"].astype(int).tolist())
             first_entry = entries[0] if entries else np.nan
-            first_exit = exits[0] if exits else np.nan
+            first_exit = (
+                next((frame for frame in exits if not entries or frame >= entries[0]), np.nan)
+                if exits
+                else np.nan
+            )
             second_entry = entries[1] if len(entries) >= 2 else np.nan
             reentry_delay = np.nan
-            if entries and exits:
-                later_exits = [frame for frame in exits if frame >= entries[0]]
-                if later_exits and len(entries) >= 2:
-                    reentry_delay = float(entries[1] - later_exits[0]) / fps
+            if len(entries) >= 2 and exits:
+                first_visit_exits = [frame for frame in exits if entries[0] <= frame < entries[1]]
+                if first_visit_exits:
+                    reentry_delay = float(entries[1] - first_visit_exits[0]) / fps
             zone_rows.append(
                 {
                     "Target Type": "zone",
+                    "Track ID": int(track_id),
                     "Target Name": str(target_name),
                     "First Entry Frame": first_entry,
                     "First Entry Latency (s)": (float(first_entry) / fps) if pd.notna(first_entry) else np.nan,
@@ -4256,22 +5078,39 @@ def _module_latency_metrics(context: AnalyticsModuleContext) -> Dict[str, Any]:
     object_contact_df = _build_first_membership_df(_coerce_dataframe(context.object_per_frame_df), "Object Contact Memberships", source_label="object_contact")
     object_prox_df = _build_first_membership_df(_coerce_dataframe(context.object_per_frame_df), "Object Proximity Memberships", source_label="object_proximity")
     if not object_event_df.empty or not object_contact_df.empty or not object_prox_df.empty:
-        interaction_frames = (
-            object_event_df[object_event_df["Event Type"] == "entry"].groupby("Target Name")["Frame"].min().to_dict()
-            if not object_event_df.empty
+        if not object_event_df.empty:
+            object_event_df["Track ID"] = pd.to_numeric(
+                object_event_df["Track ID"], errors="coerce"
+            ).fillna(0).astype(int)
+            interaction_frames = (
+                object_event_df[object_event_df["Event Type"] == "entry"]
+                .groupby(["Track ID", "Target Name"])["Frame"]
+                .min()
+                .to_dict()
+            )
+        else:
+            interaction_frames = {}
+        contact_frames = (
+            object_contact_df.groupby(["Track ID", "Target Name"])["Frame"].min().to_dict()
+            if not object_contact_df.empty
             else {}
         )
-        contact_frames = object_contact_df.groupby("Target Name")["Frame"].min().to_dict() if not object_contact_df.empty else {}
-        proximity_frames = object_prox_df.groupby("Target Name")["Frame"].min().to_dict() if not object_prox_df.empty else {}
-        all_names = sorted(set(interaction_frames) | set(contact_frames) | set(proximity_frames))
+        proximity_frames = (
+            object_prox_df.groupby(["Track ID", "Target Name"])["Frame"].min().to_dict()
+            if not object_prox_df.empty
+            else {}
+        )
+        all_keys = sorted(set(interaction_frames) | set(contact_frames) | set(proximity_frames))
         object_rows = []
-        for target_name in all_names:
-            first_interaction = interaction_frames.get(target_name, np.nan)
-            first_contact = contact_frames.get(target_name, np.nan)
-            first_proximity = proximity_frames.get(target_name, np.nan)
+        for track_id, target_name in all_keys:
+            key = (track_id, target_name)
+            first_interaction = interaction_frames.get(key, np.nan)
+            first_contact = contact_frames.get(key, np.nan)
+            first_proximity = proximity_frames.get(key, np.nan)
             object_rows.append(
                 {
                     "Target Type": "object",
+                    "Track ID": int(track_id),
                     "Target Name": str(target_name),
                     "First Interaction Frame": first_interaction,
                     "First Interaction Latency (s)": (float(first_interaction) / fps) if pd.notna(first_interaction) else np.nan,
@@ -4332,7 +5171,10 @@ def _module_visit_structure(context: AnalyticsModuleContext) -> Dict[str, Any]:
     files: Dict[str, str] = {}
     fps = max(context.fps, 1e-6)
 
-    roi_dwell = _coerce_dataframe(context.roi_metrics.get("dwell_events") if isinstance(context.roi_metrics, dict) else None)
+    roi_payload = context.roi_metrics if isinstance(context.roi_metrics, dict) else {}
+    roi_dwell = _coerce_dataframe(roi_payload.get("exclusive_dwell_events"))
+    if roi_dwell.empty:
+        roi_dwell = _coerce_dataframe(roi_payload.get("dwell_events"))
     if not roi_dwell.empty and "ROI Name" in roi_dwell.columns:
         zone_summary, zone_track = _summarize_dwell_events(roi_dwell, name_col="ROI Name", source_label="zone", fps=fps)
         if not zone_summary.empty:
@@ -4373,13 +5215,12 @@ def _module_object_transition_analysis(context: AnalyticsModuleContext) -> Dict[
         _check_stop_interval(context.stop_check, track_idx, stage="Object transition analysis", interval=8)
         group_sorted = group.sort_values("Frame", kind="mergesort")
         prev_name = None
+        visited_names: set[str] = set()
         visit_order = 0
         for _, row in group_sorted.iterrows():
             target_name = str(row.get("Target Name", "") or "").strip()
             frame = int(row.get("Frame"))
             if not target_name:
-                continue
-            if target_name == prev_name:
                 continue
             visit_order += 1
             sequence_rows.append(
@@ -4389,6 +5230,7 @@ def _module_object_transition_analysis(context: AnalyticsModuleContext) -> Dict[
                     "Object ROI": target_name,
                     "Entry Frame": frame,
                     "Entry Time (s)": frame / max(context.fps, 1e-6),
+                    "Is Revisit": target_name in visited_names,
                 }
             )
             if prev_name is not None:
@@ -4400,6 +5242,7 @@ def _module_object_transition_analysis(context: AnalyticsModuleContext) -> Dict[
                         "Transition Count": 1,
                     }
                 )
+            visited_names.add(target_name)
             prev_name = target_name
 
     if not sequence_rows:
@@ -4505,58 +5348,120 @@ def _module_normalization_summary(context: AnalyticsModuleContext) -> Dict[str, 
     module_dir = context.get_module_dir("normalization_summary")
     session_duration = float(context.session_duration_s) if np.isfinite(context.session_duration_s) else np.nan
     session_minutes = session_duration / 60.0 if np.isfinite(session_duration) and session_duration > 0.0 else np.nan
+    exposure_duration = float(context.session_exposure_s) if np.isfinite(context.session_exposure_s) else np.nan
+    exposure_minutes = exposure_duration / 60.0 if np.isfinite(exposure_duration) and exposure_duration > 0.0 else np.nan
     files: Dict[str, str] = {}
 
-    zone_summary = _coerce_dataframe(context.roi_metrics.get("entries_exits") if isinstance(context.roi_metrics, dict) else None)
+    roi_payload = context.roi_metrics if isinstance(context.roi_metrics, dict) else {}
+    zone_summary = _coerce_dataframe(roi_payload.get("exclusive_entries_exits"))
+    if zone_summary.empty:
+        zone_summary = _coerce_dataframe(roi_payload.get("entries_exits"))
     if not zone_summary.empty and "ROI Name" in zone_summary.columns:
         zone_summary = zone_summary.copy()
         zone_summary.insert(0, "Source", "zone")
         zone_summary["Time per Minute (s/min)"] = np.where(
-            np.isfinite(session_minutes) & (session_minutes > 0.0),
-            pd.to_numeric(zone_summary.get("Time in ROI (s)"), errors="coerce") / session_minutes,
+            np.isfinite(exposure_minutes) & (exposure_minutes > 0.0),
+            pd.to_numeric(zone_summary.get("Time in ROI (s)"), errors="coerce") / exposure_minutes,
             np.nan,
         )
         zone_summary["Entries per Minute"] = np.where(
-            np.isfinite(session_minutes) & (session_minutes > 0.0),
-            pd.to_numeric(zone_summary.get("Entries"), errors="coerce") / session_minutes,
+            np.isfinite(exposure_minutes) & (exposure_minutes > 0.0),
+            pd.to_numeric(zone_summary.get("Entries"), errors="coerce") / exposure_minutes,
             np.nan,
         )
         zone_summary["Percent of Session"] = np.where(
-            np.isfinite(session_duration) & (session_duration > 0.0),
-            pd.to_numeric(zone_summary.get("Time in ROI (s)"), errors="coerce") / session_duration,
+            np.isfinite(exposure_duration) & (exposure_duration > 0.0),
+            pd.to_numeric(zone_summary.get("Time in ROI (s)"), errors="coerce") / exposure_duration,
             np.nan,
         )
+        zone_summary["Tracks in Analysis"] = int(context.track_count)
+        zone_summary["Available Track-Time (s)"] = exposure_duration
         zone_path = os.path.join(module_dir, f"{context.video_name}_zone_normalized_summary.csv")
         zone_summary.to_csv(zone_path, index=False)
         files["zone_summary"] = zone_path
+
+        zone_by_track = _coerce_dataframe(roi_payload.get("exclusive_entries_exits_by_track"))
+        if zone_by_track.empty:
+            zone_by_track = _coerce_dataframe(roi_payload.get("entries_exits_by_track"))
+        if not zone_by_track.empty:
+            zone_by_track = zone_by_track.copy()
+            zone_by_track.insert(0, "Source", "zone")
+            zone_by_track["Time per Minute (s/min)"] = np.where(
+                np.isfinite(session_minutes) & (session_minutes > 0.0),
+                pd.to_numeric(zone_by_track.get("Time in ROI (s)"), errors="coerce") / session_minutes,
+                np.nan,
+            )
+            zone_by_track["Entries per Minute"] = np.where(
+                np.isfinite(session_minutes) & (session_minutes > 0.0),
+                pd.to_numeric(zone_by_track.get("Entries"), errors="coerce") / session_minutes,
+                np.nan,
+            )
+            zone_by_track["Percent of Session"] = np.where(
+                np.isfinite(session_duration) & (session_duration > 0.0),
+                pd.to_numeric(zone_by_track.get("Time in ROI (s)"), errors="coerce") / session_duration,
+                np.nan,
+            )
+            path = os.path.join(module_dir, f"{context.video_name}_zone_normalized_by_track.csv")
+            zone_by_track.to_csv(path, index=False)
+            files["zone_by_track"] = path
 
     object_summary = _coerce_dataframe(context.object_summary_df)
     if not object_summary.empty and "Object ROI" in object_summary.columns:
         object_summary = object_summary.copy()
         object_summary.insert(0, "Source", "object")
         object_summary["Interaction Time per Minute (s/min)"] = np.where(
-            np.isfinite(session_minutes) & (session_minutes > 0.0),
-            pd.to_numeric(object_summary.get("Time Interacting (s)"), errors="coerce") / session_minutes,
+            np.isfinite(exposure_minutes) & (exposure_minutes > 0.0),
+            pd.to_numeric(object_summary.get("Time Interacting (s)"), errors="coerce") / exposure_minutes,
             np.nan,
         )
         object_summary["Contact Time per Minute (s/min)"] = np.where(
-            np.isfinite(session_minutes) & (session_minutes > 0.0),
-            pd.to_numeric(object_summary.get("Time Contact (s)"), errors="coerce") / session_minutes,
+            np.isfinite(exposure_minutes) & (exposure_minutes > 0.0),
+            pd.to_numeric(object_summary.get("Time Contact (s)"), errors="coerce") / exposure_minutes,
             np.nan,
         )
         object_summary["Entries per Minute"] = np.where(
-            np.isfinite(session_minutes) & (session_minutes > 0.0),
-            pd.to_numeric(object_summary.get("Entries"), errors="coerce") / session_minutes,
+            np.isfinite(exposure_minutes) & (exposure_minutes > 0.0),
+            pd.to_numeric(object_summary.get("Entries"), errors="coerce") / exposure_minutes,
             np.nan,
         )
         object_summary["Percent of Session"] = np.where(
-            np.isfinite(session_duration) & (session_duration > 0.0),
-            pd.to_numeric(object_summary.get("Time Interacting (s)"), errors="coerce") / session_duration,
+            np.isfinite(exposure_duration) & (exposure_duration > 0.0),
+            pd.to_numeric(object_summary.get("Time Interacting (s)"), errors="coerce") / exposure_duration,
             np.nan,
         )
+        object_summary["Tracks in Analysis"] = int(context.track_count)
+        object_summary["Available Track-Time (s)"] = exposure_duration
         object_path = os.path.join(module_dir, f"{context.video_name}_object_normalized_summary.csv")
         object_summary.to_csv(object_path, index=False)
         files["object_summary"] = object_path
+
+        object_by_track = _coerce_dataframe(context.object_per_track_df)
+        if not object_by_track.empty:
+            object_by_track = object_by_track.copy()
+            object_by_track.insert(0, "Source", "object")
+            object_by_track["Interaction Time per Minute (s/min)"] = np.where(
+                np.isfinite(session_minutes) & (session_minutes > 0.0),
+                pd.to_numeric(object_by_track.get("Time Interacting (s)"), errors="coerce") / session_minutes,
+                np.nan,
+            )
+            object_by_track["Contact Time per Minute (s/min)"] = np.where(
+                np.isfinite(session_minutes) & (session_minutes > 0.0),
+                pd.to_numeric(object_by_track.get("Time Contact (s)"), errors="coerce") / session_minutes,
+                np.nan,
+            )
+            object_by_track["Entries per Minute"] = np.where(
+                np.isfinite(session_minutes) & (session_minutes > 0.0),
+                pd.to_numeric(object_by_track.get("Entries"), errors="coerce") / session_minutes,
+                np.nan,
+            )
+            object_by_track["Percent of Session"] = np.where(
+                np.isfinite(session_duration) & (session_duration > 0.0),
+                pd.to_numeric(object_by_track.get("Time Interacting (s)"), errors="coerce") / session_duration,
+                np.nan,
+            )
+            path = os.path.join(module_dir, f"{context.video_name}_object_normalized_by_track.csv")
+            object_by_track.to_csv(path, index=False)
+            files["object_by_track"] = path
 
     return {"files": files} if files else {}
 

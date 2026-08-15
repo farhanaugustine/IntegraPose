@@ -1,18 +1,16 @@
-"""ADP-4 Commit B — bout aggregation helpers, GUI-free.
+"""Bout aggregation helpers without GUI dependencies.
 
 This module hosts pure-data bout aggregators that do NOT pull in any of
 the GUI / ML stack (no matplotlib, no torch, no umap, no hmmlearn). The
-function lives here so:
+separate module allows:
 
   1. Tests can import and exercise it on a minimal pandas+numpy install
      without dragging in 1 GB of optional deps.
-  2. ADP-4's defensibility code (held-out report, stability audit) can
-     reuse it from contexts that don't need the full toolkit.
+  2. Held-out reports, stability audits, and cluster naming to reuse the
+     aggregation logic without importing the full toolkit.
 
-The legacy ``aggregate_into_bouts`` (class-id segmentation) remains in
-``main.py`` for now — many existing call sites depend on its surrounding
-context and a wholesale move would balloon the diff. When that function
-gets extracted, this module is its natural home.
+The legacy ``aggregate_into_bouts`` class-id implementation remains in
+``main.py`` because existing call sites depend on its surrounding context.
 """
 
 from __future__ import annotations
@@ -42,10 +40,8 @@ def aggregate_states_into_bouts(
 
     - ``aggregate_into_bouts`` (class-id segmentation) is the pre-HMM
       pipeline's contract; many existing call sites depend on it.
-    - ``aggregate_states_into_bouts`` (state segmentation) is what
-      ADP-4's defensibility / cluster-naming machinery needs — clusters
-      are HMM states, and a "cluster bout" is a contiguous run of one
-      state on a single track.
+    - ``aggregate_states_into_bouts`` segments HMM or cluster states. A
+      cluster bout is a contiguous run of one state on a single track.
 
     Bout dicts carry the same fields as the class-based aggregator plus
     ``state`` (the run's HMM state) and ``state_column`` (which column
@@ -180,8 +176,7 @@ def aggregate_states_into_bouts(
                 "mean_location": mean_bout_location,
             }
             if has_class:
-                # Dominant class_id within the bout — handy for the
-                # held-out evaluation panel (Commit D).
+                # Dominant class_id within the bout for held-out evaluation.
                 try:
                     bout["class_id"] = int(bout_df["class_id"].mode().iloc[0])
                 except Exception:

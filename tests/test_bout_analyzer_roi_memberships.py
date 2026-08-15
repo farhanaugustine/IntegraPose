@@ -73,3 +73,56 @@ def test_assign_roi_membership_hybrid_uses_detection_box_for_pose_rows():
     assert df_result.loc[0, "ROI Memberships"] == ("roi1",)
     assert event_log["entries"] == [{"frame": 0, "track_id": 1, "roi_name": "roi1"}]
     assert event_log["exits"] == [{"frame": 0, "track_id": 1, "roi_name": "roi1"}]
+
+
+def test_assign_roi_membership_resets_hysteresis_after_long_track_gap():
+    per_frame_df = pd.DataFrame(
+        [
+            {"track_id": 1, "frame": 0, "x_center": 0.25, "y_center": 0.5, "w": 0.2, "h": 0.2},
+            # Center is outside and bbox overlap is between the entry/exit
+            # thresholds. It may remain inside only while hysteresis is live.
+            {"track_id": 1, "frame": 10, "x_center": 0.55, "y_center": 0.5, "w": 0.4, "h": 0.2},
+        ]
+    )
+    roi_polygons = {"roi1": [[(0, 0), (50, 0), (50, 99), (0, 99)]]}
+
+    result, events = assign_roi_membership(
+        per_frame_df,
+        roi_polygons,
+        100,
+        100,
+        entry_threshold=0.75,
+        exit_threshold=0.25,
+        event_mode="bbox_only",
+        max_gap_frames=1,
+    )
+
+    assert result.loc[0, "ROI Name"] == "roi1"
+    assert result.loc[1, "ROI Name"] == ""
+    assert events == {
+        "entries": [{"frame": 0, "track_id": 1, "roi_name": "roi1"}],
+        "exits": [{"frame": 0, "track_id": 1, "roi_name": "roi1"}],
+    }
+
+
+def test_assign_roi_membership_counts_overlaps_and_prefers_specific_nested_roi():
+    per_frame_df = pd.DataFrame(
+        [{"track_id": 7, "frame": 0, "x_center": 0.5, "y_center": 0.5, "w": 0.1, "h": 0.1}]
+    )
+    roi_polygons = {
+        "arena": [[(0, 0), (99, 0), (99, 99), (0, 99)]],
+        "center": [[(40, 40), (60, 40), (60, 60), (40, 60)]],
+    }
+
+    result, events = assign_roi_membership(
+        per_frame_df,
+        roi_polygons,
+        100,
+        100,
+        event_mode="bbox_only",
+    )
+
+    assert result.loc[0, "ROI Memberships"] == ("center", "arena")
+    assert result.loc[0, "ROI Name"] == "center"
+    assert {event["roi_name"] for event in events["entries"]} == {"arena", "center"}
+    assert {event["roi_name"] for event in events["exits"]} == {"arena", "center"}

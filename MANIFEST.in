@@ -1,4 +1,5 @@
 include README.md
+include RELEASE_SNAPSHOT.md
 include LICENSE
 include THIRD_PARTY_NOTICES.md
 recursive-include integra_pose *.py *.json *.yaml *.yml *.txt *.csv *.html
@@ -6,6 +7,5 @@ recursive-include integra_pose *.gif
 recursive-include docs *.md *.yml *.yaml *.png *.svg *.css *.js
 recursive-include tools *.py
 exclude yolo11n-cls.pt
-prune pre-trained\ model
 prune samples_images
 global-exclude __pycache__ *.py[cod]

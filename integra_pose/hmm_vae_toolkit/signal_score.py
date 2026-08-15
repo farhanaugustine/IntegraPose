@@ -1,21 +1,9 @@
-"""ADP-4 Commit F — Sub-cluster signal scoring.
+"""Sub-cluster signal scoring.
 
 Combines several quality signals into a single 0–1 "candidate strength"
-score per sub-cluster, so the novel-behavior review panel can surface
-the strongest candidates first. The user reviews ranked candidates,
-marks each as Real / Noise / Skip, and the labeled subset becomes
-training data for the next iteration of YOLO or BehaviorScope.
-
-The honest framing (per user, 2026-04-26):
-
-  > "How to make sure that only clusters with true behaviors are
-  > surfaced? How to pick thresholds, etc."
-
-There is no single threshold that's correct. Algorithmic filters
-**rank**; the human **decides**. The score is a tool for prioritising
-review attention, not for autonomous gating. If a cluster scores 0.3
-that does not mean it's noise — it means *spend less time on it
-than the 0.8 candidates*.
+score per sub-cluster. The review panel sorts candidates by this score.
+Scores support prioritization only; they do not automatically accept or
+reject a cluster. Review decisions are recorded as Real, Noise, or Skip.
 
 Signals and weights (defaults, all overridable):
 
@@ -26,10 +14,8 @@ Signals and weights (defaults, all overridable):
 | Stability ARI      | Cluster survives seed shuffles            | 0.30           |
 | Mean bout duration | Longer bouts → more confident segments    | 0.15           |
 
-When stability hasn't been computed (user didn't tick the audit
-checkbox), the stability term is excluded from the weighted sum and
-the remaining weights are renormalized. That way a "fast run, no
-stability" still gets a sensible score — just with one fewer pillar.
+When stability has not been computed, that term is excluded and the
+remaining weights are normalized before scoring.
 
 This module is pure logic; the review-panel UI lives in main.py.
 """
@@ -43,8 +29,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-# Signal weights. Documented in the module docstring; keep them as
-# constants so a power user can override via monkey-patch in scripts.
+# Signal weights used by compute_signal_scores.
 DEFAULT_WEIGHTS = {
     "size": 0.25,
     "coverage": 0.30,
@@ -54,9 +39,7 @@ DEFAULT_WEIGHTS = {
 
 # Score reference points — define the "saturation level" of each
 # signal. Each signal is mapped to ``[0, 1]`` via min(value/ref, 1).
-# Once the user provides feedback we can replace these heuristics
-# with empirical calibration; for v1 the values come from typical
-# pose-data datasets in the literature.
+# Reference values are heuristics based on typical pose-data datasets.
 DEFAULT_SIZE_REF = 100.0          # frames — beyond this size signal saturates
 DEFAULT_COVERAGE_REF = 3.0        # subjects — 3 distinct subjects → full credit
 DEFAULT_DURATION_REF = 30.0       # frames — ~1s at 30 FPS for full credit

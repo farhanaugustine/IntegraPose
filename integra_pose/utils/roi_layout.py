@@ -234,6 +234,12 @@ def auto_place_rois(
             )
 
         cx, cy = centers[idx]
+        raw_size = _row_attr(row, "size_px", None)
+        try:
+            requested_size = max(2.0, float(raw_size)) if raw_size is not None else None
+        except (TypeError, ValueError):
+            requested_size = None
+        radius = (requested_size / 2.0) if requested_size is not None else base_radius
         roi: Dict[str, Any] = {
             "name": name,
             "shape": shape,
@@ -244,19 +250,19 @@ def auto_place_rois(
         if shape == SHAPE_CIRCLE:
             roi["cx"] = int(round(cx))
             roi["cy"] = int(round(cy))
-            roi["r"] = max(2, int(round(base_radius)))
+            roi["r"] = max(1, int(round(radius)))
         elif shape == SHAPE_POLYGON:
             n_vertices = int(_row_attr(row, "polygon_vertices", POLYGON_DEFAULT_VERTICES) or POLYGON_DEFAULT_VERTICES)
             roi["vertices"] = _polygon_vertices_regular(
                 cx,
                 cy,
-                base_radius,
+                radius,
                 n_vertices=n_vertices,
                 frame_width=frame_width,
                 frame_height=frame_height,
             )
         elif shape == SHAPE_SQUARE:
-            half = base_radius
+            half = radius
             x, y, w, h = _clamp_box(
                 cx, cy, half, half,
                 frame_width=frame_width,
@@ -267,8 +273,12 @@ def auto_place_rois(
             roi["x"], roi["y"], roi["w"], roi["h"] = x, y, side, side
         else:  # rectangle
             # Rectangles get a wider-than-tall default (4:3).
-            half_w = base_radius * 1.2
-            half_h = base_radius * 0.9
+            if requested_size is not None:
+                half_w = requested_size / 2.0
+                half_h = requested_size * 0.375
+            else:
+                half_w = base_radius * 1.2
+                half_h = base_radius * 0.9
             x, y, w, h = _clamp_box(
                 cx, cy, half_w, half_h,
                 frame_width=frame_width,

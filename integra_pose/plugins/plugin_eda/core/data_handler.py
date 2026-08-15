@@ -1,11 +1,23 @@
-import os
-import pandas as pd
-import numpy as np
 import glob
-import yaml
+import os
 import traceback
-from .integra_pose_utils import parse_inference_output  # Assumes this is in the same directory or accessible
+
+import numpy as np
+import pandas as pd
+import yaml
+
+from integra_pose.utils.frame_identity import (
+    FrameIdentityError,
+    load_frame_label_manifest,
+    resolve_frame_label_indices,
+)
+
 from ..config import app_config  # For constants like EPSILON
+from .integra_pose_utils import (
+    frame_file_matches_source,
+    parse_inference_output,  # Assumes this is in the same directory or accessible
+)
+
 
 class DataHandler:
     def __init__(self):
@@ -160,18 +172,62 @@ class DataHandler:
             kp_mismatch_yaml = True # UI will handle the askyesno
 
         files_to_parse = []
+        frame_index_by_path = {}
         is_dir_input = os.path.isdir(data_path)
         if is_dir_input:
-            files_to_parse = sorted(glob.glob(os.path.join(data_path, "*.txt")) + glob.glob(os.path.join(data_path, "*.csv")))
+            candidate_paths = sorted(
+                glob.glob(os.path.join(data_path, "*.txt"))
+                + glob.glob(os.path.join(data_path, "*.csv"))
+            )
+            candidate_by_name = {os.path.basename(path): path for path in candidate_paths}
+            try:
+                frame_manifest = load_frame_label_manifest(data_path)
+                source_hint = str(frame_manifest.get("source_stem") or "").strip() or None
+                scoped_names = [
+                    name for name in candidate_by_name if frame_file_matches_source(name, source_hint)
+                ]
+                skipped_source_names = sorted(set(candidate_by_name) - set(scoped_names))
+                if skipped_source_names:
+                    print(
+                        f"Warning: Skipping {len(skipped_source_names)} inference file(s) that do not "
+                        f"belong to source {source_hint!r}: {', '.join(skipped_source_names[:3])}"
+                    )
+                frame_map = resolve_frame_label_indices(scoped_names, source=source_hint)
+            except FrameIdentityError as exc:
+                self.status_message = "Status: Duplicate or invalid frame identities."
+                self.last_error = str(exc)
+                return False
+            skipped = sorted(set(scoped_names) - set(frame_map))
+            if skipped:
+                print(
+                    f"Warning: Skipping {len(skipped)} auxiliary/unparseable inference file(s) "
+                    f"in {data_path}: {', '.join(skipped[:3])}"
+                )
+            files_to_parse = [
+                candidate_by_name[name]
+                for name, _frame in sorted(frame_map.items(), key=lambda item: (item[1], item[0]))
+            ]
+            frame_index_by_path = {
+                candidate_by_name[name]: frame for name, frame in frame_map.items()
+            }
         elif os.path.isfile(data_path):
-            files_to_parse = [data_path]
+            try:
+                frame_map = resolve_frame_label_indices([os.path.basename(data_path)])
+            except FrameIdentityError as exc:
+                self.status_message = "Status: Duplicate or invalid frame identities."
+                self.last_error = str(exc)
+                return False
+            basename = os.path.basename(data_path)
+            if basename in frame_map:
+                files_to_parse = [data_path]
+                frame_index_by_path[data_path] = frame_map[basename]
         else:
             self.status_message = f"Status: Invalid path: {data_path}"
             self.last_error = self.status_message
             return False
 
         if not files_to_parse:
-            self.status_message = f"Status: No .txt or .csv files found at: {data_path}"
+            self.status_message = f"Status: No frame-indexed .txt or .csv files found at: {data_path}"
             self.last_error = self.status_message
             return False
 
@@ -183,7 +239,13 @@ class DataHandler:
             if progress_callback:
                 progress_callback(i, len(files_to_parse), f"Parsing: {os.path.basename(file_p)}")
             try:
-                df_s = parse_inference_output(file_p, self.keypoint_names_list, assume_visible, self.behavior_id_to_name_map)
+                df_s = parse_inference_output(
+                    file_p,
+                    self.keypoint_names_list,
+                    assume_visible,
+                    self.behavior_id_to_name_map,
+                    frame_index=frame_index_by_path[file_p],
+                )
                 if df_s is not None and not df_s.empty:
                     all_loaded_dfs.append(df_s)
             except Exception as e_parse:

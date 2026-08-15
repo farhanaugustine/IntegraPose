@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pandas as pd
 
+from integra_pose.utils.frame_identity import write_frame_label_manifest
+
 
 def _load_module(rel_path: str, module_name: str):
     repo_root = Path(__file__).resolve().parent.parent
@@ -120,6 +122,66 @@ def test_preview_preflight_prefers_model_class_names_for_detection():
     assert preflight["behavior_names_override"] == ["mouse"]
     assert preflight["behavior_source"] == "model class names"
     assert "Behavior labels: model class names" in fake_app.analytics_behavior_source_var.get()
+
+
+def test_preview_preflight_prefers_saved_label_metadata_over_yaml_model_and_setup(
+    tmp_path: Path,
+):
+    labels_dir = tmp_path / "labels"
+    write_frame_label_manifest(
+        labels_dir,
+        source="video.mp4",
+        max_det=1,
+        class_names={0: "Sniffing", 1: "Wall-Rearing", 2: "Ambulatory"},
+        class_names_source="model.names",
+        model_task="detect",
+    )
+    yaml_path = tmp_path / "dataset.yaml"
+    yaml_path.write_text("names: {0: WrongYamlName}\n", encoding="utf-8")
+    values = {
+        "inference.trained_model_path_infer": "different_model.pt",
+        "analytics.roi_analytics_yaml_path_var": str(yaml_path),
+        "analytics.source_video_path_var": "video.mp4",
+        "analytics.yolo_output_path_var": str(labels_dir),
+        "analytics.object_interaction_enabled_var": False,
+        "analytics.object_count_var": "0",
+        "analytics.max_frame_gap_var": "5",
+        "analytics.min_bout_duration_var": "3",
+        "analytics.roi_max_gap_frames_var": "5",
+        "analytics.roi_min_dwell_frames_var": "3",
+        "analytics.roi_use_keypoint_var": False,
+        "analytics.single_animal_analysis_var": True,
+        "setup.behaviors_list": [{"id": 0, "name": "WrongSetupName"}],
+    }
+    fake_app = _FakeApp(values)
+    fake_app.root = _ImmediateRoot()
+    fake_app.config.analytics = SimpleNamespace()
+    fake_app.object_roi_manager = _FakeROIManager({})
+    fake_app.analytics_behavior_source_var = _FakeVar()
+    fake_app.analytics_preflight_summary_var = _FakeVar()
+    fake_app.analytics_metric_checkbox_by_key = {}
+    fake_app.batch_processing_service = _FakeBatchProcessingService(
+        SimpleNamespace(
+            model_path="different_model.pt",
+            task="detect",
+            has_keypoints=False,
+            keypoint_count=0,
+            class_count=1,
+            class_names=["WrongModelName"],
+            supports_multiclass_stats=False,
+            warnings=[],
+        )
+    )
+
+    preflight = AnalyticsService(fake_app).preview_preflight(show_dialog=False)
+
+    assert preflight["behavior_names_override"] == [
+        "Sniffing",
+        "Wall-Rearing",
+        "Ambulatory",
+    ]
+    assert preflight["behavior_source"] == "inference label metadata"
+    assert "Behavior labels: inference label metadata" in fake_app.analytics_behavior_source_var.get()
 
 
 def test_preview_preflight_uses_class_id_fallback_for_detection_without_names():
@@ -326,10 +388,12 @@ def test_worker_renders_video_even_when_no_bouts(monkeypatch):
             "yolo_folder": "labels",
             "yaml_file": "",
             "object_roi_polygon_map_override": {},
+            "single_animal_mode_override": True,
         }
     )
 
     assert len(render_calls) == 1
+    assert render_calls[0][1]["single_animal_mode"] is True
     assert ("analytics", "completed") in fake_app.activities
     assert any("No bouts found in analysis." in message for _level, message in fake_app.log_messages)
 
@@ -343,9 +407,11 @@ def test_start_includes_roi_debounce_settings(monkeypatch):
         "analytics.assay_preset_var": "custom",
         "analytics.min_bout_duration_var": "50",
         "analytics.max_frame_gap_var": "50",
+        "analytics.behavior_bout_class_mode_var": "multi_label",
         "analytics.roi_min_dwell_frames_var": "4",
         "analytics.roi_max_gap_frames_var": "12",
         "analytics.create_video_output_var": True,
+        "analytics.single_animal_analysis_var": True,
         "analytics.object_interaction_enabled_var": False,
         "analytics.object_count_var": "0",
         "analytics.object_roi_size_px_var": "20",
@@ -407,5 +473,9 @@ def test_start_includes_roi_debounce_settings(monkeypatch):
     assert params["behavior_names_override"] == ["mouse"]
     assert params["min_bout_frames"] == 50
     assert params["max_gap_frames"] == 50
+    assert params["behavior_bout_class_mode"] == "multi_label"
     assert params["roi_min_dwell_frames"] == 4
     assert params["roi_max_gap_frames"] == 12
+    assert params["object_min_dwell_frames"] == 4
+    assert params["object_max_gap_frames"] == 12
+    assert params["single_animal_mode_override"] is True

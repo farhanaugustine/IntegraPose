@@ -37,6 +37,17 @@ try:
 except ImportError:  # torch < 2.0
     from torch.cuda.amp import autocast, GradScaler  # type: ignore[no-redef]
 
+try:  # pragma: no cover - package/script dual use
+    from integra_pose.utils.torch_backend import (
+        detect_torch_backend,
+        normalize_torch_device,
+        resolve_amp_dtype,
+    )
+except Exception:  # pragma: no cover
+    detect_torch_backend = None
+    normalize_torch_device = None
+    resolve_amp_dtype = None
+
 # matplotlib is only needed for confusion-matrix PNGs and is imported lazily
 # inside `save_confusion_matrix_png` so that headless setups without matplotlib
 # can still train.
@@ -97,13 +108,10 @@ TEMPORAL_SPLITTER_CONFIG_KEY = "temporal_splitter"
 LEGACY_V25_SPLITTER_CONFIG_KEY = "v25_splitter"
 
 
-def safe_torch_load(path: Path | str, *, map_location=None):
-    """Load local checkpoints without unsafe pickle execution when supported."""
-    try:
-        return torch.load(str(path), map_location=map_location, weights_only=True)
-    except TypeError:
-        # PyTorch versions before weights_only support.
-        return torch.load(str(path), map_location=map_location)
+try:  # pragma: no cover - package/script dual use
+    from safe_checkpoint_io import safe_torch_load
+except ImportError:  # pragma: no cover
+    from .safe_checkpoint_io import safe_torch_load
 
 
 def parse_args():
@@ -254,7 +262,7 @@ def parse_args():
     # bookkeeping
     p.add_argument("--project", default="behavior_lstm_runs")
     p.add_argument("--name", default="run")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default="auto")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -266,6 +274,8 @@ def _resolve_amp_dtype(requested: str) -> str:
     falling back to fp16 (GradScaler required) everywhere else.
     """
     if requested == "auto":
+        if resolve_amp_dtype is not None:
+            return resolve_amp_dtype(requested)
         return "bf16" if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else "fp16"
     return requested
 
@@ -1031,7 +1041,9 @@ def evaluate(model, loader, criterion, device, num_classes,
              return_preds: bool = False,
              return_probs: bool = False,
              amp_enabled: bool = False,
-             amp_dtype_torch=None):
+             amp_dtype_torch=None,
+             autocast_device_type: str = "cuda",
+             non_blocking_transfer: bool = False):
     model.eval()
     losses = []
     all_preds = []
@@ -1043,8 +1055,8 @@ def evaluate(model, loader, criterion, device, num_classes,
             if item is None:
                 continue
             inputs, labels = item
-            labels = labels.to(device, non_blocking=(device.type == "cuda"))
-            with autocast("cuda", dtype=_eval_dtype, enabled=amp_enabled):
+            labels = labels.to(device, non_blocking=non_blocking_transfer)
+            with autocast(autocast_device_type, dtype=_eval_dtype, enabled=amp_enabled):
                 logits = model(inputs)
                 loss = criterion(logits, labels)
             losses.append(float(loss.item()))
@@ -1077,7 +1089,15 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device = torch.device(args.device)
+    backend_info = detect_torch_backend(args.device) if detect_torch_backend is not None else None
+    device_arg = backend_info.device if backend_info is not None else (
+        normalize_torch_device(args.device) if normalize_torch_device is not None else args.device
+    )
+    device = torch.device(device_arg)
+    supports_cuda_api = backend_info.supports_cuda_api if backend_info is not None else (device.type == "cuda")
+    pin_memory = backend_info.supports_pinned_memory if backend_info is not None else (device.type == "cuda")
+    non_blocking_transfer = backend_info.non_blocking_transfer if backend_info is not None else (device.type == "cuda")
+    autocast_device_type = backend_info.autocast_device_type if backend_info is not None else "cuda"
 
     try:
         splits, class_to_idx, idx_to_class, meta = load_n_manifest(args.manifest_path)
@@ -1225,7 +1245,7 @@ def main():
     train_loader = DataLoader(
         train_ds, batch_size=args.batch, shuffle=shuffle, sampler=sampler,
         num_workers=args.num_workers, collate_fn=collate_multi_animal,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=pin_memory,
         persistent_workers=_persist,
         prefetch_factor=2 if _persist else None,
         generator=loader_generator if sampler is None else None,
@@ -1233,7 +1253,7 @@ def main():
     val_loader = DataLoader(
         val_ds, batch_size=args.batch, shuffle=False,
         num_workers=args.num_workers, collate_fn=collate_multi_animal,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=pin_memory,
         persistent_workers=_persist,
         prefetch_factor=2 if _persist else None,
     )
@@ -1285,13 +1305,13 @@ def main():
     # AMP / mixed-precision setup.
     # Computed before config_dump so the resolved dtype is recorded in config.json.
     # Training and inference AMP are independent choices (see infer_n.py --amp).
-    _amp_active = args.amp and (device.type == "cuda")
+    _amp_active = args.amp and supports_cuda_api
     if args.amp and not _amp_active:
-        print("[warn] --amp requested but device is not CUDA; AMP disabled.", flush=True)
+        print("[warn] --amp requested but the resolved backend does not support CUDA API AMP; AMP disabled.", flush=True)
     amp_dtype_resolved = _resolve_amp_dtype(args.amp_dtype) if _amp_active else None
     _amp_dtype_torch = (torch.bfloat16 if amp_dtype_resolved == "bf16" else torch.float16) if _amp_active else None
     # GradScaler is only needed for fp16; bf16 has fp32 dynamic range.
-    scaler = GradScaler("cuda", enabled=(_amp_active and amp_dtype_resolved == "fp16"))
+    scaler = GradScaler(autocast_device_type, enabled=(_amp_active and amp_dtype_resolved == "fp16"))
     if _amp_active:
         print(f"[amp] enabled  dtype_requested={args.amp_dtype}  dtype_resolved={amp_dtype_resolved}", flush=True)
 
@@ -1500,9 +1520,9 @@ def main():
             if item is None:
                 continue
             inputs, labels = item
-            labels = labels.to(device, non_blocking=(device.type == "cuda"))
+            labels = labels.to(device, non_blocking=non_blocking_transfer)
             optimizer.zero_grad(set_to_none=True)
-            with autocast("cuda", dtype=_amp_dtype_torch or torch.float16, enabled=_amp_active):
+            with autocast(autocast_device_type, dtype=_amp_dtype_torch or torch.float16, enabled=_amp_active):
                 logits = model(inputs)
                 loss = criterion(logits, labels)
             scaler.scale(loss).backward()
@@ -1535,11 +1555,15 @@ def main():
             val_loss, val_acc, val_f1, val_preds, val_labels = evaluate(
                 model, val_loader, criterion, device, num_classes, return_preds=True,
                 amp_enabled=_amp_active, amp_dtype_torch=_amp_dtype_torch,
+                autocast_device_type=autocast_device_type,
+                non_blocking_transfer=non_blocking_transfer,
             )
         else:
             val_loss, val_acc, val_f1 = evaluate(
                 model, val_loader, criterion, device, num_classes,
                 amp_enabled=_amp_active, amp_dtype_torch=_amp_dtype_torch,
+                autocast_device_type=autocast_device_type,
+                non_blocking_transfer=non_blocking_transfer,
             )
             val_preds, val_labels = None, None
 
@@ -1714,6 +1738,8 @@ def main():
                 model, val_loader, criterion, device, num_classes,
                 return_preds=True, return_probs=True,
                 amp_enabled=_amp_active, amp_dtype_torch=_amp_dtype_torch,
+                autocast_device_type=autocast_device_type,
+                non_blocking_transfer=non_blocking_transfer,
             )
             decoder_config = fit_threshold_decoder(
                 val_probs=val_probs_fit,
@@ -1834,6 +1860,8 @@ def main():
                     model, val_loader, criterion, device, num_classes,
                     return_preds=True, return_probs=True,
                     amp_enabled=_amp_active, amp_dtype_torch=_amp_dtype_torch,
+                    autocast_device_type=autocast_device_type,
+                    non_blocking_transfer=non_blocking_transfer,
                 )
             print(f"[temporal splitter] fitting on val with target={target_class!r} "
                   f"(idx={target_index}) replacement={replacement_class!r} "

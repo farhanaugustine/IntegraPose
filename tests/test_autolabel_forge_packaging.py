@@ -7,7 +7,6 @@ from pathlib import Path
 AUTOLABEL_FORGE_RUNTIME = {
     "autodistill==0.1.29",
     "autodistill-grounding-dino==0.1.4",
-    "roboflow==1.2.13",
     "transformers==4.57.6",
 }
 

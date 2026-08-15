@@ -12,6 +12,239 @@ import numpy as np
 import tkinter as tk
 from tkinter import messagebox
 
+from integra_pose.utils.detection_contract import enforce_ultralytics_max_det
+from integra_pose.utils.frame_identity import (
+    extract_model_class_metadata,
+    frame_label_filename,
+    write_frame_label_manifest,
+)
+from integra_pose.utils.yolo_pose_labels import (
+    YoloPoseLabelSchema,
+    format_yolo_pose_label,
+    load_pose_label_schema,
+    write_pose_label_schema,
+)
+
+
+def _to_numpy(value, *, dtype=None) -> np.ndarray | None:
+    if value is None:
+        return None
+    candidate = value
+    if hasattr(candidate, "detach"):
+        try:
+            candidate = candidate.detach()
+        except Exception:
+            pass
+    if hasattr(candidate, "cpu"):
+        try:
+            candidate = candidate.cpu()
+        except Exception:
+            pass
+    if hasattr(candidate, "numpy"):
+        try:
+            candidate = candidate.numpy()
+        except Exception:
+            pass
+    try:
+        array = np.asarray(candidate)
+    except Exception:
+        return None
+    if dtype is not None:
+        array = array.astype(dtype, copy=False)
+    return array
+
+
+def _create_unique_run_dir(project_dir: Path, run_name: str) -> Path:
+    """Create and return an incremented run directory without reusing artifacts."""
+    base = Path(project_dir) / (str(run_name or "webcam_run").strip() or "webcam_run")
+    counter = 0
+    while True:
+        candidate = base if counter == 0 else base.parent / f"{base.name}_{counter}"
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            counter += 1
+
+
+def _coerce_track_id(raw_value) -> int | None:
+    if raw_value is None:
+        return None
+    try:
+        numeric = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric) or numeric < 0:
+        return None
+    rounded = round(numeric)
+    if abs(numeric - rounded) > 1e-6:
+        return None
+    return int(rounded)
+
+
+def _normalized_keypoints(result, *, frame_width: int, frame_height: int) -> tuple[np.ndarray | None, np.ndarray | None]:
+    keypoints = getattr(result, "keypoints", None)
+    if keypoints is None:
+        return None, None
+
+    normalized = _to_numpy(getattr(keypoints, "xyn", None), dtype=float)
+    if normalized is None:
+        pixel_xy = _to_numpy(getattr(keypoints, "xy", None), dtype=float)
+        if pixel_xy is None:
+            data = _to_numpy(getattr(keypoints, "data", None), dtype=float)
+            if data is not None and data.ndim == 3 and data.shape[2] >= 2:
+                pixel_xy = data[..., :2]
+        if pixel_xy is not None and frame_width > 0 and frame_height > 0:
+            normalized = np.asarray(pixel_xy, dtype=float).copy()
+            normalized[..., 0] /= float(frame_width)
+            normalized[..., 1] /= float(frame_height)
+
+    confidence = _to_numpy(getattr(keypoints, "conf", None), dtype=float)
+    if confidence is None:
+        data = _to_numpy(getattr(keypoints, "data", None), dtype=float)
+        if data is not None and data.ndim == 3 and data.shape[2] >= 3:
+            confidence = data[..., 2]
+    return normalized, confidence
+
+
+def _write_webcam_label_file(
+    result,
+    *,
+    labels_dir: Path,
+    source_name: str,
+    frame_index: int,
+    frame_width: int,
+    frame_height: int,
+    schema_state: dict[str, object] | None = None,
+) -> Path:
+    """Write one capped webcam result using the canonical zero-based label contract."""
+    target = Path(labels_dir) / frame_label_filename(source_name, frame_index)
+    boxes = getattr(result, "boxes", None)
+    if boxes is None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("", encoding="utf-8")
+        return target
+
+    try:
+        detection_count = int(len(boxes))
+    except Exception as exc:
+        raise ValueError("Could not determine webcam detection count for label output.") from exc
+    if detection_count == 0:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("", encoding="utf-8")
+        return target
+
+    xywhn = _to_numpy(getattr(boxes, "xywhn", None), dtype=float)
+    if xywhn is None:
+        xyxy = _to_numpy(getattr(boxes, "xyxy", None), dtype=float)
+        if xyxy is None or frame_width <= 0 or frame_height <= 0:
+            raise ValueError("Webcam result does not provide normalized or convertible bounding boxes.")
+        xywhn = np.empty_like(xyxy, dtype=float)
+        xywhn[:, 0] = (xyxy[:, 0] + xyxy[:, 2]) / (2.0 * float(frame_width))
+        xywhn[:, 1] = (xyxy[:, 1] + xyxy[:, 3]) / (2.0 * float(frame_height))
+        xywhn[:, 2] = (xyxy[:, 2] - xyxy[:, 0]) / float(frame_width)
+        xywhn[:, 3] = (xyxy[:, 3] - xyxy[:, 1]) / float(frame_height)
+    xywhn = np.asarray(xywhn, dtype=float)
+    if xywhn.ndim != 2 or xywhn.shape[0] != detection_count or xywhn.shape[1] < 4:
+        raise ValueError("Webcam bounding-box rows do not match the capped detection count.")
+
+    classes = _to_numpy(getattr(boxes, "cls", None))
+    classes = np.asarray(classes).reshape(-1) if classes is not None else None
+    confidences = _to_numpy(getattr(boxes, "conf", None), dtype=float)
+    confidences = np.asarray(confidences, dtype=float).reshape(-1) if confidences is not None else None
+    track_ids = _to_numpy(getattr(boxes, "id", None))
+    track_ids = np.asarray(track_ids).reshape(-1) if track_ids is not None else None
+
+    keypoints_xyn, keypoints_conf = _normalized_keypoints(
+        result,
+        frame_width=frame_width,
+        frame_height=frame_height,
+    )
+    pose_schema = None
+    if keypoints_xyn is not None:
+        keypoints_xyn = np.asarray(keypoints_xyn, dtype=float)
+        if keypoints_xyn.ndim != 3 or keypoints_xyn.shape[0] != detection_count or keypoints_xyn.shape[2] < 2:
+            raise ValueError("Webcam keypoint rows do not match the capped detection count.")
+        point_count = int(keypoints_xyn.shape[1])
+        if point_count <= 0:
+            keypoints_xyn = None
+        else:
+            if keypoints_conf is not None:
+                keypoints_conf = np.asarray(keypoints_conf, dtype=float)
+                if keypoints_conf.ndim != 2 or keypoints_conf.shape[:2] != keypoints_xyn.shape[:2]:
+                    raise ValueError("Webcam keypoint-confidence rows do not match the keypoint coordinates.")
+            pose_schema = YoloPoseLabelSchema(
+                keypoint_count=point_count,
+                keypoint_dimensions=3 if keypoints_conf is not None else 2,
+                include_bbox=True,
+                include_bbox_confidence=True,
+                include_track_id=True,
+            )
+            existing_schema = None
+            if schema_state is not None:
+                if schema_state.get("format") == "detect":
+                    raise ValueError(
+                        "Webcam output changed from detection labels to pose labels during capture."
+                    )
+                candidate = schema_state.get("pose_schema")
+                if isinstance(candidate, YoloPoseLabelSchema):
+                    existing_schema = candidate
+            else:
+                existing_schema = load_pose_label_schema(labels_dir)
+            if existing_schema is None:
+                write_pose_label_schema(labels_dir, pose_schema)
+            elif existing_schema != pose_schema:
+                raise ValueError(
+                    "Webcam pose-label shape changed during capture; refusing to write a mixed schema."
+                )
+            if schema_state is not None:
+                schema_state["format"] = "pose"
+                schema_state["pose_schema"] = pose_schema
+
+    if pose_schema is None and schema_state is not None:
+        if schema_state.get("format") == "pose":
+            raise ValueError(
+                "Webcam pose output lost its keypoint payload during capture; refusing to write a mixed schema."
+            )
+        schema_state["format"] = "detect"
+
+    lines: list[str] = []
+    for index in range(detection_count):
+        class_id = int(round(float(classes[index]))) if classes is not None and index < classes.size else 0
+        bbox_confidence = 0.0
+        if confidences is not None and index < confidences.size and math.isfinite(float(confidences[index])):
+            bbox_confidence = float(np.clip(confidences[index], 0.0, 1.0))
+        track_id = _coerce_track_id(track_ids[index]) if track_ids is not None and index < track_ids.size else None
+
+        if pose_schema is not None and keypoints_xyn is not None:
+            row_keypoints: list[tuple[float, ...]] = []
+            for point_index in range(pose_schema.keypoint_count):
+                x = float(keypoints_xyn[index, point_index, 0])
+                y = float(keypoints_xyn[index, point_index, 1])
+                if pose_schema.keypoint_dimensions == 3 and keypoints_conf is not None:
+                    row_keypoints.append((x, y, float(keypoints_conf[index, point_index])))
+                else:
+                    row_keypoints.append((x, y))
+            lines.append(
+                format_yolo_pose_label(
+                    class_id=class_id,
+                    bbox=xywhn[index, :4],
+                    keypoints=row_keypoints,
+                    bbox_confidence=bbox_confidence,
+                    track_id=track_id,
+                )
+            )
+        else:
+            fields = [str(class_id), *(f"{float(value):.6f}" for value in xywhn[index, :4])]
+            fields.append(f"{bbox_confidence:.6f}")
+            if track_id is not None:
+                fields.append(str(track_id))
+            lines.append(" ".join(fields))
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(lines), encoding="utf-8")
+    return target
+
 
 class WebcamController:
     """Live webcam preview and inference orchestration."""
@@ -137,7 +370,12 @@ class WebcamController:
         app = self.app
         cap = None
         detection_csv_file = None
-        close_video_writers = lambda: None
+        detection_cap_violation_frames = 0
+        detection_cap_dropped = 0
+
+        def close_video_writers():
+            return None
+
         try:
             from ultralytics import YOLO
         except Exception as exc:
@@ -158,6 +396,7 @@ class WebcamController:
                 return
 
             model = YOLO(model_path)
+            model_class_names, model_task = extract_model_class_metadata(model)
 
             mode = str(app.config.webcam.webcam_mode_var.get() or "track").strip().lower()
             if mode not in {"track", "predict"}:
@@ -205,6 +444,12 @@ class WebcamController:
             imgsz = _parse_int(app.config.webcam.webcam_imgsz_var.get(), 640, min_value=32)
             max_det = _parse_int(app.config.webcam.webcam_max_det_var.get(), 10, min_value=1)
             device_raw = str(app.config.webcam.webcam_device_var.get() or "").strip()
+            if device_raw:
+                from integra_pose.utils.torch_backend import normalize_ultralytics_device
+
+                resolved_device = normalize_ultralytics_device(device_raw, preserve_auto=True)
+            else:
+                resolved_device = ""
             model_kwargs = {
                 "conf": conf_threshold,
                 "iou": iou_threshold,
@@ -212,8 +457,13 @@ class WebcamController:
                 "max_det": max_det,
                 "verbose": False,
             }
-            if device_raw:
-                model_kwargs["device"] = device_raw
+            if resolved_device:
+                model_kwargs["device"] = resolved_device
+                if resolved_device != device_raw:
+                    app.log_message(
+                        f"Webcam inference device resolved: {device_raw!r} -> {resolved_device!r}",
+                        "INFO",
+                    )
 
             try:
                 cam_idx = app._parse_webcam_index_value()
@@ -284,8 +534,7 @@ class WebcamController:
 
             project_dir = Path(app.config.webcam.webcam_project_var.get() or "runs/webcam")
             run_name = app.config.webcam.webcam_name_var.get() or "webcam_run"
-            run_dir = project_dir / run_name
-            run_dir.mkdir(parents=True, exist_ok=True)
+            run_dir = _create_unique_run_dir(project_dir, run_name)
             annotated_dir = run_dir / "annotated"
             raw_dir = run_dir / "raw_captures"
             txt_dir = run_dir / "labels"
@@ -296,10 +545,21 @@ class WebcamController:
             if save_raw:
                 raw_dir.mkdir(parents=True, exist_ok=True)
             txt_dir.mkdir(parents=True, exist_ok=True)
+            label_source_name = run_dir.name
+            write_frame_label_manifest(
+                txt_dir,
+                source=label_source_name,
+                max_det=max_det,
+                class_names=model_class_names,
+                class_names_source="model.names",
+                model_task=model_task,
+            )
+            app.log_message(f"Webcam outputs will be stored in {run_dir}", "INFO")
 
             detection_csv_writer = None
             detection_csv_keypoints = 0
             detection_csv_warned = False
+            webcam_label_schema_state: dict[str, object] = {}
             total_frame_index = 0
 
             def _resolve_tracker_value(raw_id, detection_index: int) -> str:
@@ -476,6 +736,18 @@ class WebcamController:
                 if result is None:
                     continue
 
+                limit_outcome = enforce_ultralytics_max_det(result, max_det)
+                result = limit_outcome.result
+                if limit_outcome.dropped_count > 0:
+                    detection_cap_violation_frames += 1
+                    detection_cap_dropped += limit_outcome.dropped_count
+                    if detection_cap_violation_frames == 1:
+                        app.log_message(
+                            "The webcam model returned more detections than max_det; "
+                            "IntegraPose capped the result before rendering, ROI analytics, and export.",
+                            "WARNING",
+                        )
+
                 annotated_frame = result.plot(
                     labels=not bool(app.config.webcam.webcam_hide_labels_var.get()),
                     conf=not bool(app.config.webcam.webcam_hide_conf_var.get()),
@@ -592,39 +864,23 @@ class WebcamController:
                                     else:
                                         row.extend([0.0, 0.0, 0.0])
                             detection_csv_writer.writerow(row)
-                if save_txt and boxes is not None and boxes.xyxy is not None and len(boxes.xyxy) > 0:
-                    txt_path = txt_dir / f"{total_frame_index:06d}.txt"
-                    try:
-                        xyxy = boxes.xyxy.detach().cpu().numpy()
-                    except Exception:
-                        xyxy = boxes.xyxy.cpu().numpy()
-                    confs = None
-                    try:
-                        confs = boxes.conf.detach().cpu().numpy()
-                    except Exception:
-                        confs = boxes.conf.cpu().numpy()
-                    cls = None
-                    if boxes.cls is not None:
-                        try:
-                            cls = boxes.cls.detach().cpu().numpy()
-                        except Exception:
-                            cls = boxes.cls.cpu().numpy()
-                    with open(txt_path, "w", encoding="utf-8") as label_file:
-                        for i_box, coords in enumerate(xyxy):
-                            box_cls = int(cls[i_box]) if cls is not None and len(cls) > i_box else 0
-                            box_conf = float(confs[i_box]) if confs is not None and len(confs) > i_box else 0.0
-                            x_center = (coords[0] + coords[2]) / 2.0
-                            y_center = (coords[1] + coords[3]) / 2.0
-                            width = coords[2] - coords[0]
-                            height = coords[3] - coords[1]
-                            x_center_norm = x_center / frame_width if frame_width else 0.0
-                            y_center_norm = y_center / frame_height if frame_height else 0.0
-                            width_norm = width / frame_width if frame_width else 0.0
-                            height_norm = height / frame_height if frame_height else 0.0
-                            label_file.write(
-                                f"{box_cls} {x_center_norm:.6f} {y_center_norm:.6f} "
-                                f"{width_norm:.6f} {height_norm:.6f} {box_conf:.6f}\n"
-                            )
+                if save_txt:
+                    _write_webcam_label_file(
+                        result,
+                        labels_dir=txt_dir,
+                        source_name=label_source_name,
+                        frame_index=total_frame_index,
+                        frame_width=frame_width,
+                        frame_height=frame_height,
+                        schema_state=webcam_label_schema_state,
+                    )
+
+                annotated_writer = app._webcam_video_writers.get("annotated")
+                if annotated_writer is not None and annotated_writer.isOpened():
+                    annotated_writer.write(annotated_frame)
+                raw_writer = app._webcam_video_writers.get("raw")
+                if raw_writer is not None and raw_writer.isOpened():
+                    raw_writer.write(frame)
 
                 cv2.imshow("Webcam Inference", annotated_frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -669,6 +925,12 @@ class WebcamController:
                     detection_csv_file.close()
                 except Exception:
                     pass
+            if detection_cap_violation_frames:
+                app.log_message(
+                    "Webcam max_det enforcement summary: "
+                    f"{detection_cap_violation_frames} frame(s), {detection_cap_dropped} excess detection(s) removed.",
+                    "WARNING",
+                )
             app._close_metrics_stream()
             cv2.destroyAllWindows()
             app.log_message("Webcam inference stopped.", "INFO")

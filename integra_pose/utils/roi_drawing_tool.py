@@ -17,6 +17,8 @@ try:
 except ImportError as exc:  # pragma: no cover - plugin optional dependency
     raise ImportError("Pillow is required for ROI drawing") from exc
 
+from integra_pose.utils.object_interaction_geometry import interaction_boundary_contours
+
 Point = Tuple[int, int]
 
 
@@ -228,6 +230,7 @@ class _ObjectROIDialog(tk.Toplevel):
         object_names: List[str],
         roi_size_px: int,
         shape: str,
+        distance_threshold_px: float = 0.0,
         title: str = "Place Object ROIs",
     ) -> None:
         super().__init__(master)
@@ -241,12 +244,14 @@ class _ObjectROIDialog(tk.Toplevel):
         self._scale = scale
         self._object_names = list(object_names)
         self._roi_size_px = max(2, int(roi_size_px))
+        self._distance_threshold_px = max(0.0, float(distance_threshold_px or 0.0))
         self._shape = str(shape or "circle").strip().lower()
         if self._shape not in {"circle", "square"}:
             self._shape = "circle"
         self._centers: list[Point] = []
         self.result: list[list[Point]] = []
         self._status_var = tk.StringVar(value="")
+        self._size_var = tk.StringVar(value=str(self._roi_size_px))
 
         self._build_ui()
         self._bind_events()
@@ -258,14 +263,31 @@ class _ObjectROIDialog(tk.Toplevel):
             self,
             text=(
                 "Click the center of each object in order. "
-                "Right-click or Backspace to undo. Enter to finish when all objects are placed."
+                "Right-click or Backspace to undo. Enter to finish when all objects are placed. "
+                "The orange dotted outline shows how far the selected interaction keypoint "
+                "may be from the nearest object edge."
             ),
-            wraplength=460,
+            wraplength=560,
             justify=tk.LEFT,
         )
         instructions.pack(fill=tk.X, padx=12, pady=(12, 4))
 
         ttk.Label(self, textvariable=self._status_var, justify=tk.LEFT).pack(fill=tk.X, padx=12, pady=(0, 8))
+
+        size_row = ttk.Frame(self)
+        size_row.pack(fill=tk.X, padx=12, pady=(0, 8))
+        ttk.Label(size_row, text="Object diameter / side (px):").pack(side=tk.LEFT)
+        size_entry = ttk.Entry(size_row, textvariable=self._size_var, width=8)
+        size_entry.pack(side=tk.LEFT, padx=(6, 8))
+        ttk.Button(size_row, text="Apply size", command=self._apply_size).pack(side=tk.LEFT)
+        ttk.Label(
+            size_row,
+            text=(
+                "Selected-keypoint activation boundary: "
+                f"+{self._distance_threshold_px:g} px from object edge"
+            ),
+            foreground="#b45309",
+        ).pack(side=tk.LEFT, padx=(12, 0))
 
         canvas_width = self._photo.width()
         canvas_height = self._photo.height()
@@ -294,6 +316,21 @@ class _ObjectROIDialog(tk.Toplevel):
         self.bind("<Return>", lambda event: self._finish())
         self.bind("<Escape>", lambda event: self._cancel())
         self.bind("<BackSpace>", lambda event: self._undo_last_point())
+
+    def _apply_size(self) -> None:
+        try:
+            parsed = int(str(self._size_var.get() or "").strip())
+        except ValueError:
+            messagebox.showwarning("Object ROI Size", "Size must be a whole number of pixels.", parent=self)
+            self._size_var.set(str(self._roi_size_px))
+            return
+        if parsed < 2:
+            messagebox.showwarning("Object ROI Size", "Size must be at least 2 px.", parent=self)
+            self._size_var.set(str(self._roi_size_px))
+            return
+        self._roi_size_px = parsed
+        self._update_status()
+        self._redraw()
 
     def _centre_on_parent(self) -> None:
         try:
@@ -346,7 +383,10 @@ class _ObjectROIDialog(tk.Toplevel):
         total = len(self._object_names)
         placed = len(self._centers)
         next_name = self._object_names[placed] if placed < total else "All objects placed"
-        self._status_var.set(f"Placed {placed}/{total}. Next: {next_name}")
+        self._status_var.set(
+            f"Placed {placed}/{total}. Next: {next_name} | size={self._roi_size_px}px | "
+            f"edge buffer={self._distance_threshold_px:g}px"
+        )
 
     def _redraw(self) -> None:
         self._canvas.delete("overlay")
@@ -357,6 +397,46 @@ class _ObjectROIDialog(tk.Toplevel):
             dx = cx * self._scale
             dy = cy * self._scale
             label = self._object_names[idx] if idx < len(self._object_names) else f"Object {idx + 1}"
+            threshold_display = self._distance_threshold_px * self._scale
+            if threshold_display > 0:
+                if self._shape == "circle":
+                    outer = radius_display + threshold_display
+                    self._canvas.create_oval(
+                        dx - outer,
+                        dy - outer,
+                        dx + outer,
+                        dy + outer,
+                        outline="#ff8c00",
+                        width=2,
+                        dash=(8, 5),
+                        tags="overlay",
+                    )
+                else:
+                    contours = interaction_boundary_contours(
+                        [self._shape_outline(center)],
+                        frame_width=self._original_width,
+                        frame_height=self._original_height,
+                        distance_px=self._distance_threshold_px,
+                    )
+                    for contour in contours:
+                        display_contour = [
+                            (point[0] * self._scale, point[1] * self._scale)
+                            for point in contour
+                        ]
+                        flat = [
+                            coord
+                            for point in (display_contour + [display_contour[0]])
+                            for coord in point
+                        ]
+                        self._canvas.create_line(
+                            *flat,
+                            fill="#ff8c00",
+                            width=2,
+                            dash=(8, 5),
+                            capstyle=tk.ROUND,
+                            joinstyle=tk.ROUND,
+                            tags="overlay",
+                        )
             if self._shape == "square":
                 self._canvas.create_rectangle(
                     dx - radius_display,
@@ -725,16 +805,18 @@ def draw_object_rois(
     object_count: int,
     roi_size_px: int = 20,
     shape: str = "circle",
+    distance_threshold_px: float = 0.0,
     object_names: Optional[List[str]] = None,
     master: Optional[tk.Misc] = None,
     title: str = "Place Object ROIs",
     max_display_size: Tuple[int, int] = (1280, 720),
-) -> List[List[Point]]:
+    return_size_px: bool = False,
+) -> List[List[Point]] | tuple[List[List[Point]], int]:
     """Place fixed-size object ROIs by clicking object centers."""
 
     total = max(0, int(object_count or 0))
     if total <= 0:
-        return []
+        return ([], max(2, int(roi_size_px or 20))) if return_size_px else []
     names = list(object_names or [])
     if len(names) != total:
         names = [f"Object_{idx + 1}" for idx in range(total)]
@@ -758,6 +840,7 @@ def draw_object_rois(
         object_names=names,
         roi_size_px=max(2, int(roi_size_px or 20)),
         shape=shape,
+        distance_threshold_px=max(0.0, float(distance_threshold_px or 0.0)),
         title=title,
     )
     dialog.grab_set()
@@ -766,6 +849,8 @@ def draw_object_rois(
     if owns_root:
         root.destroy()
 
+    if return_size_px:
+        return dialog.result, int(dialog._roi_size_px)
     return dialog.result
 
 

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Any, Callable, Iterable, Sequence
 
 from integra_pose.logic.analytics_metric_catalog import AnalyticsMetricSpec
+from integra_pose.logic.batch_design import parse_time_point_numeric
+from integra_pose.utils.frame_identity import FrameIdentityError, resolve_frame_label_indices
 
 PreflightRow = dict[str, str]
 IndexLabelsFn = Callable[[Path], list[tuple[Path, list[str]]]]
@@ -26,6 +29,8 @@ class PreflightVideoState:
     group: str = ""
     subject_id: str = ""
     time_point: str = ""
+    metadata_sources: dict[str, str] = field(default_factory=dict)
+    metadata_warnings: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -40,6 +45,10 @@ class AnalysisPreflightConfig:
     class_count: int
     enabled_metrics: set[str]
     metric_specs: Sequence[AnalyticsMetricSpec]
+    include_mixed_effects: bool = True
+    auto_detect_design: bool = True
+    categorical_factors: Sequence[str] = ()
+    model_preflight_error: str = ""
 
 
 def _normalized_text(value: Any) -> str:
@@ -48,10 +57,15 @@ def _normalized_text(value: Any) -> str:
 
 def _summarize_study_design(videos: Sequence[PreflightVideoState]) -> dict[str, Any]:
     group_sizes: dict[str, int] = {}
+    group_units: dict[str, set[str]] = {}
     subject_sizes: dict[str, int] = {}
     subject_time_levels: dict[str, set[str]] = {}
+    design_cell_sizes: dict[tuple[str, str, str], int] = {}
     time_levels: set[str] = set()
     numeric_time_levels: set[float] = set()
+    group_numeric_time_levels: dict[str, set[float]] = {}
+    inferred_field_counts = {"group": 0, "subject_id": 0, "time_point": 0}
+    metadata_warning_count = 0
     missing_group_videos = 0
     missing_subject_videos = 0
     missing_time_videos = 0
@@ -60,34 +74,64 @@ def _summarize_study_design(videos: Sequence[PreflightVideoState]) -> dict[str, 
         group = _normalized_text(getattr(video, "group", ""))
         subject_id = _normalized_text(getattr(video, "subject_id", ""))
         time_point = _normalized_text(getattr(video, "time_point", ""))
+        video_id = _normalized_text(getattr(video, "video_id", "")) or _normalized_text(
+            getattr(video, "video_name", "")
+        )
+        metadata_sources = dict(getattr(video, "metadata_sources", {}) or {})
+        metadata_warning_count += len(list(getattr(video, "metadata_warnings", []) or []))
+        for field_name in inferred_field_counts:
+            source = _normalized_text(metadata_sources.get(field_name, ""))
+            if source and source != "manual":
+                inferred_field_counts[field_name] += 1
 
         if group:
             group_sizes[group] = group_sizes.get(group, 0) + 1
+            independent_unit = (
+                f"{group}\x1f{subject_id}"
+                if subject_id
+                else f"{group}\x1f__video__:{video_id}"
+            )
+            group_units.setdefault(group, set()).add(independent_unit)
         else:
             missing_group_videos += 1
 
         if subject_id:
-            subject_sizes[subject_id] = subject_sizes.get(subject_id, 0) + 1
+            subject_key = f"{group}\x1f{subject_id}" if group else subject_id
+            subject_sizes[subject_key] = subject_sizes.get(subject_key, 0) + 1
         else:
+            subject_key = ""
             missing_subject_videos += 1
 
         if time_point:
             time_levels.add(time_point)
-            if subject_id:
-                subject_time_levels.setdefault(subject_id, set()).add(time_point)
-            try:
-                numeric_time_levels.add(float(time_point))
-            except Exception:
-                pass
+            if subject_key:
+                subject_time_levels.setdefault(subject_key, set()).add(time_point)
+            numeric_time = parse_time_point_numeric(time_point)
+            if numeric_time is not None:
+                numeric_time_levels.add(float(numeric_time))
+                if group:
+                    group_numeric_time_levels.setdefault(group, set()).add(
+                        float(numeric_time)
+                    )
         else:
             missing_time_videos += 1
+        if group or subject_id or time_point:
+            design_key = (group, subject_id, time_point)
+            design_cell_sizes[design_key] = design_cell_sizes.get(design_key, 0) + 1
 
     subjects_with_repeats = sum(1 for count in subject_sizes.values() if count >= 2)
     subjects_with_multiple_timepoints = sum(1 for times in subject_time_levels.values() if len(times) >= 2)
     labeled_group_videos = sum(group_sizes.values())
+    group_unit_sizes = {group: len(units) for group, units in group_units.items()}
+    repeated_design_cells = {
+        key: count
+        for key, count in design_cell_sizes.items()
+        if count > 1 and all(key)
+    }
 
     return {
         "group_sizes": group_sizes,
+        "group_unit_sizes": group_unit_sizes,
         "group_levels": len(group_sizes),
         "labeled_group_videos": labeled_group_videos,
         "missing_group_videos": missing_group_videos,
@@ -98,8 +142,21 @@ def _summarize_study_design(videos: Sequence[PreflightVideoState]) -> dict[str, 
         "missing_subject_videos": missing_subject_videos,
         "time_levels": len(time_levels),
         "numeric_time_levels": len(numeric_time_levels),
+        "group_numeric_time_levels": {
+            group: len(values)
+            for group, values in group_numeric_time_levels.items()
+        },
         "missing_time_videos": missing_time_videos,
+        "repeated_design_cells": repeated_design_cells,
+        "inferred_field_counts": inferred_field_counts,
+        "metadata_warning_count": metadata_warning_count,
     }
+
+
+def summarize_study_design(videos: Sequence[PreflightVideoState]) -> dict[str, Any]:
+    """Public study-design summary shared by preflight and the wizard UI."""
+
+    return _summarize_study_design(videos)
 
 
 def _default_index_label_dirs(root_dir: Path) -> list[tuple[Path, list[str]]]:
@@ -109,7 +166,15 @@ def _default_index_label_dirs(root_dir: Path) -> list[tuple[Path, list[str]]]:
     for txt_file in root_dir.rglob("*.txt"):
         parent = txt_file.parent
         grouped.setdefault(parent, []).append(txt_file.name.lower())
-    return [(parent, names) for parent, names in grouped.items() if names]
+    rows = []
+    for parent, names in grouped.items():
+        try:
+            resolved = resolve_frame_label_indices(names)
+        except FrameIdentityError:
+            continue
+        if resolved:
+            rows.append((parent, sorted(resolved)))
+    return rows
 
 
 def _default_find_labels_dir(
@@ -123,35 +188,47 @@ def _default_find_labels_dir(
     if not stem:
         return None
 
-    def _dir_has_txt(path: Path) -> bool:
+    def _source_filename_match(name: str) -> bool:
+        file_stem = Path(name).stem.casefold()
+        return bool(
+            file_stem == stem
+            or re.match(rf"^{re.escape(stem)}__(?:frame|frm|image|img)_?\d+$", file_stem)
+            or re.match(rf"^{re.escape(stem)}_(?:frame|frm|image|img)_?\d+$", file_stem)
+            or re.match(rf"^{re.escape(stem)}_\d+$", file_stem)
+        )
+
+    def _dir_has_frames(path: Path, *, require_source_match: bool) -> bool:
         if not path.exists() or not path.is_dir():
             return False
         try:
-            return any(path.glob("*.txt"))
+            names = [item.name for item in path.glob("*.txt") if not item.name.startswith(".")]
+            if require_source_match:
+                names = [name for name in names if _source_filename_match(name)]
+            return bool(resolve_frame_label_indices(names, source=video_stem))
         except Exception:
             return False
 
     preferred = Path(str(preferred_dir or "").strip()).expanduser() if preferred_dir else None
-    if preferred and _dir_has_txt(preferred):
+    if preferred and _dir_has_frames(preferred, require_source_match=False):
         return preferred.resolve()
 
     if labels_root is not None:
         direct_candidates = [labels_root / video_stem, labels_root / video_stem / "labels", labels_root / f"{video_stem}_labels"]
         for candidate in direct_candidates:
-            if _dir_has_txt(candidate):
+            if _dir_has_frames(candidate, require_source_match=True):
                 return candidate.resolve()
 
     if not indexed_dirs:
         return None
 
-    prefix = f"{stem}_frame"
-    best_path = None
-    best_score = -1
+    prefixes = (f"{stem}_frame", f"{stem}__frame")
+    candidates: list[tuple[int, str, Path]] = []
     for parent, names in indexed_dirs:
-        prefix_hit = any(name.startswith(prefix) for name in names)
-        stem_hit = any(stem in name for name in names)
+        matching_names = [name for name in names if _source_filename_match(name)]
+        prefix_hit = any(name.startswith(prefixes) for name in matching_names)
+        stem_hit = bool(matching_names)
         parent_name = parent.name.lower()
-        parent_hit = stem in parent_name
+        parent_hit = parent_name in {stem, f"{stem}_labels"}
         # Avoid false positives by requiring a concrete video-stem signal.
         if not (prefix_hit or stem_hit or parent_hit):
             continue
@@ -164,13 +241,14 @@ def _default_find_labels_dir(
             score += 25
         if parent_name == "labels":
             score += 10
-        score += min(len(names), 20)
-        if score > best_score:
-            best_score = score
-            best_path = parent
-    if best_score <= 0:
+        score += min(len(matching_names), 20)
+        candidates.append((score, str(parent).casefold(), parent))
+    if not candidates:
         return None
-    return Path(best_path).resolve() if best_path is not None else None
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        return None
+    return candidates[0][2].resolve()
 
 
 def _roi_ready_counts(videos: Sequence[PreflightVideoState], *, strategy: str, shared_has_rois: bool) -> tuple[int, int]:
@@ -192,8 +270,11 @@ def _object_roi_ready_counts(
     total = len(videos)
     if total <= 0:
         return 0, 0
-    if strategy == "single":
-        return (total if shared_has_object_rois else 0), total
+    # Object placements may vary independently of the arena-ROI strategy.
+    # A shared object set is a fallback for every video; otherwise each
+    # video's own object ROI store determines readiness.
+    if shared_has_object_rois:
+        return total, total
     ready = sum(1 for video in videos if bool(video.has_object_rois))
     return ready, total
 
@@ -212,8 +293,9 @@ def _missing_object_roi_videos(
     videos: Sequence[PreflightVideoState],
     *,
     strategy: str,
+    shared_has_object_rois: bool = False,
 ) -> list[PreflightVideoState]:
-    if str(strategy or "").strip() == "single":
+    if bool(shared_has_object_rois):
         return []
     return [video for video in videos if not bool(video.has_object_rois)]
 
@@ -281,6 +363,8 @@ def build_analysis_preflight_rows(
     model_path = str(config.model_path or "").strip()
     model_path_resolved = Path(model_path).expanduser() if model_path else None
     model_path_exists = bool(model_path_resolved and model_path_resolved.is_file())
+    model_preflight_error = _normalized_text(config.model_preflight_error)
+    model_ready = bool(model_path_exists and not model_preflight_error)
     object_count = max(0, int(config.object_count or 0))
     enabled_metrics = {str(name).strip() for name in (config.enabled_metrics or set()) if str(name).strip()}
 
@@ -297,7 +381,11 @@ def build_analysis_preflight_rows(
         inference_run = "No"
         inference_scope = "-"
         inference_reason = "Using saved label files; model inference is skipped."
-    elif model_path and model_path_exists:
+    elif model_preflight_error:
+        inference_run = "No"
+        inference_scope = "-"
+        inference_reason = f"Model preflight failed: {model_preflight_error}"
+    elif model_path and model_ready:
         inference_run = "Yes"
         inference_scope = f"{queue_total} video(s)"
         inference_reason = "Model file found and ready."
@@ -352,7 +440,7 @@ def build_analysis_preflight_rows(
 
     prerequisites_ok = queue_total > 0 and (
         (use_existing_labels and labels_root_valid and labels_ready > 0)
-        or ((not use_existing_labels) and model_path_exists)
+        or ((not use_existing_labels) and model_ready)
     )
     if prerequisites_ok:
         if use_existing_labels and labels_total > 0 and labels_ready < labels_total:
@@ -436,10 +524,10 @@ def build_analysis_preflight_rows(
     elif object_count <= 0:
         object_run = "No"
         object_reason = "Object count must be greater than 0."
-    elif strategy == "single" and object_ready <= 0:
+    elif object_ready <= 0:
         object_run = "No"
-        object_reason = "Shared object ROIs are missing."
-    elif strategy != "single" and object_ready < object_total:
+        object_reason = "No shared or per-video object ROIs are assigned."
+    elif object_ready < object_total:
         object_run = "No"
         object_reason = f"Object ROIs are missing for some videos ({object_ready}/{object_total})."
     else:
@@ -457,16 +545,28 @@ def build_analysis_preflight_rows(
             "reason": object_reason,
         }
     )
-    missing_object_rois = _missing_object_roi_videos(videos, strategy=strategy)
+    missing_object_rois = _missing_object_roi_videos(
+        videos,
+        strategy=strategy,
+        shared_has_object_rois=bool(shared_has_object_rois),
+    )
     if bool(config.object_interaction_enabled) and object_count > 0:
-        if str(strategy).strip() == "single" and queue_total > 0 and not bool(shared_has_object_rois):
+        if (
+            str(strategy).strip() == "single"
+            and queue_total > 0
+            and object_ready <= 0
+            and not bool(shared_has_object_rois)
+        ):
             rows.append(
                 {
                     "analysis": "Missing object ROI setup",
                     "will_run": "Fix",
                     "scope": "Shared object ROI set",
                     "variables": f"Applies to all {queue_total} queued video(s)",
-                    "reason": "Place the shared object ROI set once; it will be reused across the full batch.",
+                    "reason": (
+                        "Place a shared object ROI set once, or use Place Objects "
+                        "Across Queue for per-video placements."
+                    ),
                 }
             )
         elif missing_object_rois:
@@ -534,11 +634,260 @@ def build_analysis_preflight_rows(
         )
 
     design = _summarize_study_design(videos)
+    missing_group_videos = int(design["missing_group_videos"])
+    missing_subject_videos = int(design["missing_subject_videos"])
+    missing_time_videos = int(design["missing_time_videos"])
+    metadata_warning_count = int(design["metadata_warning_count"])
+    inferred_counts = dict(design["inferred_field_counts"])
+    missing_total = (
+        missing_group_videos
+        + missing_subject_videos
+        + missing_time_videos
+    )
+    if queue_total <= 0:
+        metadata_run = "No"
+        metadata_scope = "-"
+        metadata_reason = "No queued videos are available for study-design discovery."
+    elif missing_total <= 0 and metadata_warning_count <= 0:
+        metadata_run = "Yes"
+        metadata_scope = f"{queue_total}/{queue_total} video(s)"
+        metadata_reason = (
+            "Group is assigned as the comparison factor, Subject ID as the "
+            "experimental/repeated unit, and Time Point as the time factor."
+        )
+    else:
+        metadata_run = "Partial"
+        metadata_scope = f"{queue_total} video(s)"
+        metadata_reason = (
+            f"Missing labels: group={missing_group_videos}, "
+            f"subject={missing_subject_videos}, time={missing_time_videos}."
+        )
+        if metadata_warning_count:
+            metadata_reason += (
+                f" {metadata_warning_count} ambiguous metadata inference "
+                "warning(s) require manual review."
+            )
+    if queue_total > 0:
+        metadata_reason += (
+            " Auto-detected values: "
+            f"group={int(inferred_counts.get('group', 0))}, "
+            f"subject={int(inferred_counts.get('subject_id', 0))}, "
+            f"time={int(inferred_counts.get('time_point', 0))}."
+        )
+        if not bool(config.auto_detect_design):
+            metadata_reason += (
+                " Automatic addition of discovered categorical factors to "
+                "group statistics is disabled."
+            )
+    rows.append(
+        {
+            "analysis": "Study-design metadata",
+            "will_run": metadata_run,
+            "scope": metadata_scope,
+            "variables": "Group=factor | Subject ID=experimental unit | Time Point=time/repeated factor",
+            "reason": metadata_reason,
+        }
+    )
+
+    missing_field_specs = {
+        "group": (
+            "Group",
+            "Assign Group before group comparisons.",
+        ),
+        "subject_id": (
+            "Subject ID",
+            (
+                "Assign Subject ID so repeated videos are collapsed to the "
+                "correct experimental unit and mixed-effects models are valid."
+            ),
+        ),
+        "time_point": (
+            "Time Point",
+            (
+                "Assign Time Point before time-course, repeated-measures, or "
+                "KPSS analyses."
+            ),
+        ),
+    }
+    for video in videos:
+        missing_fields = [
+            field_name
+            for field_name in missing_field_specs
+            if not _normalized_text(getattr(video, field_name, ""))
+        ]
+        if not missing_fields:
+            continue
+        missing_labels = [
+            missing_field_specs[field_name][0]
+            for field_name in missing_fields
+        ]
+        next_actions = [
+            missing_field_specs[field_name][1]
+            for field_name in missing_fields
+        ]
+        rows.append(
+            {
+                "analysis": (
+                    f"Missing {missing_labels[0]}"
+                    if len(missing_labels) == 1
+                    else "Missing design metadata"
+                ),
+                "will_run": "Fix",
+                "scope": _format_preflight_video_scope(video),
+                "variables": (
+                    _format_preflight_video_context(video)
+                    + " | Missing="
+                    + ", ".join(missing_labels)
+                ),
+                "reason": (
+                    "No confident value was discovered from the filename or "
+                    "folder structure. "
+                    + " ".join(next_actions)
+                    + " Per-video analytics can still run."
+                ),
+            }
+        )
+    for video in videos:
+        for warning in list(getattr(video, "metadata_warnings", []) or []):
+            rows.append(
+                {
+                    "analysis": "Ambiguous design metadata",
+                    "will_run": "Fix",
+                    "scope": _format_preflight_video_scope(video),
+                    "variables": _format_preflight_video_context(video),
+                    "reason": str(warning),
+                }
+            )
+
+    repeated_design_cells = dict(design["repeated_design_cells"])
+    for (group, subject_id, time_point), count in sorted(
+        repeated_design_cells.items()
+    ):
+        rows.append(
+            {
+                "analysis": "Repeated design cell",
+                "will_run": "Partial",
+                "scope": f"{count} video(s)",
+                "variables": (
+                    f"Group={group} | Subject={subject_id} | Time={time_point}"
+                ),
+                "reason": (
+                    "These videos share one subject/time design cell and will be "
+                    "averaged as technical/session replicates for inferential statistics."
+                ),
+            }
+        )
+
+    factor_aliases = {
+        "group": "group",
+        "grp": "group",
+        "cohort": "group",
+        "condition": "group",
+        "treatment": "group",
+        "time": "time_point",
+        "timepoint": "time_point",
+        "time_point": "time_point",
+        "visit": "time_point",
+        "subject": "subject_id",
+        "subjectid": "subject_id",
+        "subject_id": "subject_id",
+        "animal": "subject_id",
+        "animal_id": "subject_id",
+    }
+    for raw_factor in list(config.categorical_factors or ()):
+        raw_text = _normalized_text(raw_factor)
+        if not raw_text:
+            continue
+        normalized_factor = re.sub(r"[\s\-]+", "_", raw_text.casefold())
+        canonical = factor_aliases.get(normalized_factor, "")
+        if canonical == "subject_id":
+            assigned_count = queue_total - missing_subject_videos
+            if assigned_count <= 0:
+                factor_state = "Fix"
+                factor_reason = (
+                    "No Subject IDs are assigned. Subject ID is the experimental "
+                    "unit, not an independent categorical comparison factor."
+                )
+            elif assigned_count < queue_total:
+                factor_state = "Partial"
+                factor_reason = (
+                    f"Subject ID is available for {assigned_count}/{queue_total} "
+                    "video(s) and will be used as the experimental unit where present."
+                )
+            else:
+                factor_state = "Yes"
+                factor_reason = (
+                    "Subject ID is assigned automatically as the experimental "
+                    "unit; it is not treated as an independent categorical factor."
+                )
+            rows.append(
+                {
+                    "analysis": "Subject ID assignment",
+                    "will_run": factor_state,
+                    "scope": (
+                        f"{assigned_count}/{queue_total} video(s) | "
+                        f"{int(design['subject_count'])} subject(s)"
+                    ),
+                    "variables": "Experimental unit / mixed-model grouping variable",
+                    "reason": factor_reason,
+                }
+            )
+        elif canonical in {"group", "time_point"}:
+            if canonical == "group":
+                assigned_count = queue_total - missing_group_videos
+                level_count = int(design["group_levels"])
+            else:
+                assigned_count = queue_total - missing_time_videos
+                level_count = int(design["time_levels"])
+            if assigned_count <= 0:
+                factor_state = "Fix"
+                factor_reason = f"No {canonical} values are assigned."
+            elif level_count < 2:
+                factor_state = "Partial"
+                factor_reason = (
+                    f"Only {level_count} non-empty level is available; at least "
+                    "two levels are needed for a comparison."
+                )
+            elif assigned_count < queue_total:
+                factor_state = "Partial"
+                factor_reason = (
+                    f"Recognized for {assigned_count}/{queue_total} video(s); "
+                    "videos with missing values cannot contribute to this factor."
+                )
+            else:
+                factor_state = "Yes"
+                factor_reason = "Recognized as a built-in batch design variable."
+            rows.append(
+                {
+                    "analysis": f"Configured factor: {canonical}",
+                    "will_run": factor_state,
+                    "scope": (
+                        f"{assigned_count}/{queue_total} video(s) | "
+                        f"{level_count} level(s)"
+                    ),
+                    "variables": canonical,
+                    "reason": factor_reason,
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "analysis": "Unavailable categorical factor",
+                    "will_run": "Fix",
+                    "scope": raw_text,
+                    "variables": "Available: group, subject_id, time_point",
+                    "reason": (
+                        "This column is not present in the batch metadata table. "
+                        "Remove it or assign it through a supported design field before running."
+                    ),
+                }
+            )
+
     group_sizes = dict(design["group_sizes"])
+    group_unit_sizes = dict(design["group_unit_sizes"])
     group_levels = int(design["group_levels"])
     labeled_group_videos = int(design["labeled_group_videos"])
-    missing_group_videos = int(design["missing_group_videos"])
-    min_group_size = min(group_sizes.values()) if group_sizes else 0
+    min_group_size = min(group_unit_sizes.values()) if group_unit_sizes else 0
 
     if core_run == "No":
         group_run = "No"
@@ -555,8 +904,8 @@ def build_analysis_preflight_rows(
     elif min_group_size < MIN_GROUP_REPLICATES:
         group_run = "No"
         group_reason = (
-            f"Each group needs at least {MIN_GROUP_REPLICATES} videos. "
-            f"Current smallest group has {min_group_size}."
+            f"Each group needs at least {MIN_GROUP_REPLICATES} independent "
+            f"subject/video units. Current smallest group has {min_group_size}."
         )
         group_scope = "-"
     else:
@@ -588,7 +937,7 @@ def build_analysis_preflight_rows(
             "analysis": "Group comparison statistics",
             "will_run": group_run,
             "scope": group_scope,
-            "variables": "Video-level summaries and nonparametric group tests",
+            "variables": "Kruskal-Wallis omnibus, Mann-Whitney pairwise, and effect sizes",
             "reason": group_reason,
         }
     )
@@ -597,63 +946,92 @@ def build_analysis_preflight_rows(
     subjects_with_multiple_timepoints = int(design["subjects_with_multiple_timepoints"])
     subject_count = int(design["subject_count"])
     numeric_time_levels = int(design["numeric_time_levels"])
+    group_numeric_time_levels = dict(design["group_numeric_time_levels"])
     time_levels = int(design["time_levels"])
 
     mixed_ready = subjects_with_repeats >= MIN_REPEATED_SUBJECTS_FOR_MIXED and (
         group_levels >= 2 or subjects_with_multiple_timepoints >= MIN_REPEATED_SUBJECTS_FOR_MIXED
     )
-    kpss_ready = numeric_time_levels >= MIN_KPSS_TIMEPOINTS
+    kpss_ready_groups = [
+        group
+        for group, level_count in group_numeric_time_levels.items()
+        if int(level_count) >= MIN_KPSS_TIMEPOINTS
+    ]
+    if not group_numeric_time_levels and numeric_time_levels >= MIN_KPSS_TIMEPOINTS:
+        kpss_ready_groups = ["all"]
+    kpss_ready = bool(kpss_ready_groups)
+
+    if not bool(config.include_mixed_effects):
+        mixed_run = "No"
+        mixed_reason = "Disabled in Advanced Statistics."
+        mixed_scope = "-"
+    elif core_run == "No":
+        mixed_run = "No"
+        mixed_reason = "Behavior bout setup is incomplete."
+        mixed_scope = "-"
+    elif mixed_ready:
+        mixed_run = "Yes" if core_run == "Yes" else "Partial"
+        mixed_reason = (
+            "Repeated observations are available for at least "
+            f"{subjects_with_repeats} subject(s); Subject ID will be used as "
+            "the random grouping variable."
+        )
+        if core_run == "Partial":
+            mixed_reason += " Only videos with completed core analytics contribute."
+        mixed_scope = f"{subject_count} subject(s)"
+    else:
+        mixed_run = "No"
+        reasons: list[str] = []
+        if subject_count < MIN_REPEATED_SUBJECTS_FOR_MIXED:
+            reasons.append("assign Subject IDs for at least 2 subjects")
+        elif subjects_with_repeats < MIN_REPEATED_SUBJECTS_FOR_MIXED:
+            reasons.append("at least 2 subjects need repeated observations")
+        elif time_levels < 2 and group_levels < 2:
+            reasons.append("assign at least 2 groups or 2 time points")
+        else:
+            reasons.append("repeated-subject design metadata is incomplete")
+        mixed_reason = "; ".join(reasons).capitalize() + "."
+        mixed_scope = "-"
+    rows.append(
+        {
+            "analysis": "Mixed-effects models",
+            "will_run": mixed_run,
+            "scope": mixed_scope,
+            "variables": "Group, Time Point, and Subject ID random grouping",
+            "reason": mixed_reason,
+        }
+    )
 
     if not bool(config.include_kpss):
         kpss_run = "No"
-        kpss_reason = "Disabled in wizard."
+        kpss_reason = "Disabled in Advanced Statistics (recommended for most routine batches)."
         kpss_scope = "-"
     elif core_run == "No":
         kpss_run = "No"
         kpss_reason = "Behavior bout setup is incomplete."
         kpss_scope = "-"
-    elif mixed_ready and kpss_ready and core_run == "Yes":
-        kpss_run = "Yes"
+    elif kpss_ready:
+        kpss_run = "Yes" if core_run == "Yes" else "Partial"
         kpss_reason = (
-            "Mixed-effects diagnostics are ready, and KPSS has enough ordered numeric time points "
-            f"({numeric_time_levels} available)."
+            "Enough ordered time points were discovered. Labels such as Day7, "
+            "Week2, and Hour24 are converted to an ordered day-scale value."
         )
-        kpss_scope = f"{queue_total} video(s)"
-    elif mixed_ready or kpss_ready or core_run == "Partial":
-        kpss_run = "Partial"
-        reasons: list[str] = []
-        if mixed_ready:
-            reasons.append("mixed-effects is ready")
-        else:
-            if subject_count < MIN_REPEATED_SUBJECTS_FOR_MIXED:
-                reasons.append("need subject IDs for at least 2 subjects")
-            elif subjects_with_repeats < MIN_REPEATED_SUBJECTS_FOR_MIXED:
-                reasons.append("need repeated observations for at least 2 subjects")
-            elif time_levels < 2 and group_levels < 2:
-                reasons.append("need either replicated groups or repeated time points")
-            else:
-                reasons.append("mixed-effects design metadata is incomplete")
-        if kpss_ready:
-            reasons.append("KPSS is ready on ordered numeric time points")
-        else:
-            reasons.append(f"KPSS needs at least {MIN_KPSS_TIMEPOINTS} numeric ordered time points")
         if core_run == "Partial":
-            reasons.append("only videos with completed core analytics contribute")
-        kpss_reason = "; ".join(reasons) + "."
-        kpss_scope = f"{queue_total} video(s)"
+            kpss_reason += " Only videos with completed core analytics contribute."
+        kpss_scope = ", ".join(kpss_ready_groups)
     else:
         kpss_run = "No"
         kpss_reason = (
-            "Need repeated-subject metadata for mixed-effects diagnostics and at least "
-            f"{MIN_KPSS_TIMEPOINTS} numeric ordered time points for KPSS."
+            f"KPSS needs at least {MIN_KPSS_TIMEPOINTS} ordered time points "
+            "within a group. Assign numeric, Day, Week, Hour, or Visit labels."
         )
         kpss_scope = "-"
     rows.append(
         {
-            "analysis": "Trend / mixed-effects diagnostics",
+            "analysis": "KPSS stationarity diagnostic",
             "will_run": kpss_run,
             "scope": kpss_scope,
-            "variables": "Time-trend diagnostics and mixed-effects model metadata",
+            "variables": "Ordered Time Point series within each group",
             "reason": kpss_reason,
         }
     )
@@ -670,6 +1048,6 @@ def summarize_preflight_counts(rows: Iterable[PreflightRow]) -> tuple[int, int, 
             yes_count += 1
         elif status == "Partial":
             partial_count += 1
-        elif status == "No":
+        elif status in {"No", "Fix"}:
             no_count += 1
     return yes_count, partial_count, no_count

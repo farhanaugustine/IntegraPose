@@ -4,20 +4,21 @@ import numpy as np
 import pandas as pd
 from collections import OrderedDict
 import os
-import re
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from integra_pose.utils.frame_identity import (
+    parse_frame_index,
+    resolve_frame_label_indices,
+)
+from integra_pose.utils.yolo_pose_labels import (
+    load_pose_label_schema,
+    parse_yolo_pose_label,
+)
+
 def get_frame_num_from_filename(filename):
-    """Extract the frame number from a filename using a robust regex."""
-    match = re.search(r'(\d+)\.txt$', filename)
-    if match:
-        return int(match.group(1))
-
-    match = re.search(r'^(\d+)\.txt$', filename)
-    if match:
-        return int(match.group(1))
-
-    return None
+    """Extract an explicit frame token without consuming subject-ID digits."""
+    return parse_frame_index(filename)
 
 class ROIManager:
     """Manages user-defined regions of interest for analytics workflows.
@@ -288,7 +289,16 @@ class ROIManager:
         if detection:
             state["last_seen_frame"] = frame_num
 
-    def process_yolo_path(self, yolo_path, behavior_names, video_width, video_height, max_frame_gap, min_bout_duration_frames):
+    def process_yolo_path(
+        self,
+        yolo_path,
+        behavior_names,
+        video_width,
+        video_height,
+        max_frame_gap,
+        min_bout_duration_frames,
+        source_video=None,
+    ):
         self._reset_analytics()
         self.behavior_names = behavior_names
         video_dims = (video_width, video_height)
@@ -296,16 +306,44 @@ class ROIManager:
         if not os.path.exists(yolo_path):
             raise FileNotFoundError(f"YOLO output path does not exist: {yolo_path}")
 
-        txt_files_with_frames: List[Tuple[int, str]] = []
-        for f in os.listdir(yolo_path):
-            if f.endswith('.txt'):
-                frame_num = get_frame_num_from_filename(f)
-                if frame_num is not None:
-                    txt_files_with_frames.append((frame_num, os.path.join(yolo_path, f)))
-        txt_files_with_frames.sort()
+        txt_filenames = sorted(
+            filename
+            for filename in os.listdir(yolo_path)
+            if filename.lower().endswith('.txt') and not filename.startswith('.')
+        )
+        if source_video is None:
+            stems = {filename: Path(filename).stem for filename in txt_filenames}
+            legacy_bases = []
+            for base_stem in stems.values():
+                prefix = f"{base_stem}_"
+                if any(
+                    child_stem != base_stem
+                    and child_stem.startswith(prefix)
+                    and child_stem[len(prefix):].isdigit()
+                    for child_stem in stems.values()
+                ):
+                    legacy_bases.append(base_stem)
+            if len(set(legacy_bases)) == 1:
+                source_video = legacy_bases[0]
+        frame_by_filename = resolve_frame_label_indices(
+            txt_filenames,
+            source=source_video,
+        )
+        txt_files_with_frames: List[Tuple[int, str]] = sorted(
+            (
+                frame_num,
+                os.path.join(yolo_path, filename),
+            )
+            for filename, frame_num in frame_by_filename.items()
+        )
 
         if not txt_files_with_frames:
-            raise FileNotFoundError("No .txt files with valid frame numbers found.")
+            raise FileNotFoundError(
+                "No frame-indexed detection TXT files found; auxiliary files "
+                "such as classes.txt are not inference frames."
+            )
+
+        pose_schema = load_pose_label_schema(yolo_path)
 
         last_processed_frame = -1
         for frame_num, file_path in txt_files_with_frames:
@@ -318,33 +356,65 @@ class ROIManager:
 
             detections_this_frame: Dict[int, Dict[str, float]] = {}
             try:
-                df_raw = pd.read_csv(file_path, sep=' ', header=None)
+                df_raw = pd.read_csv(file_path, sep=r'\s+', header=None)
             except pd.errors.EmptyDataError:
                 df_raw = pd.DataFrame()
-            except Exception:
-                df_raw = pd.DataFrame()
+            except (OSError, pd.errors.ParserError) as exc:
+                raise ValueError(f"Could not read inference labels from {file_path}: {exc}") from exc
             if not df_raw.empty:
                 df = df_raw.apply(pd.to_numeric, errors='coerce')
                 total_cols = df.shape[1]
                 track_col_idx = None
-                if total_cols >= 1 and self._looks_like_track_column(df.iloc[:, -1]):
+                if (
+                    pose_schema is None
+                    and total_cols >= 1
+                    and self._looks_like_track_column(df.iloc[:, -1])
+                ):
                     track_col_idx = total_cols - 1
                 for row_idx, row in df.iterrows():
                     if total_cols < 3:
                         continue
-                    try:
-                        track_identifier = int(round(row.iloc[track_col_idx])) if track_col_idx is not None else 0
-                    except (ValueError, TypeError):
-                        track_identifier = 0
-                    try:
-                        class_id = int(round(row.iloc[0]))
-                    except (ValueError, TypeError):
-                        class_id = 0
-                    try:
-                        cx = float(row.iloc[1])
-                        cy = float(row.iloc[2])
-                    except (ValueError, TypeError):
-                        continue
+                    if pose_schema is not None:
+                        try:
+                            parsed = parse_yolo_pose_label(
+                                row.dropna().tolist(),
+                                keypoint_count=pose_schema.keypoint_count,
+                                schema=pose_schema,
+                            )
+                        except ValueError as exc:
+                            raise ValueError(
+                                f"Malformed pose label at {file_path}:{row_idx + 1}: {exc}"
+                            ) from exc
+                        if parsed.bbox is None:
+                            raise ValueError(
+                                f"Pose label has no bounding box at {file_path}:{row_idx + 1}."
+                            )
+                        track_identifier = parsed.track_id if parsed.track_id is not None else 0
+                        class_id = parsed.class_id
+                        cx, cy = parsed.bbox[:2]
+                    else:
+                        try:
+                            track_identifier = int(round(row.iloc[track_col_idx])) if track_col_idx is not None else 0
+                        except (ValueError, TypeError):
+                            track_identifier = 0
+                        try:
+                            class_id = int(round(row.iloc[0]))
+                        except (ValueError, TypeError):
+                            class_id = 0
+                        try:
+                            cx = float(row.iloc[1])
+                            cy = float(row.iloc[2])
+                        except (ValueError, TypeError):
+                            continue
+                    if not np.isfinite([cx, cy]).all() or not (0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0):
+                        raise ValueError(
+                            f"Detection center must be finite and normalized at {file_path}:{row_idx + 1}."
+                        )
+                    if track_identifier in detections_this_frame:
+                        raise ValueError(
+                            "Multiple detections in one frame share track ID "
+                            f"{track_identifier} at {file_path}:{row_idx + 1}; refusing to overwrite one."
+                        )
                     detections_this_frame[track_identifier] = {
                         'class_id': class_id,
                         'cx': cx,

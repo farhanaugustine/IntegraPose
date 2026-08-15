@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tkinter as tk
 import traceback
+import uuid
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, Optional
@@ -12,11 +13,14 @@ import pandas as pd
 from PIL import Image, ImageTk
 
 from integra_pose.gui.windowing import apply_adaptive_window_geometry
+from integra_pose.utils.bout_review import INTERVAL_SEMANTICS, inclusive_duration_frames
+from integra_pose.utils.operation_result import OperationResult
 
 LogFn = Callable[[str, str], None]
 
 SCORER_COLUMNS = [
     "Bout ID",
+    "Run ID",
     "Track ID",
     "Behavior",
     "Behavior ID",
@@ -30,6 +34,7 @@ SCORER_COLUMNS = [
     "Original Start Frame",
     "Original End Frame",
     "Review Status",
+    "Interval Semantics",
 ]
 
 
@@ -68,8 +73,16 @@ def _format_track_id(value) -> str:
 
 
 def _duration_seconds(start_frame: int, end_frame: int, fps: float) -> float:
-    safe_fps = float(fps) if fps and fps > 0 else 30.0
-    return max(0.0, float(end_frame - start_frame) / safe_fps)
+    if fps is None or float(fps) <= 0:
+        raise ValueError("A positive FPS is required to calculate bout duration.")
+    return float(inclusive_duration_frames(start_frame, end_frame)) / float(fps)
+
+
+def _coerce_bout_id(value, *, fallback_token: str) -> str:
+    text = "" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value).strip()
+    if text:
+        return text
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, fallback_token))
 
 
 def _first_present_column(df: pd.DataFrame, *candidates: str) -> str | None:
@@ -106,6 +119,7 @@ def normalize_advanced_bout_dataframe(
     work = raw_df.copy()
 
     bout_id_col = _first_present_column(work, "Bout ID")
+    run_id_col = _first_present_column(work, "Run ID")
     track_col = _first_present_column(work, "Track ID", "Animal ID")
     behavior_col = _first_present_column(work, "Behavior", "Behavior Name")
     behavior_id_col = _first_present_column(work, "Behavior ID", "Class ID", "class_id")
@@ -123,12 +137,19 @@ def normalize_advanced_bout_dataframe(
         track_id = _format_track_id(row.get(track_col) if track_col else 0)
         behavior = str(row.get(behavior_col, "") if behavior_col else "").strip()
         start_frame = _coerce_int(row.get(start_col) if start_col else 0, 0)
-        end_frame = _coerce_int(row.get(end_col) if end_col else start_frame + 1, start_frame + 1)
-        if end_frame <= start_frame:
-            end_frame = start_frame + 1
+        end_frame = _coerce_int(row.get(end_col) if end_col else start_frame, start_frame)
+        inclusive_duration_frames(start_frame, end_frame)
+        run_id = str(row.get(run_id_col, "") if run_id_col else "").strip()
+        fallback_token = (
+            f"{video_path}|{run_id}|{track_id}|{behavior}|{start_frame}|{end_frame}|{offset}"
+        )
         rows.append(
             {
-                "Bout ID": _coerce_int(row.get(bout_id_col) if bout_id_col else offset, offset),
+                "Bout ID": _coerce_bout_id(
+                    row.get(bout_id_col) if bout_id_col else None,
+                    fallback_token=fallback_token,
+                ),
+                "Run ID": run_id,
                 "Track ID": track_id,
                 "Behavior": behavior,
                 "Behavior ID": _coerce_behavior_id(
@@ -151,6 +172,7 @@ def normalize_advanced_bout_dataframe(
                     row.get(original_end_col) if original_end_col else end_frame, end_frame
                 ),
                 "Review Status": str(row.get("Review Status", "") or "").strip() or "detected",
+                "Interval Semantics": INTERVAL_SEMANTICS,
             }
         )
 
@@ -160,11 +182,18 @@ def normalize_advanced_bout_dataframe(
     normalized.sort_values(["Start Frame", "End Frame", "Track ID", "Behavior"], inplace=True, kind="stable")
     normalized.reset_index(drop=True, inplace=True)
     if normalized["Bout ID"].duplicated().any():
-        normalized["Bout ID"] = list(range(1, len(normalized) + 1))
+        duplicate_ordinals = normalized.groupby("Bout ID", sort=False).cumcount()
+        for index in normalized.index[duplicate_ordinals > 0]:
+            normalized.loc[index, "Bout ID"] = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"{normalized.loc[index, 'Bout ID']}|duplicate|{int(duplicate_ordinals.loc[index])}",
+                )
+            )
     return normalized
 
 
-def resolve_initial_bout_id(df: pd.DataFrame | None, details) -> int | None:
+def resolve_initial_bout_id(df: pd.DataFrame | None, details) -> str | None:
     if df is None or df.empty or details is None:
         return None
     try:
@@ -175,9 +204,9 @@ def resolve_initial_bout_id(df: pd.DataFrame | None, details) -> int | None:
         return None
 
     if "Bout ID" in payload:
-        bout_id = _coerce_int(payload.get("Bout ID"), -1)
-        if bout_id >= 0 and not df[df["Bout ID"] == bout_id].empty:
-            return int(bout_id)
+        bout_id = str(payload.get("Bout ID") or "").strip()
+        if bout_id and not df[df["Bout ID"].astype(str) == bout_id].empty:
+            return bout_id
 
     track_value = None
     for key in ("Track ID", "Animal ID"):
@@ -218,13 +247,13 @@ def resolve_initial_bout_id(df: pd.DataFrame | None, details) -> int | None:
             & (pd.to_numeric(candidates["End Frame"], errors="coerce") == end_value)
         ]
         if not filtered.empty:
-            return int(filtered.iloc[0]["Bout ID"])
+            return str(filtered.iloc[0]["Bout ID"])
     if start_value is not None:
         filtered = candidates[pd.to_numeric(candidates["Start Frame"], errors="coerce") == start_value]
         if not filtered.empty:
-            return int(filtered.iloc[0]["Bout ID"])
+            return str(filtered.iloc[0]["Bout ID"])
     if not candidates.empty:
-        return int(candidates.iloc[0]["Bout ID"])
+        return str(candidates.iloc[0]["Bout ID"])
     return None
 
 
@@ -241,10 +270,11 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
         *,
         autosave_path: str | None = None,
         on_scores_saved: Optional[Callable[[pd.DataFrame], None]] = None,
+        on_save_result: Optional[Callable[[OperationResult], None]] = None,
         log_fn: Optional[LogFn] = None,
     ):
         super().__init__(parent)
-        self.title("Advanced Bout Scorer")
+        self.title("Manual Bout Scorer")
         apply_adaptive_window_geometry(
             self,
             preferred_size=(1320, 860),
@@ -257,16 +287,18 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
         self.all_bouts_df = all_bouts_df.copy() if isinstance(all_bouts_df, pd.DataFrame) else pd.DataFrame()
         self.autosave_path = str(autosave_path or "").strip()
         self.on_scores_saved = on_scores_saved
+        self.on_save_result = on_save_result
+        self.last_save_result = OperationResult.cancel("Advanced bout scores have not been saved yet.")
         self.log_fn = log_fn
 
         self.cap = None
         self.total_frames = 0
-        self.video_fps = 30.0
+        self.video_fps = 0.0
         self.current_frame_index = 0
         self.is_playing = False
         self._scale_callback_suppressed = False
         self._current_photo = None
-        self._selected_bout_id: int | None = None
+        self._selected_bout_id: str | None = None
 
         behaviors = {str(name).strip() for name in self.behavior_map.keys() if str(name).strip()}
         if not self.all_bouts_df.empty and "Behavior" in self.all_bouts_df.columns:
@@ -451,7 +483,7 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
                 pass
             self.cap = None
         self.total_frames = 0
-        self.video_fps = 30.0
+        self.video_fps = 0.0
         self.current_frame_index = 0
         self._set_transport_enabled(False)
         if not filepath:
@@ -459,20 +491,47 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
             return
         self.cap = cv2.VideoCapture(filepath)
         if not self.cap.isOpened():
-            messagebox.showerror("Advanced Bout Scorer", "Could not open the selected video file.", parent=self)
-            self._log(f"Advanced Bout Scorer could not open video: {filepath}", "ERROR")
+            messagebox.showerror("Manual Bout Scorer", "Could not open the selected video file.", parent=self)
+            self._log(f"Manual Bout Scorer could not open video: {filepath}", "ERROR")
             self.cap = None
             self.status_var.set("Failed to open video.")
             return
         self.total_frames = max(1, int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1))
-        fps_value = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        self.video_fps = fps_value if fps_value > 0 else 30.0
+        probed_fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        analysis_fps = pd.to_numeric(
+            self.all_bouts_df.get("Analysis FPS", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna()
+        analysis_values = sorted({float(value) for value in analysis_fps if float(value) > 0})
+        if len(analysis_values) > 1:
+            messagebox.showerror(
+                "Manual Bout Scorer",
+                "Bout data contain multiple Analysis FPS values; timing provenance is ambiguous.",
+                parent=self,
+            )
+            self.cap.release()
+            self.cap = None
+            self.status_var.set("Ambiguous analysis FPS.")
+            return
+        self.video_fps = analysis_values[0] if analysis_values else probed_fps
+        if self.video_fps <= 0:
+            messagebox.showerror(
+                "Manual Bout Scorer",
+                "Could not resolve a positive FPS from the bout data or source video.",
+                parent=self,
+            )
+            self.cap.release()
+            self.cap = None
+            self.status_var.set("FPS unavailable.")
+            return
         self.video_scale.configure(to=max(0, self.total_frames - 1))
         self._set_transport_enabled(True)
         self._display_frame_at(0)
         self.status_var.set(f"Loaded video: {os.path.basename(filepath)}")
 
     def _load_initial_dataframe(self) -> pd.DataFrame:
+        if self.video_fps <= 0:
+            return pd.DataFrame(columns=SCORER_COLUMNS)
         source_df = self.all_bouts_df
         if self.autosave_path:
             autosave_target = Path(self.autosave_path)
@@ -496,7 +555,7 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
         if not self.working_bouts_df.empty:
             bout_id = resolve_initial_bout_id(self.working_bouts_df, initial_bout_details)
             if bout_id is None:
-                bout_id = int(self.working_bouts_df.iloc[0]["Bout ID"])
+                bout_id = str(self.working_bouts_df.iloc[0]["Bout ID"])
             self._select_bout_by_id(bout_id, seek=True)
             return
         if initial_bout_details:
@@ -540,7 +599,7 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
             self.results_tree.insert(
                 "",
                 "end",
-                iid=str(int(row["Bout ID"])),
+                iid=str(row["Bout ID"]),
                 values=(
                     str(row["Track ID"]),
                     str(row["Behavior"]),
@@ -693,16 +752,16 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
             self.notes_text.insert("1.0", notes)
         self._update_duration_preview()
 
-    def _select_bout_by_id(self, bout_id: int | None, *, seek: bool = False) -> None:
+    def _select_bout_by_id(self, bout_id: str | None, *, seek: bool = False) -> None:
         if bout_id is None:
             return
-        iid = str(int(bout_id))
+        iid = str(bout_id)
         if iid not in self.results_tree.get_children():
             return
         self.results_tree.selection_set(iid)
         self.results_tree.focus(iid)
         self.results_tree.see(iid)
-        self._selected_bout_id = int(bout_id)
+        self._selected_bout_id = str(bout_id)
         self._on_tree_select()
         if seek:
             self._jump_to_start_frame()
@@ -712,8 +771,8 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
         if not selection:
             self._selected_bout_id = None
             return
-        bout_id = _coerce_int(selection[0], -1)
-        row_match = self.working_bouts_df[self.working_bouts_df["Bout ID"] == bout_id]
+        bout_id = str(selection[0])
+        row_match = self.working_bouts_df[self.working_bouts_df["Bout ID"].astype(str) == bout_id]
         if row_match.empty:
             return
         self._selected_bout_id = bout_id
@@ -722,7 +781,9 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
     def _selected_bout_row(self) -> pd.Series | None:
         if self._selected_bout_id is None:
             return None
-        row_match = self.working_bouts_df[self.working_bouts_df["Bout ID"] == int(self._selected_bout_id)]
+        row_match = self.working_bouts_df[
+            self.working_bouts_df["Bout ID"].astype(str) == str(self._selected_bout_id)
+        ]
         if row_match.empty:
             return None
         return row_match.iloc[0]
@@ -733,14 +794,14 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
             return
         selection = self.results_tree.selection()
         if not selection:
-            self._select_bout_by_id(_coerce_int(children[0], 1), seek=True)
+            self._select_bout_by_id(str(children[0]), seek=True)
             return
         try:
             current_index = children.index(selection[0])
         except ValueError:
             current_index = 0
         next_index = max(0, min(len(children) - 1, current_index + int(delta)))
-        self._select_bout_by_id(_coerce_int(children[next_index], 1), seek=True)
+        self._select_bout_by_id(str(children[next_index]), seek=True)
 
     def _jump_to_selected_bout(self) -> None:
         row = self._selected_bout_row()
@@ -769,8 +830,8 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
         end_frame = _coerce_int(self.end_frame_var.get(), -1)
         if start_frame < 0 or end_frame < 0:
             raise ValueError("Start and end frames are required.")
-        if end_frame <= start_frame:
-            raise ValueError("End frame must be greater than start frame.")
+        if end_frame < start_frame:
+            raise ValueError("End frame must be greater than or equal to start frame.")
         if self.total_frames > 0 and end_frame >= self.total_frames:
             raise ValueError(f"End frame must be less than {self.total_frames}.")
         notes = self.notes_text.get("1.0", tk.END).strip()
@@ -781,7 +842,7 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
         review_status = "added_manual"
         bout_id = None
         if selected_row is not None:
-            bout_id = int(selected_row["Bout ID"])
+            bout_id = str(selected_row["Bout ID"])
             original_behavior = str(
                 selected_row.get("Original Behavior", selected_row.get("Behavior", behavior)) or behavior
             ).strip()
@@ -804,6 +865,7 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
             review_status = "corrected" if changed else str(selected_row.get("Review Status", "detected") or "detected")
         return {
             "Bout ID": bout_id,
+            "Run ID": str(selected_row.get("Run ID", "") if selected_row is not None else "").strip(),
             "Track ID": track_id,
             "Behavior": behavior,
             "Behavior ID": _coerce_behavior_id(self.behavior_map.get(behavior, "")),
@@ -817,32 +879,31 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
             "Original Start Frame": int(original_start),
             "Original End Frame": int(original_end),
             "Review Status": review_status,
+            "Interval Semantics": INTERVAL_SEMANTICS,
         }
 
     def _update_selected_bout(self) -> None:
         row = self._selected_bout_row()
         if row is None:
-            messagebox.showinfo("Advanced Bout Scorer", "Select a bout from the table to update it.", parent=self)
+            messagebox.showinfo("Manual Bout Scorer", "Select a bout from the table to update it.", parent=self)
             return
         try:
             payload = self._collect_form_payload(selected_row=row)
-            mask = self.working_bouts_df["Bout ID"] == int(row["Bout ID"])
+            mask = self.working_bouts_df["Bout ID"].astype(str) == str(row["Bout ID"])
             for column, value in payload.items():
                 if column == "Bout ID":
                     continue
                 self.working_bouts_df.loc[mask, column] = value
             self._refresh_track_ids()
             self._refresh_results_tree()
-            self._select_bout_by_id(int(row["Bout ID"]), seek=False)
+            self._select_bout_by_id(str(row["Bout ID"]), seek=False)
             self._save_scores(silent=True)
-            self.status_var.set(f"Updated bout {int(row['Bout ID'])}.")
+            self.status_var.set(f"Updated bout {row['Bout ID']}.")
         except Exception as exc:
-            messagebox.showerror("Advanced Bout Scorer", str(exc), parent=self)
+            messagebox.showerror("Manual Bout Scorer", str(exc), parent=self)
 
-    def _next_bout_id(self) -> int:
-        if self.working_bouts_df.empty:
-            return 1
-        return int(pd.to_numeric(self.working_bouts_df["Bout ID"], errors="coerce").fillna(0).max()) + 1
+    def _next_bout_id(self) -> str:
+        return str(uuid.uuid4())
 
     def _add_new_bout(self) -> None:
         try:
@@ -854,21 +915,23 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
             self.working_bouts_df = pd.concat([self.working_bouts_df, new_row], ignore_index=True)
             self._refresh_track_ids()
             self._refresh_results_tree()
-            self._select_bout_by_id(int(payload["Bout ID"]), seek=False)
+            self._select_bout_by_id(str(payload["Bout ID"]), seek=False)
             self._save_scores(silent=True)
-            self.status_var.set(f"Added new bout {int(payload['Bout ID'])}.")
+            self.status_var.set(f"Added new bout {payload['Bout ID']}.")
         except Exception as exc:
-            messagebox.showerror("Advanced Bout Scorer", str(exc), parent=self)
+            messagebox.showerror("Manual Bout Scorer", str(exc), parent=self)
 
     def _delete_selected_bout(self) -> None:
         row = self._selected_bout_row()
         if row is None:
-            messagebox.showinfo("Advanced Bout Scorer", "Select a bout to delete.", parent=self)
+            messagebox.showinfo("Manual Bout Scorer", "Select a bout to delete.", parent=self)
             return
-        bout_id = int(row["Bout ID"])
+        bout_id = str(row["Bout ID"])
         if not messagebox.askyesno("Delete Bout", f"Delete bout {bout_id}?", parent=self):
             return
-        self.working_bouts_df = self.working_bouts_df[self.working_bouts_df["Bout ID"] != bout_id].copy()
+        self.working_bouts_df = self.working_bouts_df[
+            self.working_bouts_df["Bout ID"].astype(str) != bout_id
+        ].copy()
         self._selected_bout_id = None
         self._refresh_track_ids()
         self._refresh_results_tree()
@@ -884,7 +947,7 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
         exported.reset_index(drop=True, inplace=True)
         return exported.loc[:, SCORER_COLUMNS]
 
-    def _save_scores(self, silent: bool = False) -> None:
+    def _save_scores(self, silent: bool = False) -> OperationResult:
         try:
             export_df = self._export_dataframe()
             if self.autosave_path:
@@ -892,24 +955,39 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
                 save_path.parent.mkdir(parents=True, exist_ok=True)
                 export_df.to_csv(save_path, index=False, encoding="utf-8")
                 if not silent:
-                    messagebox.showinfo("Advanced Bout Scorer", f"Saved progress to:\n{save_path}", parent=self)
+                    messagebox.showinfo("Manual Bout Scorer", f"Saved progress to:\n{save_path}", parent=self)
             if callable(self.on_scores_saved):
-                self.on_scores_saved(export_df.copy())
+                try:
+                    self.on_scores_saved(export_df.copy())
+                except Exception as callback_exc:
+                    self._log(f"Advanced bout save callback failed: {callback_exc}", "WARNING")
+            result = OperationResult.success(
+                "Advanced bout scores saved.",
+                scores_path=str(Path(self.autosave_path).expanduser().resolve()) if self.autosave_path else "",
+            )
         except Exception as exc:
             self._log(f"Failed to save advanced bout scores: {exc}\n{traceback.format_exc()}", "ERROR")
             if not silent:
                 messagebox.showerror("Save Error", f"Failed to save bout scores:\n{exc}", parent=self)
+            result = OperationResult.failure("Failed to save advanced bout scores.", error=str(exc))
+        self.last_save_result = result
+        if callable(self.on_save_result):
+            try:
+                self.on_save_result(result)
+            except Exception as callback_exc:
+                self._log(f"Advanced bout outcome callback failed: {callback_exc}", "WARNING")
+        return result
 
     def _export_csv(self) -> None:
         export_df = self._export_dataframe()
         if export_df.empty:
-            messagebox.showinfo("Advanced Bout Scorer", "No bouts are available to export.", parent=self)
+            messagebox.showinfo("Manual Bout Scorer", "No bouts are available to export.", parent=self)
             return
         initial_name = f"advanced_bout_scores_{Path(self.video_path).stem or 'video'}.csv"
         if self.autosave_path:
             initial_name = Path(self.autosave_path).name
         target = filedialog.asksaveasfilename(
-            title="Export Advanced Bout Scores",
+            title="Export Manual Bout Scores",
             defaultextension=".csv",
             filetypes=[("CSV File", "*.csv")],
             initialfile=initial_name,
@@ -920,16 +998,23 @@ class AdvancedBoutAnalyzer(tk.Toplevel):
         try:
             export_df.to_csv(target, index=False, encoding="utf-8")
             self.status_var.set(f"Exported advanced bout scores to {target}")
-            messagebox.showinfo("Advanced Bout Scorer", f"Exported bout scores to:\n{target}", parent=self)
+            messagebox.showinfo("Manual Bout Scorer", f"Exported bout scores to:\n{target}", parent=self)
         except Exception as exc:
             messagebox.showerror("Export Error", f"Failed to export bout scores:\n{exc}", parent=self)
 
     def _on_closing(self) -> None:
         self.is_playing = False
+        result = self._save_scores(silent=True)
+        if result.failed:
+            messagebox.showerror(
+                "Save Error",
+                f"The advanced bout scores could not be saved, so the window will remain open.\n\n{result.error or result.message}",
+                parent=self,
+            )
+            return
         if self.cap is not None:
             try:
                 self.cap.release()
             except Exception:
                 pass
-        self._save_scores(silent=True)
         self.destroy()

@@ -6,7 +6,7 @@ Use this guide for the full end-to-end IntegraPose workflow: project setup, pose
 
 | Stage | Main result |
 | --- | --- |
-| Project setup | Stable project scaffold and label schema |
+| Project setup | Saved project structure and label definitions |
 | Annotation | Pose labels for training |
 | Training | YOLO pose checkpoint |
 | Inference | Pose labels and optional videos or metrics |
@@ -78,7 +78,7 @@ Set:
 
 | Setting | Recommendation |
 | --- | --- |
-| Model artifact | Your trained pose checkpoint |
+| Model file | Your trained pose checkpoint |
 | Inference task | `pose` or `auto` |
 | Save Results (.txt) | On |
 | Use Tracker | On for multi-animal recordings |
@@ -113,11 +113,21 @@ Open `Bout Analytics` after inference and provide:
 Then:
 
 1. Draw ROIs if needed
-2. Adjust entry/exit and bout settings
-3. Run `Process & Analyze Bouts`
-4. Review outputs using `Review & Confirm Detected Bouts` or the advanced scorer when needed
+2. Choose mutually exclusive or multi-label behavior-bout construction
+3. Adjust entry/exit and bout settings
+4. Run `Process & Analyze Bouts`
+5. Open **Review Behavior Bouts** or **Review ROI / Object Bouts** when
+   scientific confirmation is needed
+6. Complete and export the applicable review scopes
 
 Tab 6 writes a `run_manifest.json` that can be reused by Tab 7 and by batch workflows.
+
+The integrated reviewer can correct behavior classes, track IDs, temporal
+boundaries, ROI visits, and object interactions while preserving the original
+predictions. See [Bout Review Workspace](../user-guide/bout-confirmation.md).
+
+Use **Manual Bout Scorer** only when a separate manually entered sidecar table
+is intended.
 
 ## Step 7. Optional Behavior Clustering in Tab 7
 
@@ -143,7 +153,8 @@ If you have many videos:
 2. Queue videos
 3. Reuse ROI settings where appropriate
 4. Run inference and analytics in one pass
-5. Open selected completed results in Tab 7 when needed
+5. Review and finalize required behavior or spatial scopes
+6. Open selected completed results in Tab 7 when needed
 
 See the [Batch Processing Wizard](../user-guide/batch-processing-wizard.md) guide for the full flow.
 
@@ -153,4 +164,6 @@ See the [Batch Processing Wizard](../user-guide/batch-processing-wizard.md) guid
 - Train a pose checkpoint in Tab 3
 - Save YOLO pose `.txt` outputs in Tab 4
 - Enable tracking for multi-animal recordings
+- Select multi-label bout construction when behavior classes can legitimately
+  overlap
 - Run Tab 6 before Tab 7 when you want reviewed bouts or ROI-grounded summaries

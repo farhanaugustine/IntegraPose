@@ -45,6 +45,7 @@ def test_normalize_advanced_bout_dataframe_from_tab6_columns():
 
     assert list(normalized.columns) == [
         "Bout ID",
+        "Run ID",
         "Track ID",
         "Behavior",
         "Behavior ID",
@@ -58,11 +59,12 @@ def test_normalize_advanced_bout_dataframe_from_tab6_columns():
         "Original Start Frame",
         "Original End Frame",
         "Review Status",
+        "Interval Semantics",
     ]
     assert normalized.iloc[0]["Track ID"] == "2"
     assert normalized.iloc[0]["Behavior"] == "Walking"
     assert normalized.iloc[0]["Behavior ID"] == "1"
-    assert normalized.iloc[0]["Duration (s)"] == 0.4
+    assert normalized.iloc[0]["Duration (s)"] == 0.433333
     assert normalized.iloc[0]["Source Video"] == "C:/data/video_a.mp4"
     assert normalized.iloc[0]["Original Start Frame"] == 10
     assert normalized.iloc[0]["Original End Frame"] == 22
@@ -93,7 +95,7 @@ def test_normalize_advanced_bout_dataframe_supports_alias_columns_and_existing_n
     assert normalized.iloc[0]["Track ID"] == "7"
     assert normalized.iloc[0]["Start Frame"] == 30
     assert normalized.iloc[0]["End Frame"] == 45
-    assert normalized.iloc[0]["Duration (s)"] == 1.0
+    assert normalized.iloc[0]["Duration (s)"] == 1.066667
     assert normalized.iloc[0]["Reviewer Notes"] == "borderline"
     assert bool(normalized.iloc[0]["Edited Manually"]) is True
     assert normalized.iloc[0]["Review Status"] == "detected"
@@ -118,4 +120,19 @@ def test_resolve_initial_bout_id_matches_selected_bout_details():
         {"Track ID": 1, "Behavior": "Walking", "Start Frame": 20, "End Frame": 42},
     )
 
-    assert bout_id == int(normalized.iloc[1]["Bout ID"])
+    assert bout_id == str(normalized.iloc[1]["Bout ID"])
+
+
+def test_normalize_advanced_bout_dataframe_keeps_single_frame_bout_inclusive():
+    normalized = normalize_advanced_bout_dataframe(
+        pd.DataFrame(
+            [{"Bout ID": "stable-id", "Track ID": 0, "Behavior": "Pause", "Start Frame": 8, "End Frame": 8}]
+        ),
+        video_path="C:/data/video_d.mp4",
+        fps=20.0,
+        behavior_map={"Pause": 0},
+    )
+
+    assert normalized.iloc[0]["Bout ID"] == "stable-id"
+    assert normalized.iloc[0]["Duration (s)"] == 0.05
+    assert normalized.iloc[0]["Interval Semantics"] == "inclusive_start_and_end_frames"

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 import json
+import math
+import re
 import time
 import traceback
 
@@ -33,17 +36,54 @@ from integra_pose.utils.batch_exporter import (
 )
 from integra_pose.utils.bout_analyzer import BoutAnalysisCancelledError
 from integra_pose.utils import video_creator
+from integra_pose.utils.detection_contract import enforce_ultralytics_max_det
+from integra_pose.utils.frame_identity import (
+    FrameIdentityError,
+    extract_model_class_metadata,
+    frame_label_filename,
+    load_frame_label_class_metadata,
+    resolve_frame_label_indices,
+    write_frame_label_manifest,
+)
+from integra_pose.utils.operation_result import OperationStatus
+from integra_pose.utils.torch_backend import normalize_ultralytics_device
+from integra_pose.utils.yolo_pose_labels import (
+    YoloPoseLabelSchema,
+    format_yolo_pose_label,
+    write_pose_label_schema,
+)
 
 ProgressFn = Callable[[str, float], None]
 
 
 @dataclass(slots=True)
 class BatchRunResult:
-    cancelled: bool
+    status: OperationStatus
     message: str
     workbook_path: str = ""
     session_json_path: str = ""
     video_results: list[dict] | None = None
+    total_count: int = 0
+    completed_count: int = 0
+    failed_count: int = 0
+    resumed_count: int = 0
+
+    @property
+    def cancelled(self) -> bool:
+        """Compatibility view for callers using the original callback contract."""
+        return self.status is OperationStatus.CANCELLED
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status is OperationStatus.SUCCESS
+
+    @property
+    def partial(self) -> bool:
+        return self.status is OperationStatus.PARTIAL
+
+    @property
+    def failed(self) -> bool:
+        return self.status is OperationStatus.FAILED
 
 
 class BatchPipeline:
@@ -57,6 +97,171 @@ class BatchPipeline:
             self.app.log_message(message, level)
         except Exception:
             pass
+
+    @staticmethod
+    def _existing_file(*candidates: object) -> str:
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if not text:
+                continue
+            try:
+                path = Path(text).expanduser()
+                if path.is_file():
+                    return str(path.resolve())
+            except (OSError, RuntimeError):
+                continue
+        return ""
+
+    def _rehydrate_completed_video_result(self, item) -> tuple[dict | None, str]:
+        """Rebuild a completed video's aggregate payload from persisted artifacts.
+
+        A resume may skip inference and analytics only when the prior core outputs
+        still exist. Otherwise the caller reprocesses the item, preventing a
+        silently incomplete batch workbook.
+        """
+        analytics_dir_text = str(getattr(item, "analytics_output_dir", "") or "").strip()
+        if not analytics_dir_text:
+            return None, "analytics output directory is not recorded"
+        analytics_dir = Path(analytics_dir_text).expanduser()
+        if not analytics_dir.is_dir():
+            return None, f"analytics output directory is missing: {analytics_dir}"
+
+        manifest_path = analytics_dir / "run_manifest.json"
+        manifest: dict = {}
+        if manifest_path.is_file():
+            try:
+                loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest = loaded if isinstance(loaded, dict) else {}
+            except (OSError, ValueError) as exc:
+                return None, f"analytics manifest is unreadable: {exc}"
+        else:
+            return None, f"analytics manifest is missing: {manifest_path}"
+
+        outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
+        inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), dict) else {}
+        parameters = manifest.get("parameters") if isinstance(manifest.get("parameters"), dict) else {}
+        video_stem = Path(str(getattr(item, "video_path", "") or "")).stem
+        detailed_bouts_csv = self._existing_file(
+            outputs.get("raw_detected_bouts_csv"),
+            outputs.get("raw_detailed_bouts_csv"),
+            getattr(item, "detailed_bouts_csv", ""),
+            outputs.get("detailed_bouts_csv"),
+            analytics_dir / f"{video_stem}_detailed_bouts.csv",
+        )
+        summary_bouts_csv = self._existing_file(
+            outputs.get("raw_summary_csv"),
+            getattr(item, "summary_bouts_csv", ""),
+            outputs.get("summary_csv"),
+            analytics_dir / f"{video_stem}_summary.csv",
+        )
+        if not detailed_bouts_csv or not summary_bouts_csv:
+            missing = []
+            if not detailed_bouts_csv:
+                missing.append("detailed bouts CSV")
+            if not summary_bouts_csv:
+                missing.append("summary bouts CSV")
+            return None, f"required prior artifact(s) missing: {', '.join(missing)}"
+
+        labels_dir_text = str(getattr(item, "yolo_output_dir", "") or "").strip()
+        run_dir_text = str(getattr(item, "run_output_dir", "") or "").strip()
+        labels_dir = Path(labels_dir_text).expanduser() if labels_dir_text else None
+        run_dir = Path(run_dir_text).expanduser() if run_dir_text else None
+
+        def _under(directory: Path | None, filename: str) -> object:
+            return directory / filename if directory is not None else ""
+
+        roi_files = outputs.get("roi_metrics_files") if isinstance(outputs.get("roi_metrics_files"), dict) else {}
+        object_files = (
+            outputs.get("object_interaction_files")
+            if isinstance(outputs.get("object_interaction_files"), dict)
+            else {}
+        )
+        modules = outputs.get("modules") if isinstance(outputs.get("modules"), dict) else {}
+        object_module = modules.get("object_interactions") if isinstance(modules.get("object_interactions"), dict) else {}
+        object_module_files = object_module.get("files") if isinstance(object_module.get("files"), dict) else {}
+
+        item.analytics_output_dir = str(analytics_dir.resolve())
+        item.detailed_bouts_csv = detailed_bouts_csv
+        item.summary_bouts_csv = summary_bouts_csv
+        return {
+            "video_id": str(getattr(item, "video_id", "") or ""),
+            "video_name": str(getattr(item, "video_name", "") or ""),
+            "video_path": str(getattr(item, "video_path", "") or ""),
+            "group": str(getattr(item, "group", "") or ""),
+            "subject_id": str(getattr(item, "subject_id", "") or ""),
+            "time_point": str(getattr(item, "time_point", "") or ""),
+            "run_output_dir": str(run_dir.resolve()) if run_dir is not None and run_dir.is_dir() else run_dir_text,
+            "yolo_output_dir": str(labels_dir.resolve()) if labels_dir is not None and labels_dir.is_dir() else labels_dir_text,
+            "analytics_output_dir": str(analytics_dir.resolve()),
+            "labels_csv": self._existing_file(_under(labels_dir, "labels.csv"), _under(run_dir, "labels.csv")),
+            "metrics_csv": self._existing_file(
+                getattr(item, "metrics_csv", ""),
+                _under(run_dir, "metrics.csv"),
+                _under(labels_dir, "metrics.csv"),
+            ),
+            "metrics_summary_by_track_csv": self._existing_file(
+                _under(run_dir, "metrics_summary_by_track.csv"),
+                _under(labels_dir, "metrics_summary_by_track.csv"),
+            ),
+            "metrics_summary_by_frame_csv": self._existing_file(
+                _under(run_dir, "metrics_summary_by_frame.csv"),
+                _under(labels_dir, "metrics_summary_by_frame.csv"),
+            ),
+            "detailed_bouts_csv": detailed_bouts_csv,
+            "reviewed_bouts_csv": self._existing_file(
+                outputs.get("reviewed_bouts_csv"),
+            ),
+            "summary_bouts_csv": summary_bouts_csv,
+            "roi_events_csv": self._existing_file(
+                outputs.get("reviewed_roi_events_csv"),
+                outputs.get("roi_events_csv"),
+                analytics_dir / f"{video_stem}_roi_events.csv",
+            ),
+            "roi_overview_csv": self._existing_file(
+                outputs.get("reviewed_roi_overview_csv"),
+                roi_files.get("exclusive_entries_exits"),
+                roi_files.get("entries_exits"),
+            ),
+            "roi_concurrent_overview_csv": self._existing_file(roi_files.get("entries_exits")),
+            "roi_dwell_events_csv": self._existing_file(
+                outputs.get("reviewed_roi_dwell_events_csv"),
+                roi_files.get("exclusive_dwell_events"),
+                roi_files.get("dwell_events"),
+            ),
+            "object_interactions_csv": self._existing_file(
+                object_module_files.get("summary"),
+                object_files.get("summary"),
+                object_module_files.get("per_frame"),
+                object_files.get("per_frame"),
+            ),
+            "object_dwell_events_csv": self._existing_file(
+                object_module_files.get("dwell_events"),
+                object_files.get("dwell_events"),
+            ),
+            "roi_polygons": dict(inputs.get("roi_polygons") or {}),
+            "object_roi_polygons": dict(inputs.get("object_roi_polygons") or {}),
+            "object_interaction_distance_px": float(parameters.get("object_interaction_distance_px", 0.0) or 0.0),
+            "analytics_annotated_video_path": self._existing_file(
+                analytics_dir / f"{video_stem}_annotated.mp4"
+            ),
+            "run_manifest_json": str(manifest_path.resolve()),
+        }, ""
+
+    @staticmethod
+    def _run_counts(active_videos: list[object]) -> tuple[int, int]:
+        completed = sum(
+            1
+            for item in active_videos
+            if str(getattr(item, "inference_status", "")).strip() == "completed"
+            and str(getattr(item, "analytics_status", "")).strip() == "completed"
+        )
+        failed = sum(
+            1
+            for item in active_videos
+            if str(getattr(item, "inference_status", "")).strip() == "failed"
+            or str(getattr(item, "analytics_status", "")).strip() == "failed"
+        )
+        return completed, failed
 
     @staticmethod
     def _safe_float(raw: str | float | int | None, default: float) -> float:
@@ -170,68 +375,27 @@ class BatchPipeline:
 
     @staticmethod
     def _normalize_device(value: str | None) -> str:
-        """Normalize a user-supplied device string into one Ultralytics accepts.
+        """Normalize batch device input for CUDA, ROCm, MPS, or CPU."""
+        return normalize_ultralytics_device(value, preserve_auto=True)
 
-        Accepts (case-insensitive):
-            ""  / "cpu"            -> "cpu"
-            "0", "1", ...          -> "cuda:0", "cuda:1", ...
-            "cuda" / "gpu"         -> "cuda:0"
-            "cuda:N"               -> validated against torch.cuda.device_count()
-            "mps"                  -> "mps" (Apple Silicon)
-
-        When CUDA isn't available, or the requested cuda index doesn't
-        exist, this returns "cpu" so the inference loop never raises an
-        "invalid device ID" from inside Ultralytics. As a defensive
-        side effect, when the broken-CUDA scenario is detected
-        (``torch.cuda.is_available() == True`` but ``device_count() == 0``,
-        common on Windows boxes where torch was built with CUDA but no
-        usable GPU is present at runtime), this also sets
-        ``CUDA_VISIBLE_DEVICES=""`` so Ultralytics' internal GPU
-        enumeration (e.g. inside BoT-SORT's ReID setup) doesn't crash on
-        ``torch.cuda.get_device_properties(0)``.
-        """
-        text = str(value or "").strip().lower()
-        if not text or text == "cpu":
-            return "cpu"
-        if text == "mps":
-            return "mps"
-
-        # Resolve "cuda" / "gpu" / "0" / "cuda:N" all into a candidate index.
-        candidate_index: int | None = None
-        if text == "cuda" or text == "gpu":
-            candidate_index = 0
-        elif text.isdigit():
-            candidate_index = int(text)
-        elif text.startswith("cuda:"):
-            tail = text.split(":", 1)[1].strip()
-            if tail.isdigit():
-                candidate_index = int(tail)
-        if candidate_index is None:
-            # Unknown / malformed — let Ultralytics decide (will likely
-            # error, but at least the user sees their literal value back).
-            return text
-
-        # Validate against actual hardware before handing off to Ultralytics.
-        try:
-            import os as _os  # noqa: PLC0415
-            import torch  # noqa: PLC0415
-
-            cuda_seen = bool(getattr(torch, "cuda", None) and torch.cuda.is_available())
-            n = int(torch.cuda.device_count()) if cuda_seen else 0
-
-            if (not cuda_seen) or n == 0 or candidate_index < 0 or candidate_index >= n:
-                # Broken-CUDA defense: when torch *thinks* it has CUDA but
-                # device_count is 0, downstream code (Ultralytics ReID, etc.)
-                # may still try to enumerate GPUs and crash. Mask the
-                # devices entirely so every subsystem behaves as CPU-only.
-                if cuda_seen and n == 0:
-                    _os.environ["CUDA_VISIBLE_DEVICES"] = ""
-                return "cpu"
-        except Exception:
-            # torch isn't importable or cuda probing failed — safest to
-            # fall through to CPU rather than risk an opaque crash.
-            return "cpu"
-        return f"cuda:{candidate_index}"
+    @staticmethod
+    def _resolve_runtime_device(model: object, fallback: str) -> str:
+        """Read the device selected by Ultralytics after predictor startup."""
+        predictor = getattr(model, "predictor", None)
+        candidates = (
+            getattr(predictor, "device", None),
+            getattr(getattr(predictor, "model", None), "device", None),
+            getattr(getattr(model, "model", None), "device", None),
+            getattr(model, "device", None),
+        )
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if text and text.lower() not in {"none", "-1", "auto"}:
+                return text
+        fallback_text = str(fallback or "").strip()
+        if fallback_text.lower() in {"", "-1", "auto"}:
+            return "unknown"
+        return fallback_text
 
     @staticmethod
     def _resolve_tracker_config(raw: str | Path | None) -> Path | None:
@@ -363,6 +527,8 @@ class BatchPipeline:
             motion_direction_threshold_deg=settings.motion_direction_threshold_deg,
             motion_velocity_threshold_px=settings.motion_velocity_threshold_px,
             heading_indices=settings.heading_indices,
+            anchor_keypoint_index=settings.anchor_keypoint_index,
+            keypoint_names=list(settings.keypoint_names or []),
             log_fn=self._log,
         )
         if result.metrics_csv.is_file():
@@ -383,6 +549,7 @@ class BatchPipeline:
         from ultralytics import YOLO
 
         model = YOLO(str(settings.model_path))
+        model_class_names, model_task = extract_model_class_metadata(model)
 
         # Pass the user's device string straight through to Ultralytics.
         # We deliberately do NOT call ``model.to(...)`` here — torch's
@@ -415,6 +582,19 @@ class BatchPipeline:
         run_dir.mkdir(parents=True, exist_ok=True)
         labels_dir = run_dir / "labels"
         labels_dir.mkdir(parents=True, exist_ok=True)
+        source_path = Path(settings.source_path)
+        requested_max_det = int(settings.max_det)
+        if requested_max_det < 1:
+            raise ValueError("max_det must be at least 1.")
+        effective_max_det = 1 if bool(settings.single_animal_mode) else requested_max_det
+        write_frame_label_manifest(
+            labels_dir,
+            source=source_path,
+            max_det=effective_max_det,
+            class_names=model_class_names,
+            class_names_source="model.names",
+            model_task=model_task,
+        )
         labels_csv_path = labels_dir / "labels.csv"
         labels_csv = LabelsAggregateRecorder(
             labels_csv_path,
@@ -428,7 +608,6 @@ class BatchPipeline:
         video_writer_path = ""
         frame_width = 0
         frame_height = 0
-        source_path = Path(settings.source_path)
         try:
             cap = cv2.VideoCapture(str(source_path))
             if cap.isOpened():
@@ -457,7 +636,7 @@ class BatchPipeline:
             iou=settings.iou,
             imgsz=settings.imgsz,
             batch=max(1, int(getattr(settings, "inference_batch_size", 25) or 25)),
-            max_det=settings.max_det,
+            max_det=effective_max_det,
             device=actual_device,
             stream=True,
             augment=settings.augment,
@@ -485,6 +664,9 @@ class BatchPipeline:
             iterator = model.predict(source=str(settings.source_path), **common_kwargs)
 
         tracker_warning_emitted = False
+        max_det_warning_emitted = False
+        pose_label_schema: YoloPoseLabelSchema | None = None
+        wrote_detection_only_labels = False
         for frame_index, result in enumerate(iterator):
             if stop_event.is_set():
                 self._log("Stop signal received. Ending native batch inference loop.", "INFO")
@@ -495,8 +677,27 @@ class BatchPipeline:
                 except Exception:
                     pass
 
+            limit_outcome = enforce_ultralytics_max_det(result, effective_max_det)
+            result = limit_outcome.result
+            if limit_outcome.dropped_count > 0 and not max_det_warning_emitted:
+                max_det_warning_emitted = True
+                self._log(
+                    (
+                        f"The model returned {limit_outcome.original_count} detections for frame {frame_index} "
+                        f"with effective max_det={effective_max_det}; retained the {limit_outcome.retained_count} "
+                        "highest-confidence detection(s)."
+                    ),
+                    "WARNING",
+                )
+
             boxes = getattr(result, "boxes", None)
             if boxes is None or len(boxes) == 0:
+                label_path = labels_dir / frame_label_filename(source_path, frame_index)
+                if label_path.exists():
+                    raise RuntimeError(
+                        f"Duplicate label output for zero-based frame {frame_index}: {label_path}"
+                    )
+                label_path.write_text("", encoding="utf-8")
                 if settings.save:
                     try:
                         plotted = result.plot()
@@ -514,7 +715,9 @@ class BatchPipeline:
 
             xywhn = self._to_numpy(getattr(boxes, "xywhn", None), dtype=float)
             if xywhn is None or xywhn.ndim != 2 or xywhn.shape[0] == 0:
-                continue
+                raise ValueError(
+                    f"Frame {frame_index} reported detections without a valid normalized xywh array."
+                )
             cls = self._to_numpy(getattr(boxes, "cls", None))
             conf = self._to_numpy(getattr(boxes, "conf", None), dtype=float)
             track_raw = self._to_numpy(getattr(boxes, "id", None))
@@ -553,23 +756,7 @@ class BatchPipeline:
             track_strings: list[str | None] = []
             has_any_track = False
             all_have_track = True
-            lines: list[str] = []
             for idx in range(xywhn.shape[0]):
-                class_id = int(cls[idx]) if cls is not None and idx < len(cls) else 0
-                x, y, w, h = xywhn[idx]
-                fields = [
-                    str(class_id),
-                    f"{float(x):.6f}",
-                    f"{float(y):.6f}",
-                    f"{float(w):.6f}",
-                    f"{float(h):.6f}",
-                ]
-                if kp_xyn is not None and idx < kp_xyn.shape[0]:
-                    point_count = kp_xyn.shape[1]
-                    for kp_idx in range(point_count):
-                        fields.append(f"{float(kp_xyn[idx, kp_idx, 0]):.6f}")
-                        fields.append(f"{float(kp_xyn[idx, kp_idx, 1]):.6f}")
-
                 track_val = None
                 if bool(settings.single_animal_mode):
                     track_val = "0"
@@ -587,18 +774,102 @@ class BatchPipeline:
                     has_any_track = True
                 else:
                     all_have_track = False
-                lines.append(" ".join(fields))
 
-            if has_any_track and all_have_track:
-                lines = [f"{base} {tid}" for base, tid in zip(lines, track_strings)]
-            elif settings.use_tracker and not tracker_warning_emitted:
+            emit_track_ids = has_any_track and all_have_track
+            if settings.use_tracker and not emit_track_ids and not tracker_warning_emitted:
                 tracker_warning_emitted = True
                 self._log(
                     "Tracker IDs were unavailable or incomplete; label files emitted without track IDs.",
                     "WARNING",
                 )
 
-            label_path = labels_dir / f"{source_path.stem}_frame{frame_index:06d}.txt"
+            pose_payload_available = bool(
+                kp_xyn is not None
+                and kp_xyn.ndim == 3
+                and kp_xyn.shape[0] == xywhn.shape[0]
+                and kp_xyn.shape[1] > 0
+                and kp_xyn.shape[2] >= 2
+            )
+            keypoint_confidence_available = bool(
+                pose_payload_available
+                and kp_conf is not None
+                and kp_conf.ndim == 2
+                and kp_conf.shape[0] == xywhn.shape[0]
+                and kp_conf.shape[1] >= kp_xyn.shape[1]
+            )
+            if pose_payload_available:
+                candidate_schema = YoloPoseLabelSchema(
+                    keypoint_count=int(kp_xyn.shape[1]),
+                    keypoint_dimensions=3 if keypoint_confidence_available else 2,
+                    include_bbox=True,
+                    include_bbox_confidence=bool(settings.save_conf),
+                    include_track_id=True,
+                )
+                if wrote_detection_only_labels:
+                    raise ValueError(
+                        "Pose keypoints appeared after detect-only label rows had already been written; "
+                        "refusing to create a mixed label schema."
+                    )
+                if pose_label_schema is None:
+                    pose_label_schema = candidate_schema
+                    write_pose_label_schema(labels_dir, pose_label_schema)
+                elif pose_label_schema != candidate_schema:
+                    raise ValueError(
+                        "Pose-label shape changed during batch inference; refusing to write a mixed schema."
+                    )
+            else:
+                if pose_label_schema is not None:
+                    raise ValueError(
+                        "A pose-label frame was missing keypoints after the pose schema was established."
+                    )
+                wrote_detection_only_labels = True
+
+            lines: list[str] = []
+            for idx in range(xywhn.shape[0]):
+                class_id = int(cls[idx]) if cls is not None and idx < len(cls) else 0
+                bbox = [float(value) for value in xywhn[idx, :4]]
+                bbox_confidence = None
+                if bool(settings.save_conf):
+                    try:
+                        bbox_confidence = float(conf[idx]) if conf is not None and idx < len(conf) else 0.0
+                    except (TypeError, ValueError):
+                        bbox_confidence = 0.0
+                    if not np.isfinite(bbox_confidence):
+                        bbox_confidence = 0.0
+                    bbox_confidence = max(0.0, min(1.0, bbox_confidence))
+                track_id = int(track_strings[idx]) if emit_track_ids and track_strings[idx] is not None else None
+
+                if pose_label_schema is not None and pose_payload_available:
+                    row_keypoints: list[tuple[float, ...]] = []
+                    for kp_idx in range(pose_label_schema.keypoint_count):
+                        kx = float(kp_xyn[idx, kp_idx, 0])
+                        ky = float(kp_xyn[idx, kp_idx, 1])
+                        if pose_label_schema.keypoint_dimensions == 3:
+                            row_keypoints.append((kx, ky, float(kp_conf[idx, kp_idx])))
+                        else:
+                            row_keypoints.append((kx, ky))
+                    lines.append(
+                        format_yolo_pose_label(
+                            class_id=class_id,
+                            bbox=bbox,
+                            keypoints=row_keypoints,
+                            bbox_confidence=bbox_confidence,
+                            track_id=track_id,
+                        )
+                    )
+                else:
+                    fields = [str(class_id), *(f"{value:.6f}" for value in bbox)]
+                    if bbox_confidence is not None:
+                        fields.append(f"{bbox_confidence:.6f}")
+                    if track_id is not None:
+                        fields.append(str(track_id))
+                    lines.append(" ".join(fields))
+
+            label_path = labels_dir / frame_label_filename(source_path, frame_index)
+            if label_path.exists():
+                raise RuntimeError(
+                    f"Duplicate label output for zero-based frame {frame_index}: {label_path}"
+                )
             label_path.write_text("\n".join(lines), encoding="utf-8")
             labels_csv.record(
                 frame_index,
@@ -634,10 +905,22 @@ class BatchPipeline:
         from integra_pose.utils.repro_metadata import build_inference_metadata
         from integra_pose.utils.safe_io import safe_write_json
 
-        seeds_extra = {}
+        metadata_extra = {
+            "max_det_requested": requested_max_det,
+            "integrapose_source_file": str(Path(__file__).resolve()),
+            "keypoint_names": list(getattr(settings, "keypoint_names", None) or []),
+            "keypoint_names_source": str(getattr(settings, "keypoint_names_source", "") or "unresolved"),
+            "keypoint_count": len(getattr(settings, "keypoint_names", None) or []),
+            "heading_indices": list(getattr(settings, "heading_indices", None)) if getattr(settings, "heading_indices", None) else None,
+            "heading_names": list(getattr(settings, "heading_names", None)) if getattr(settings, "heading_names", None) else None,
+            "heading_source": str(getattr(settings, "heading_source", "") or "unavailable"),
+            "anchor_keypoint_index": getattr(settings, "anchor_keypoint_index", None),
+            "anchor_keypoint_name": str(getattr(settings, "anchor_keypoint_name", "") or ""),
+        }
         seeds_snapshot = getattr(self, "_active_seeds_snapshot", None)
         if isinstance(seeds_snapshot, dict) and seeds_snapshot:
-            seeds_extra["seeds"] = dict(seeds_snapshot)
+            metadata_extra["seeds"] = dict(seeds_snapshot)
+        runtime_device = self._resolve_runtime_device(model, actual_device)
         metadata = build_inference_metadata(
             source_video=source_path,
             frame_width=frame_width,
@@ -645,14 +928,15 @@ class BatchPipeline:
             fps=fps,
             fps_source=fps_source,
             device_requested=requested_raw or actual_device,
-            device_used=actual_device,
+            device_used=runtime_device,
             single_animal_mode=bool(settings.single_animal_mode),
             model_path=settings.model_path,
             conf_threshold=getattr(settings, "conf", None),
             iou_threshold=getattr(settings, "iou", None),
+            max_det=effective_max_det,
             use_tracker=bool(settings.use_tracker),
             tracker_config=settings.tracker_config,
-            extra=seeds_extra or None,
+            extra=metadata_extra,
         )
         safe_write_json(run_dir / "inference_metadata.json", metadata, indent=2)
         return {
@@ -827,6 +1111,10 @@ class BatchPipeline:
             "names": names_map,
             "rois": {},
         }
+        keypoint_names, _source = self._get_keypoint_names(session)
+        if keypoint_names:
+            payload["kpt_shape"] = [len(keypoint_names), 3]
+            payload["kpt_names"] = list(keypoint_names)
         yaml_path = output_root / "_batch_generated_dataset.yaml"
         try:
             import yaml
@@ -837,19 +1125,45 @@ class BatchPipeline:
             yaml_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return yaml_path
 
-    def _get_keypoint_names(self) -> list[str]:
-        names = []
+    def _get_keypoint_names(self, session=None) -> tuple[list[str], str]:
+        expected = 0
+        if session is not None:
+            capabilities = getattr(session, "model_capabilities", None)
+            expected = max(0, int(getattr(capabilities, "keypoint_count", 0) or 0))
+            task = str(getattr(capabilities, "task", "unknown") or "unknown").strip().lower()
+            if task == "detect":
+                return [], "not_applicable"
+            session_names = [str(name).strip() for name in (getattr(session, "keypoint_names", []) or []) if str(name).strip()]
+            if session_names and (not expected or len(session_names) == expected):
+                return session_names, str(getattr(session, "keypoint_names_source", "session") or "session")
+            capability_names = [str(name).strip() for name in (getattr(capabilities, "keypoint_names", []) or []) if str(name).strip()]
+            if capability_names and (not expected or len(capability_names) == expected):
+                return capability_names, str(getattr(capabilities, "keypoint_names_source", "model") or "model")
+
+        names: list[str] = []
         try:
             raw = str(self.app.config.setup.keypoint_names_str.get() or "").strip()
         except Exception:
             raw = ""
         if raw:
             names = [token.strip() for token in raw.split(",") if token.strip()]
-        return names
+        if names and (not expected or len(names) == expected):
+            return names, "gui_config"
+        if expected:
+            return [f"kp{idx}" for idx in range(expected)], "generated_generic"
+        return names, "gui_config" if names else "unresolved"
+
+    @staticmethod
+    def _semantic_keypoint_index(names: list[str], aliases: set[str]) -> int | None:
+        for idx, name in enumerate(names):
+            token = re.sub(r"[^a-z0-9]+", "", str(name).casefold())
+            if token in aliases:
+                return idx
+        return None
 
     def _build_inference_settings(self, session, video_path: str, infer_project_dir: Path, run_name: str) -> InferenceSettings:
         cfg = self.app.config.inference
-        keypoint_names = self._get_keypoint_names()
+        keypoint_names, keypoint_names_source = self._get_keypoint_names(session)
         grid_enabled_var = getattr(cfg, "grid_metrics_enabled_var", None)
         grid_size_var = getattr(cfg, "grid_size_px_var", None)
         grid_heatmaps_var = getattr(cfg, "grid_save_heatmaps_var", None)
@@ -917,9 +1231,32 @@ class BatchPipeline:
         heading_to = str(getattr(cfg, "metrics_heading_to_var", "").get() if hasattr(getattr(cfg, "metrics_heading_to_var", None), "get") else "").strip()
         heading_indices: tuple[int, int] | None = None
         heading_names: tuple[str, str] | None = None
+        heading_source = "unavailable"
         if heading_from and heading_to and heading_from != heading_to and heading_from in keypoint_names and heading_to in keypoint_names:
             heading_indices = (keypoint_names.index(heading_from), keypoint_names.index(heading_to))
             heading_names = (heading_from, heading_to)
+            heading_source = "gui_config"
+        else:
+            tail_index = self._semantic_keypoint_index(
+                keypoint_names,
+                {"tailbase", "baseoftail", "tailroot", "basetail"},
+            )
+            nose_index = self._semantic_keypoint_index(keypoint_names, {"nose", "snout"})
+            if tail_index is not None and nose_index is not None and tail_index != nose_index:
+                heading_indices = (tail_index, nose_index)
+                heading_names = (keypoint_names[tail_index], keypoint_names[nose_index])
+                heading_source = "semantic_tailbase_to_nose"
+                if heading_from or heading_to:
+                    self._log(
+                        f"Configured heading pair '{heading_from}' to '{heading_to}' is not present in the validated "
+                        f"keypoint schema; using {heading_names[0]} to {heading_names[1]}.",
+                        "WARNING",
+                    )
+        anchor_index = self._semantic_keypoint_index(
+            keypoint_names,
+            {"centerspine", "centrespine", "thorax", "bodycenter", "centrebody", "centerbody", "midback"},
+        )
+        anchor_name = keypoint_names[anchor_index] if anchor_index is not None else None
         tracker_config_raw = str(getattr(session, "tracker_config_path", "") or "").strip()
         if not tracker_config_raw:
             tracker_config_raw = str(cfg.tracker_config_path.get() or "").strip()
@@ -932,7 +1269,7 @@ class BatchPipeline:
             iou=self._safe_float(cfg.iou_thres_var.get(), 0.45),
             imgsz=self._safe_int(cfg.infer_imgsz_var.get(), 640),
             device=str(session.inference_device or cfg.infer_device_var.get() or "").strip(),
-            max_det=self._safe_int(cfg.infer_max_det_var.get(), 300),
+            max_det=max(1, self._safe_int(getattr(session, "max_det", 300), 300)),
             augment=bool(cfg.infer_augment_var.get()),
             show=False,
             preview_max_side=self._safe_nonnegative_int(
@@ -967,6 +1304,10 @@ class BatchPipeline:
             heading_names=heading_names,
             model_keypoint_names=keypoint_names if keypoint_names else None,
             keypoint_names=keypoint_names if keypoint_names else None,
+            keypoint_names_source=keypoint_names_source,
+            anchor_keypoint_index=anchor_index,
+            anchor_keypoint_name=anchor_name,
+            heading_source=heading_source,
             annotation=annotation,
             motion_direction_threshold_deg=self._safe_float(cfg.motion_direction_threshold_var.get(), 15.0),
             motion_velocity_threshold_px=self._safe_float(cfg.motion_velocity_threshold_var.get(), 0.0),
@@ -1019,8 +1360,12 @@ class BatchPipeline:
             grouped.setdefault(parent, []).append(txt_file.name.lower())
         rows: list[tuple[Path, list[str]]] = []
         for parent, names in grouped.items():
-            if names:
-                rows.append((parent, names))
+            try:
+                resolved = resolve_frame_label_indices(names)
+            except FrameIdentityError:
+                continue
+            if resolved:
+                rows.append((parent, sorted(resolved)))
         return rows
 
     @staticmethod
@@ -1035,35 +1380,47 @@ class BatchPipeline:
         if not stem:
             return None
 
-        def _dir_has_txt(path: Path) -> bool:
+        def _source_filename_match(name: str) -> bool:
+            file_stem = Path(name).stem.casefold()
+            return bool(
+                file_stem == stem
+                or re.match(rf"^{re.escape(stem)}__(?:frame|frm|image|img)_?\d+$", file_stem)
+                or re.match(rf"^{re.escape(stem)}_(?:frame|frm|image|img)_?\d+$", file_stem)
+                or re.match(rf"^{re.escape(stem)}_\d+$", file_stem)
+            )
+
+        def _dir_has_frames(path: Path, *, require_source_match: bool) -> bool:
             if not path.exists() or not path.is_dir():
                 return False
             try:
-                return any(path.glob("*.txt"))
+                names = [item.name for item in path.glob("*.txt") if not item.name.startswith(".")]
+                if require_source_match:
+                    names = [name for name in names if _source_filename_match(name)]
+                return bool(resolve_frame_label_indices(names, source=video_stem))
             except Exception:
                 return False
 
         preferred = Path(str(preferred_dir or "").strip()).expanduser() if preferred_dir else None
-        if preferred and _dir_has_txt(preferred):
+        if preferred and _dir_has_frames(preferred, require_source_match=False):
             return preferred.resolve()
 
         if labels_root is not None:
             direct_candidates = [labels_root / video_stem, labels_root / video_stem / "labels", labels_root / f"{video_stem}_labels"]
             for candidate in direct_candidates:
-                if _dir_has_txt(candidate):
+                if _dir_has_frames(candidate, require_source_match=True):
                     return candidate.resolve()
 
         if not indexed_dirs:
             return None
 
-        prefix = f"{stem}_frame"
-        best_path = None
-        best_score = -1
+        prefixes = (f"{stem}_frame", f"{stem}__frame")
+        candidates: list[tuple[int, str, Path]] = []
         for parent, names in indexed_dirs:
-            prefix_hit = any(name.startswith(prefix) for name in names)
-            stem_hit = any(stem in name for name in names)
+            matching_names = [name for name in names if _source_filename_match(name)]
+            prefix_hit = any(name.startswith(prefixes) for name in matching_names)
+            stem_hit = bool(matching_names)
             parent_name = parent.name.lower()
-            parent_hit = stem in parent_name
+            parent_hit = parent_name in {stem, f"{stem}_labels"}
             # Avoid false positives by requiring a concrete video-stem signal.
             if not (prefix_hit or stem_hit or parent_hit):
                 continue
@@ -1076,13 +1433,14 @@ class BatchPipeline:
                 score += 25
             if parent_name == "labels":
                 score += 10
-            score += min(len(names), 20)
-            if score > best_score:
-                best_score = score
-                best_path = parent
-        if best_score <= 0:
+            score += min(len(matching_names), 20)
+            candidates.append((score, str(parent).casefold(), parent))
+        if not candidates:
             return None
-        return Path(best_path).resolve() if best_path is not None else None
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+            return None
+        return candidates[0][2].resolve()
 
     @staticmethod
     def _normalize_stats_categorical_factors(
@@ -1116,6 +1474,714 @@ class BatchPipeline:
             normalized.append(mapped_key or key)
         return normalized, removed_behavior, removed_unavailable
 
+    @staticmethod
+    def _discover_stats_categorical_factors(
+        video_summary_df: pd.DataFrame,
+    ) -> list[str]:
+        """Find replicated categorical design columns, excluding ID/unit fields."""
+
+        if video_summary_df is None or video_summary_df.empty:
+            return []
+        excluded = {
+            "group",
+            "subject_id",
+            "video_id",
+            "video_name",
+            "video_path",
+        }
+        discovered: list[str] = []
+        row_count = max(1, int(len(video_summary_df.index)))
+        max_levels = max(2, min(24, row_count))
+        for column in video_summary_df.columns:
+            column_name = str(column)
+            column_key = column_name.casefold()
+            if column_key in excluded:
+                continue
+            series = video_summary_df[column]
+            if pd.api.types.is_numeric_dtype(series) and column_key != "time_point":
+                continue
+            cleaned = series.fillna("").astype(str).str.strip()
+            cleaned = cleaned[cleaned != ""]
+            level_count = int(cleaned.nunique(dropna=True))
+            if 2 <= level_count <= max_levels:
+                discovered.append(column_name)
+        return discovered
+
+    @staticmethod
+    def _figure_export_options(session) -> dict[str, object]:
+        export_mode = (
+            str(getattr(session, "figure_export_mode", "full_bundle") or "full_bundle").strip()
+            or "full_bundle"
+        )
+        return {
+            "export_mode": export_mode,
+            "export_publication_figures": bool(
+                getattr(session, "export_publication_figures", export_mode != "disabled")
+            ),
+            "export_batch_dashboard": bool(
+                getattr(session, "export_batch_dashboard", False)
+            ),
+            "export_group_stats_overview": bool(
+                getattr(session, "export_group_stats_overview", False)
+            ),
+            "export_individual_profiles": bool(
+                getattr(session, "export_individual_profiles", export_mode == "full_bundle")
+            ),
+            "export_module_archive": bool(
+                getattr(session, "export_module_archive", export_mode == "full_bundle")
+            ),
+            "generate_video_quicklooks": bool(
+                getattr(session, "generate_video_quicklooks", export_mode == "full_bundle")
+            ),
+        }
+
+    def _export_batch_aggregates(
+        self,
+        *,
+        session,
+        video_results: list[dict],
+        output_root: Path,
+        progress_callback: Optional[ProgressFn] = None,
+        precomputed_figure_records: list[dict[str, str]] | None = None,
+    ) -> str:
+        """Rebuild every batch-level derivative from active per-video outputs."""
+
+        def _progress(message: str, ratio: float) -> None:
+            if progress_callback is not None:
+                progress_callback(message, ratio)
+
+        fps_summary = check_fps_consistency(video_results, log_fn=self._log) or {}
+        if (
+            not bool(fps_summary.get("consistent", True))
+            and str(
+                getattr(session, "temporal_threshold_unit", "frames") or "frames"
+            ).strip().lower()
+            == "seconds"
+        ):
+            self._log(
+                "Second-based bout and ROI thresholds were resolved separately "
+                "for each video's FPS, so their real-time meaning is preserved.",
+                "INFO",
+            )
+        keypoint_df, kinematic_df, bout_df = collect_batch_frames(video_results)
+        video_summary_df = build_video_summary(video_results)
+        analysis_coverage_df = build_analysis_coverage(video_results)
+        module_bundle = collect_batch_module_tables(video_results)
+        module_file_index_df, module_table_index_df = export_batch_module_tables(
+            module_bundle,
+            output_dir=output_root / "module_tables",
+        )
+        analysis_coverage_csv = output_root / "analysis_coverage_table.csv"
+        (analysis_coverage_df if not analysis_coverage_df.empty else pd.DataFrame()).to_csv(
+            analysis_coverage_csv,
+            index=False,
+        )
+
+        class_capabilities = getattr(session, "model_capabilities", None)
+        supports_multiclass = bool(
+            getattr(class_capabilities, "supports_multiclass_stats", False)
+        )
+        class_names = list(getattr(class_capabilities, "class_names", []) or [])
+        class_count = int(getattr(class_capabilities, "class_count", 0) or 0)
+        if class_count <= 0 and class_names:
+            class_count = len(class_names)
+        if class_count > 1:
+            supports_multiclass = True
+        elif class_count == 1:
+            supports_multiclass = False
+        configured_stats_factors = list(
+            getattr(session, "stats_categorical_factors", None) or []
+        )
+        if bool(getattr(session, "stats_auto_detect_design", True)):
+            inferred_stats_factors = self._discover_stats_categorical_factors(
+                video_summary_df
+            )
+            for factor in inferred_stats_factors:
+                if factor.casefold() not in {
+                    str(existing).casefold()
+                    for existing in configured_stats_factors
+                }:
+                    configured_stats_factors.append(factor)
+            if inferred_stats_factors:
+                self._log(
+                    "Automatically assigned categorical study-design factors: "
+                    + ", ".join(inferred_stats_factors),
+                    "INFO",
+                )
+        (
+            stats_factors,
+            removed_behavior_factors,
+            removed_unavailable_factors,
+        ) = self._normalize_stats_categorical_factors(
+            configured_stats_factors,
+            supports_multiclass_stats=supports_multiclass,
+            available_columns=set(video_summary_df.columns),
+        )
+        if removed_behavior_factors:
+            self._log(
+                "Single-class mode detected; skipping behavior-like categorical "
+                "factors in batch stats: "
+                + ", ".join(removed_behavior_factors),
+                "INFO",
+            )
+        if removed_unavailable_factors:
+            self._log(
+                "Batch stats ignored unavailable categorical factors: "
+                + ", ".join(removed_unavailable_factors),
+                "INFO",
+            )
+
+        _progress("Rebuilding group statistics...", 99.15)
+        stats_output_dir = output_root / "group_stats"
+        from integra_pose.logic.group_stats import export_group_stats_bundle
+
+        omnibus_df, pairwise_df, kpss_df, effects_df, _stats_artifacts = (
+            export_group_stats_bundle(
+                video_summary_df,
+                output_dir=stats_output_dir,
+                correction_method=str(session.stats_correction or "fdr_bh"),
+                include_kpss=bool(session.include_kpss),
+                include_mixed_effects=bool(
+                    getattr(session, "include_mixed_effects", True)
+                ),
+                categorical_factors=stats_factors,
+                render_plots=False,
+                log_fn=self._log,
+            )
+        )
+
+        figure_manifest_df = pd.DataFrame()
+        assay_figure_manifest_df = pd.DataFrame()
+        figure_options = self._figure_export_options(session)
+        figures_enabled = any(
+            bool(figure_options[key])
+            for key in (
+                "export_publication_figures",
+                "export_batch_dashboard",
+                "export_group_stats_overview",
+                "export_individual_profiles",
+                "export_module_archive",
+                "generate_video_quicklooks",
+            )
+        )
+        if figures_enabled:
+            try:
+                _progress("Rendering batch figures from authoritative data...", 99.35)
+                from integra_pose.logic.batch_figures import export_batch_figure_bundle
+
+                figure_manifest_df, figure_artifacts = export_batch_figure_bundle(
+                    video_summary_df=video_summary_df,
+                    omnibus_df=omnibus_df,
+                    pairwise_df=pairwise_df,
+                    output_dir=output_root / "figures",
+                    video_results=video_results,
+                    module_tables=module_bundle.tables,
+                    precomputed_figure_records=list(precomputed_figure_records or []),
+                    assay_preset_key=str(
+                        getattr(session, "analytics_assay_preset", "custom") or "custom"
+                    ),
+                    export_mode=str(figure_options["export_mode"]),
+                    export_publication_figures=bool(
+                        figure_options["export_publication_figures"]
+                    ),
+                    export_batch_dashboard=bool(
+                        figure_options["export_batch_dashboard"]
+                    ),
+                    export_group_stats_overview=bool(
+                        figure_options["export_group_stats_overview"]
+                    ),
+                    export_individual_profiles=bool(
+                        figure_options["export_individual_profiles"]
+                    ),
+                    export_module_archive=bool(
+                        figure_options["export_module_archive"]
+                    ),
+                    group_col="group",
+                    time_col="time_point",
+                )
+                if getattr(figure_artifacts, "figure_count", 0):
+                    self._log(
+                        f"Saved {figure_artifacts.figure_count} batch figure "
+                        f"artifacts to {figure_artifacts.output_dir}",
+                        "INFO",
+                    )
+                assay_manifest_path = str(
+                    getattr(figure_artifacts, "assay_manifest_csv", "") or ""
+                ).strip()
+                if assay_manifest_path:
+                    assay_path = Path(assay_manifest_path).expanduser()
+                    if assay_path.is_file():
+                        assay_figure_manifest_df = pd.read_csv(assay_path)
+            except Exception as exc:
+                self._log(
+                    f"Batch figure rendering failed: {exc}\n{traceback.format_exc()}",
+                    "WARNING",
+                )
+        else:
+            self._log("Publication figure export disabled for this batch session.", "INFO")
+
+        _progress("Writing batch workbook...", 99.8)
+        return write_batch_workbook(
+            workbook_path=output_root / "batch_results.xlsx",
+            keypoint_df=keypoint_df,
+            kinematic_df=kinematic_df,
+            bout_df=bout_df,
+            video_summary_df=video_summary_df,
+            omnibus_df=omnibus_df,
+            pairwise_df=pairwise_df,
+            kpss_df=kpss_df,
+            effects_df=effects_df,
+            analysis_coverage_df=analysis_coverage_df,
+            figure_manifest_df=figure_manifest_df,
+            assay_figure_manifest_df=assay_figure_manifest_df,
+            module_file_index_df=module_file_index_df,
+            module_table_index_df=module_table_index_df,
+        )
+
+    @staticmethod
+    def _csv_row_state(path_value: object) -> tuple[str, str]:
+        """Return (state, detail) for a review-source CSV."""
+
+        text = str(path_value or "").strip()
+        if not text:
+            return "absent", ""
+        path = Path(text).expanduser()
+        if not path.is_file():
+            return "missing", str(path)
+        try:
+            frame = pd.read_csv(path)
+        except pd.errors.EmptyDataError:
+            return "empty", str(path)
+        except Exception as exc:
+            return "unreadable", f"{path}: {exc}"
+        return ("has_rows" if not frame.empty else "empty"), str(path)
+
+    def _review_completion_issues(
+        self,
+        session,
+        video_results: list[dict],
+    ) -> list[str]:
+        """Validate that every non-empty review source has authoritative output."""
+
+        policy = str(getattr(session, "review_policy", "after_all") or "after_all").strip().lower()
+        if policy == "skip":
+            return []
+
+        issues: list[str] = []
+        for result in video_results:
+            video_label = (
+                str(result.get("video_name", "") or "").strip()
+                or str(result.get("video_id", "") or "").strip()
+                or "video"
+            )
+            manifest_path = str(result.get("run_manifest_json", "") or "").strip()
+            try:
+                manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+            except Exception as exc:
+                issues.append(f"{video_label}: run manifest is unreadable ({exc})")
+                continue
+            if not isinstance(manifest, dict):
+                issues.append(f"{video_label}: run manifest is not an object")
+                continue
+            outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
+            notes = manifest.get("notes") if isinstance(manifest.get("notes"), dict) else {}
+
+            raw_bouts = (
+                outputs.get("raw_detected_bouts_csv")
+                or outputs.get("raw_detailed_bouts_csv")
+                or result.get("detailed_bouts_csv")
+            )
+            bout_state, bout_detail = self._csv_row_state(raw_bouts)
+            if bout_state in {"missing", "unreadable"}:
+                issues.append(f"{video_label}: detected-bout source is {bout_state} ({bout_detail})")
+            elif bout_state == "has_rows":
+                bout_note = notes.get("bout_review") if isinstance(notes.get("bout_review"), dict) else {}
+                reviewed_bouts = (
+                    outputs.get("reviewed_bouts_csv")
+                    or result.get("reviewed_bouts_csv")
+                )
+                reviewed_state = self._csv_row_state(reviewed_bouts)[0]
+                if (
+                    str(bout_note.get("status", "")).strip().lower() != "complete"
+                    or reviewed_state
+                    not in {"has_rows", "empty"}
+                ):
+                    issues.append(f"{video_label}: bout review is not finalized")
+
+            raw_roi_events = (
+                outputs.get("raw_roi_events_csv")
+                or outputs.get("roi_events_csv")
+                or result.get("roi_events_csv")
+            )
+            roi_state, roi_detail = self._csv_row_state(raw_roi_events)
+            if roi_state in {"missing", "unreadable"}:
+                issues.append(f"{video_label}: ROI-event source is {roi_state} ({roi_detail})")
+            elif roi_state == "has_rows":
+                roi_note = notes.get("roi_review") if isinstance(notes.get("roi_review"), dict) else {}
+                validation_path = str(
+                    outputs.get("reviewed_roi_validation_json") or ""
+                ).strip()
+                validation: dict = {}
+                if validation_path and Path(validation_path).expanduser().is_file():
+                    try:
+                        loaded = json.loads(
+                            Path(validation_path).expanduser().read_text(encoding="utf-8")
+                        )
+                        validation = loaded if isinstance(loaded, dict) else {}
+                    except Exception:
+                        validation = {}
+                if (
+                    str(roi_note.get("status", "")).strip().lower() != "complete"
+                    or str(validation.get("status", "")).strip().lower()
+                    not in {"valid", "valid_empty"}
+                ):
+                    issues.append(f"{video_label}: ROI review is not finalized")
+        return issues
+
+    @staticmethod
+    def _invalidated_review_module_warnings(
+        video_results: list[dict],
+    ) -> list[str]:
+        warnings: list[str] = []
+        for result in video_results:
+            manifest_path = str(result.get("run_manifest_json", "") or "").strip()
+            try:
+                manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            outputs = (
+                manifest.get("outputs")
+                if isinstance(manifest, dict)
+                and isinstance(manifest.get("outputs"), dict)
+                else {}
+            )
+            invalidated: set[str] = set()
+            for key in (
+                "invalidated_raw_bout_modules",
+                "invalidated_raw_roi_modules",
+            ):
+                payload = outputs.get(key)
+                if isinstance(payload, dict):
+                    invalidated.update(str(name) for name in payload)
+            if invalidated:
+                video_label = (
+                    str(result.get("video_name", "") or "").strip()
+                    or str(result.get("video_id", "") or "").strip()
+                    or "video"
+                )
+                warnings.append(
+                    f"{video_label}: review-dependent optional modules excluded "
+                    f"({', '.join(sorted(invalidated))})"
+                )
+        return warnings
+
+    @staticmethod
+    def _finalized_source_kind(session, video_results: list[dict]) -> str:
+        if (
+            str(getattr(session, "review_policy", "") or "").strip().lower()
+            == "skip"
+        ):
+            return "automatic_outputs_review_explicitly_skipped"
+        for result in video_results:
+            manifest_path = str(result.get("run_manifest_json", "") or "").strip()
+            try:
+                manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            outputs = (
+                manifest.get("outputs")
+                if isinstance(manifest, dict)
+                and isinstance(manifest.get("outputs"), dict)
+                else {}
+            )
+            if outputs.get("reviewed_bouts_csv") or outputs.get(
+                "reviewed_roi_events_csv"
+            ):
+                return "authoritative_reviewed_outputs"
+        return "automatic_outputs_no_review_required"
+
+    @staticmethod
+    def _write_batch_results_status(
+        *,
+        output_root: Path,
+        status: str,
+        workbook_path: str = "",
+        video_count: int = 0,
+        review_policy: str = "",
+        source_kind: str = "",
+        review_issues: list[str] | None = None,
+        warnings: list[str] | None = None,
+        reason: str = "",
+    ) -> str:
+        from integra_pose.utils.safe_io import safe_write_json
+
+        marker_path = output_root / "batch_results_status.json"
+        payload = {
+            "schema_version": 1,
+            "status": str(status),
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "workbook_path": str(workbook_path or ""),
+            "video_count": int(video_count),
+            "review_policy": str(review_policy or ""),
+            "source_kind": str(source_kind or ""),
+            "review_issues": list(review_issues or []),
+            "warnings": list(warnings or []),
+            "reason": str(reason or ""),
+        }
+        safe_write_json(marker_path, payload, indent=2)
+        return str(marker_path)
+
+    def mark_results_stale(self, session, *, reason: str) -> str:
+        """Mark existing batch derivatives as needing an authoritative rebuild."""
+
+        output_text = str(getattr(session, "output_path", "") or "").strip()
+        if not output_text:
+            return ""
+        output_root = Path(output_text).expanduser().resolve()
+        if not output_root.is_dir():
+            return ""
+        workbook_path = output_root / "batch_results.xlsx"
+        marker_path = output_root / "batch_results_status.json"
+        if not workbook_path.is_file() and not marker_path.is_file():
+            return ""
+        active_videos = [
+            item
+            for item in (getattr(session, "videos", None) or [])
+            if not bool(getattr(item, "excluded", False))
+        ]
+        return self._write_batch_results_status(
+            output_root=output_root,
+            status="needs_rebuild",
+            workbook_path=str(workbook_path) if workbook_path.is_file() else "",
+            video_count=len(active_videos),
+            review_policy=str(getattr(session, "review_policy", "") or ""),
+            source_kind="reviewed_per_video_outputs",
+            reason=reason,
+        )
+
+    def finalize_reviewed_results(
+        self,
+        session,
+        *,
+        stop_event=None,
+        progress_callback: Optional[ProgressFn] = None,
+    ) -> BatchRunResult:
+        """Rebuild batch outputs only after all required reviews are complete."""
+
+        active_videos = [
+            item
+            for item in (getattr(session, "videos", None) or [])
+            if not bool(getattr(item, "excluded", False))
+        ]
+        total = len(active_videos)
+        output_text = str(getattr(session, "output_path", "") or "").strip()
+        if not output_text:
+            return BatchRunResult(
+                OperationStatus.FAILED,
+                "Cannot finalize results: the batch output folder is not set.",
+                total_count=total,
+                failed_count=total,
+            )
+        output_root = Path(output_text).expanduser().resolve()
+        if not output_root.is_dir():
+            return BatchRunResult(
+                OperationStatus.FAILED,
+                f"Cannot finalize results: output folder does not exist: {output_root}",
+                total_count=total,
+                failed_count=total,
+            )
+        session_json_path = output_root / "batch_session.json"
+        if not active_videos:
+            return BatchRunResult(
+                OperationStatus.FAILED,
+                "Cannot finalize results: there are no included videos.",
+                session_json_path=str(session_json_path),
+                total_count=0,
+            )
+
+        if progress_callback is not None:
+            progress_callback("Validating completed videos and reviews...", 5.0)
+        video_results: list[dict] = []
+        restoration_issues: list[str] = []
+        for item in active_videos:
+            if stop_event is not None and stop_event.is_set():
+                return BatchRunResult(
+                    OperationStatus.CANCELLED,
+                    "Result finalization cancelled.",
+                    session_json_path=str(session_json_path),
+                    video_results=video_results,
+                    total_count=total,
+                    completed_count=len(video_results),
+                )
+            if (
+                str(getattr(item, "inference_status", "")).strip() != "completed"
+                or str(getattr(item, "analytics_status", "")).strip() != "completed"
+            ):
+                restoration_issues.append(
+                    f"{getattr(item, 'video_name', 'video')}: inference and analytics are not complete"
+                )
+                continue
+            result, error = self._rehydrate_completed_video_result(item)
+            if result is None:
+                restoration_issues.append(
+                    f"{getattr(item, 'video_name', 'video')}: {error}"
+                )
+            else:
+                video_results.append(result)
+        if restoration_issues:
+            return BatchRunResult(
+                OperationStatus.FAILED,
+                "Cannot finalize results:\n- " + "\n- ".join(restoration_issues),
+                session_json_path=str(session_json_path),
+                video_results=video_results,
+                total_count=total,
+                completed_count=len(video_results),
+                failed_count=len(restoration_issues),
+            )
+
+        review_issues = self._review_completion_issues(session, video_results)
+        if review_issues:
+            self._write_batch_results_status(
+                output_root=output_root,
+                status="needs_rebuild",
+                workbook_path=str(output_root / "batch_results.xlsx"),
+                video_count=total,
+                review_policy=str(getattr(session, "review_policy", "") or ""),
+                source_kind="review_incomplete",
+                review_issues=review_issues,
+                reason="Required reviews must be completed before finalization.",
+            )
+            return BatchRunResult(
+                OperationStatus.FAILED,
+                "Cannot finalize results until required reviews are complete:\n- "
+                + "\n- ".join(review_issues),
+                workbook_path=str(output_root / "batch_results.xlsx"),
+                session_json_path=str(session_json_path),
+                video_results=video_results,
+                total_count=total,
+                completed_count=total,
+            )
+
+        try:
+            if progress_callback is not None:
+                progress_callback("Rebuilding batch results from authoritative outputs...", 20.0)
+            workbook_path = self._export_batch_aggregates(
+                session=session,
+                video_results=video_results,
+                output_root=output_root,
+                progress_callback=progress_callback,
+                precomputed_figure_records=[],
+            )
+            session.save_json(session_json_path)
+            policy = str(getattr(session, "review_policy", "") or "")
+            module_warnings = self._invalidated_review_module_warnings(video_results)
+            self._write_batch_results_status(
+                output_root=output_root,
+                status="finalized",
+                workbook_path=workbook_path,
+                video_count=total,
+                review_policy=policy,
+                source_kind=self._finalized_source_kind(session, video_results),
+                warnings=module_warnings,
+            )
+            if progress_callback is not None:
+                progress_callback("Finalized batch results are ready.", 100.0)
+            return BatchRunResult(
+                OperationStatus.SUCCESS,
+                f"Finalized batch results for {total} video(s).",
+                workbook_path=workbook_path,
+                session_json_path=str(session_json_path),
+                video_results=video_results,
+                total_count=total,
+                completed_count=total,
+            )
+        except Exception as exc:
+            self._log(
+                f"Batch result finalization failed: {exc}\n{traceback.format_exc()}",
+                "ERROR",
+            )
+            try:
+                self._write_batch_results_status(
+                    output_root=output_root,
+                    status="needs_rebuild",
+                    workbook_path=str(output_root / "batch_results.xlsx"),
+                    video_count=total,
+                    review_policy=str(
+                        getattr(session, "review_policy", "") or ""
+                    ),
+                    source_kind="finalization_failed",
+                    reason=f"Finalization failed: {exc}",
+                )
+            except Exception:
+                pass
+            return BatchRunResult(
+                OperationStatus.FAILED,
+                f"Batch result finalization failed: {exc}",
+                session_json_path=str(session_json_path),
+                video_results=video_results,
+                total_count=total,
+                completed_count=total,
+            )
+
+    def _time_threshold_frames(
+        self,
+        *,
+        session,
+        item,
+        run_dir: Path,
+    ) -> tuple[int, int, int, int, float]:
+        """Resolve second-based settings against one video's actual FPS."""
+
+        fps = 0.0
+        try:
+            fps = float(getattr(session, "video_fps", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            fps = 0.0
+        if fps <= 0:
+            metadata_path = run_dir / "inference_metadata.json"
+            if metadata_path.is_file():
+                try:
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    fps = float(metadata.get("fps") or 0.0)
+                except Exception:
+                    fps = 0.0
+        if fps <= 0:
+            fps, _width, _height = self._probe_video_metadata(item.video_path)
+        if fps <= 0:
+            raise ValueError(
+                f"Cannot convert temporal settings from seconds for {item.video_name}: "
+                "video FPS could not be resolved."
+            )
+
+        def _positive_frames(seconds_value: object, fallback: float) -> int:
+            try:
+                seconds = float(seconds_value)
+            except (TypeError, ValueError):
+                seconds = fallback
+            if seconds <= 0:
+                seconds = fallback
+            return max(1, int(math.ceil((seconds * fps) - 1e-12)))
+
+        def _gap_frames(seconds_value: object, fallback: float) -> int:
+            try:
+                seconds = float(seconds_value)
+            except (TypeError, ValueError):
+                seconds = fallback
+            seconds = max(0.0, seconds)
+            return max(0, int(math.floor((seconds * fps) + 1e-12)))
+
+        return (
+            _positive_frames(getattr(session, "min_bout_seconds", 0.10), 0.10),
+            _gap_frames(getattr(session, "max_gap_seconds", 0.17), 0.17),
+            _positive_frames(
+                getattr(session, "roi_min_dwell_seconds", 0.10), 0.10
+            ),
+            _gap_frames(
+                getattr(session, "roi_max_gap_seconds", 0.17), 0.17
+            ),
+            float(fps),
+        )
+
     def _run_video_analytics(
         self,
         *,
@@ -1139,43 +2205,113 @@ class BatchPipeline:
                 item.status_message = "Analytics cancelled."
                 return None
 
-            try:
-                min_bout_frames = int(
-                    getattr(session, "min_bout_frames", self.app.config.analytics.min_bout_duration_var.get())
+            def _resolve_frame_threshold(
+                session_attr: str,
+                fallback: int,
+                *,
+                gui_attr: str = "",
+            ) -> int:
+                raw_value = getattr(session, session_attr, None)
+                if raw_value is None and gui_attr:
+                    try:
+                        gui_var = getattr(self.app.config.analytics, gui_attr)
+                        raw_value = gui_var.get()
+                    except Exception:
+                        raw_value = None
+                if raw_value is None:
+                    raw_value = fallback
+                try:
+                    return int(raw_value)
+                except (TypeError, ValueError):
+                    return int(fallback)
+
+            min_bout_frames = _resolve_frame_threshold(
+                "min_bout_frames",
+                5,
+                gui_attr="min_bout_duration_var",
+            )
+            max_gap_frames = _resolve_frame_threshold(
+                "max_gap_frames",
+                2,
+                gui_attr="max_frame_gap_var",
+            )
+            roi_min_dwell_frames = _resolve_frame_threshold(
+                "roi_min_dwell_frames",
+                min_bout_frames,
+            )
+            roi_max_gap_frames = _resolve_frame_threshold(
+                "roi_max_gap_frames",
+                max_gap_frames,
+            )
+            temporal_threshold_unit = str(
+                getattr(session, "temporal_threshold_unit", "frames") or "frames"
+            ).strip().lower()
+            temporal_threshold_fps = 0.0
+            if temporal_threshold_unit == "seconds":
+                (
+                    min_bout_frames,
+                    max_gap_frames,
+                    roi_min_dwell_frames,
+                    roi_max_gap_frames,
+                    temporal_threshold_fps,
+                ) = self._time_threshold_frames(
+                    session=session,
+                    item=item,
+                    run_dir=run_dir,
                 )
-            except Exception:
-                min_bout_frames = 5
-            try:
-                max_gap_frames = int(
-                    getattr(session, "max_gap_frames", self.app.config.analytics.max_frame_gap_var.get())
-                )
-            except Exception:
-                max_gap_frames = 2
-            try:
-                roi_min_dwell_frames = int(
-                    getattr(session, "roi_min_dwell_frames", getattr(session, "min_bout_frames", self.app.config.analytics.min_bout_duration_var.get()))
-                )
-            except Exception:
-                roi_min_dwell_frames = min_bout_frames
-            try:
-                roi_max_gap_frames = int(
-                    getattr(session, "roi_max_gap_frames", getattr(session, "max_gap_frames", self.app.config.analytics.max_frame_gap_var.get()))
-                )
-            except Exception:
-                roi_max_gap_frames = max_gap_frames
+            else:
+                temporal_threshold_unit = "frames"
 
             rois_for_video = self._choose_rois_for_video(session, item)
             object_rois_for_video = self._choose_object_rois_for_video(session, item)
             analytics_out_dir = run_root / "analytics"
+            label_class_metadata = load_frame_label_class_metadata(labels_dir)
+            saved_class_names = list(label_class_metadata.get("class_names") or [])
+            if saved_class_names:
+                behavior_names_override = saved_class_names
+                behavior_names_source = "inference label metadata"
+            else:
+                behavior_names_override = list(
+                    getattr(session.model_capabilities, "class_names", []) or []
+                )
+                behavior_names_source = (
+                    "model class names" if behavior_names_override else "unresolved"
+                )
             params = {
                 "yolo_folder": str(labels_dir),
                 "video_file": str(item.video_path),
                 "yaml_file": str(yaml_path),
-                "behavior_names_override": list(getattr(session.model_capabilities, "class_names", []) or []),
+                "behavior_names_override": behavior_names_override,
+                "behavior_names_source": behavior_names_source,
+                "keypoint_names_override": list(getattr(session, "keypoint_names", []) or []),
+                "keypoint_names_source": str(getattr(session, "keypoint_names_source", "unresolved") or "unresolved"),
+                "keypoint_schema_path": str(getattr(session, "keypoint_schema_path", "") or ""),
                 "min_bout_frames": min_bout_frames,
                 "max_gap_frames": max_gap_frames,
+                "behavior_bout_class_mode": str(
+                    getattr(
+                        session,
+                        "behavior_bout_class_mode",
+                        "mutually_exclusive",
+                    )
+                    or "mutually_exclusive"
+                ),
                 "roi_min_dwell_frames": max(1, int(roi_min_dwell_frames if roi_min_dwell_frames is not None else min_bout_frames)),
                 "roi_max_gap_frames": max(0, int(roi_max_gap_frames if roi_max_gap_frames is not None else max_gap_frames)),
+                "temporal_threshold_unit": temporal_threshold_unit,
+                "configured_min_bout_seconds": float(
+                    getattr(session, "min_bout_seconds", 0.0) or 0.0
+                ),
+                "configured_max_gap_seconds": float(
+                    getattr(session, "max_gap_seconds", 0.0) or 0.0
+                ),
+                "configured_roi_min_dwell_seconds": float(
+                    getattr(session, "roi_min_dwell_seconds", 0.0) or 0.0
+                ),
+                "configured_roi_max_gap_seconds": float(
+                    getattr(session, "roi_max_gap_seconds", 0.0) or 0.0
+                ),
+                "temporal_threshold_fps": temporal_threshold_fps,
                 "create_video": bool(session.save_annotated_video),
                 "output_folder_override": str(analytics_out_dir),
                 "use_rois_override": bool(rois_for_video),
@@ -1192,6 +2328,11 @@ class BatchPipeline:
                 "object_roi_shape": str(getattr(session, "object_roi_shape", "circle") or "circle"),
                 "object_interaction_keypoint_index": int(getattr(session, "object_interaction_keypoint_index", 0) or 0),
                 "object_interaction_distance_px": float(getattr(session, "object_interaction_distance_px", 0.0) or 0.0),
+                # The wizard exposes the same debounce controls for all ROI
+                # events, so object and zone visits must use identical temporal
+                # semantics.
+                "object_min_dwell_frames": max(1, int(roi_min_dwell_frames)),
+                "object_max_gap_frames": max(0, int(roi_max_gap_frames)),
                 "object_roi_polygon_map_override": object_rois_for_video,
                 "use_existing_labels": bool(use_existing_labels),
                 "existing_labels_root": str(labels_root or ""),
@@ -1200,7 +2341,7 @@ class BatchPipeline:
                 "enabled_metrics_override": list(getattr(session, "analytics_enabled_metrics", []) or []),
                 "enabled_modules_override": list(getattr(session, "analytics_enabled_modules", []) or []),
                 "user_video_fps_override": float(getattr(session, "video_fps", 0.0) or 0.0),
-                # ADP-4 provenance — flows into the analytics manifest's
+                # Study provenance flows into the analytics manifest's
                 # `provenance` block (schema v2). Empty strings outside batch
                 # context. Tab 7 keys auto-split on these.
                 "provenance_subject_id": str(getattr(item, "subject_id", "") or "").strip(),
@@ -1234,17 +2375,27 @@ class BatchPipeline:
             detailed_csv = Path(output_folder) / f"{Path(item.video_path).stem}_detailed_bouts.csv"
             summary_csv = Path(output_folder) / f"{Path(item.video_path).stem}_summary.csv"
             roi_overview_csv = ""
+            roi_concurrent_overview_csv = ""
+            roi_dwell_events_csv = ""
             object_interactions_csv = ""
+            object_dwell_events_csv = ""
             if isinstance(roi_metrics, dict):
                 files = roi_metrics.get("files")
                 if isinstance(files, dict):
-                    roi_overview_csv = str(files.get("entries_exits", "") or "")
+                    roi_overview_csv = str(
+                        files.get("exclusive_entries_exits", "") or files.get("entries_exits", "") or ""
+                    )
+                    roi_concurrent_overview_csv = str(files.get("entries_exits", "") or "")
+                    roi_dwell_events_csv = str(
+                        files.get("exclusive_dwell_events", "") or files.get("dwell_events", "") or ""
+                    )
             if isinstance(_module_outputs, dict):
                 object_module = _module_outputs.get("object_interactions")
                 if isinstance(object_module, dict):
                     files = object_module.get("files")
                     if isinstance(files, dict):
                         object_interactions_csv = str(files.get("summary", "") or files.get("per_frame", "") or "")
+                        object_dwell_events_csv = str(files.get("dwell_events", "") or "")
             analytics_annotated_video_path = ""
             if params["create_video"] and not stop_event.is_set():
                 analytics_video_path = Path(output_folder) / f"{_base_name}_annotated.mp4"
@@ -1262,6 +2413,9 @@ class BatchPipeline:
                             object_rois=object_rois_for_video,
                             object_metrics=object_metrics,
                             object_events=object_events,
+                            single_animal_mode=bool(
+                                params.get("single_animal_mode_override", False)
+                            ),
                         )
                     )
                 except Exception as exc:
@@ -1290,7 +2444,9 @@ class BatchPipeline:
                 item.roi_review_status = "skipped"
             else:
                 bout_review_needed = not detailed_df.empty
-                roi_review_needed = roi_events_csv.is_file()
+                roi_review_needed = (
+                    self._csv_row_state(roi_events_csv)[0] == "has_rows"
+                )
                 item.bout_review_status = "queued" if bout_review_needed else "not_required"
                 item.roi_review_status = "queued" if roi_review_needed else "not_required"
                 review_needed = bout_review_needed or roi_review_needed
@@ -1315,7 +2471,13 @@ class BatchPipeline:
                 "summary_bouts_csv": item.summary_bouts_csv,
                 "roi_events_csv": str(roi_events_csv) if roi_events_csv.is_file() else "",
                 "roi_overview_csv": roi_overview_csv,
+                "roi_concurrent_overview_csv": roi_concurrent_overview_csv,
+                "roi_dwell_events_csv": roi_dwell_events_csv,
                 "object_interactions_csv": object_interactions_csv,
+                "object_dwell_events_csv": object_dwell_events_csv,
+                "roi_polygons": rois_for_video,
+                "object_roi_polygons": object_rois_for_video,
+                "object_interaction_distance_px": float(getattr(session, "object_interaction_distance_px", 0.0) or 0.0),
                 "analytics_annotated_video_path": analytics_annotated_video_path,
                 "run_manifest_json": str(manifest_json) if manifest_json.is_file() else "",
             }
@@ -1389,23 +2551,8 @@ class BatchPipeline:
         total = max(1, len(active_videos))
         video_results: list[dict] = []
         cancelled = False
-        figure_export_mode = str(getattr(session, "figure_export_mode", "full_bundle") or "full_bundle").strip() or "full_bundle"
-        export_publication_figures = bool(getattr(session, "export_publication_figures", figure_export_mode != "disabled"))
-        export_batch_dashboard = bool(getattr(session, "export_batch_dashboard", False))
-        export_group_stats_overview = bool(getattr(session, "export_group_stats_overview", False))
-        export_individual_profiles = bool(getattr(session, "export_individual_profiles", figure_export_mode == "full_bundle"))
-        export_module_archive = bool(getattr(session, "export_module_archive", figure_export_mode == "full_bundle"))
-        quicklook_enabled = bool(getattr(session, "generate_video_quicklooks", figure_export_mode == "full_bundle"))
-        figures_enabled = any(
-            (
-                export_publication_figures,
-                export_batch_dashboard,
-                export_group_stats_overview,
-                export_individual_profiles,
-                export_module_archive,
-                quicklook_enabled,
-            )
-        )
+        figure_options = self._figure_export_options(session)
+        quicklook_enabled = bool(figure_options["generate_video_quicklooks"])
         analytics_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="batch-analytics")
         analytics_futures: list[tuple[int, object, Future[dict | None]]] = []
         figure_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="batch-figures")
@@ -1439,10 +2586,11 @@ class BatchPipeline:
             if not active_videos:
                 session.save_json(session_json_path)
                 return BatchRunResult(
-                    cancelled=False,
+                    status=OperationStatus.FAILED,
                     message="No included videos queued.",
                     session_json_path=str(session_json_path),
                     video_results=[],
+                    total_count=0,
                 )
 
             resumed_skip_count = 0
@@ -1456,13 +2604,21 @@ class BatchPipeline:
                     and str(getattr(item, "inference_status", "")).strip() == "completed"
                     and str(getattr(item, "analytics_status", "")).strip() == "completed"
                 ):
-                    resumed_skip_count += 1
+                    prior_result, resume_error = self._rehydrate_completed_video_result(item)
+                    if prior_result is not None:
+                        resumed_skip_count += 1
+                        video_results.append(prior_result)
+                        self._log(
+                            f"Resume: reusing already-completed video {index}/{total}: "
+                            f"{item.video_name}",
+                            "INFO",
+                        )
+                        continue
                     self._log(
-                        f"Resume: skipping already-completed video {index}/{total}: "
-                        f"{item.video_name}",
-                        "INFO",
+                        f"Resume: prior outputs for {item.video_name} cannot be reused "
+                        f"({resume_error}); reprocessing this video.",
+                        "WARNING",
                     )
-                    continue
 
                 item.inference_status = "running"
                 item.analytics_status = "pending"
@@ -1629,11 +2785,21 @@ class BatchPipeline:
                                 phase_start,
                             )
 
-                    native_result = self._run_native_inference(
-                        settings,
-                        stop_event=stop_event,
-                        progress_fn=_native_progress,
-                    )
+                    try:
+                        native_result = self._run_native_inference(
+                            settings,
+                            stop_event=stop_event,
+                            progress_fn=_native_progress,
+                        )
+                    except Exception as exc:
+                        item.inference_status = "failed"
+                        item.analytics_status = "failed"
+                        item.status_message = f"Inference failed: {exc}"
+                        self._log(
+                            f"Batch video {item.video_name} inference failed: {exc}\n{traceback.format_exc()}",
+                            "ERROR",
+                        )
+                        continue
                     run_dir = Path(native_result.get("run_dir") or infer_project)
                     labels_dir = run_dir / "labels"
                     labels_csv = labels_dir / "labels.csv"
@@ -1730,10 +2896,21 @@ class BatchPipeline:
                         continue
                     result_payload = future.result()
                     if result_payload:
-                        video_results.append(result_payload)
-                        session.save_json(session_json_path)
                         if str(getattr(session, "review_policy", "")).strip().lower() == "after_each" and review_callback is not None:
                             review_callback(submitted_item)
+                            rehydrated, rehydrate_error = (
+                                self._rehydrate_completed_video_result(submitted_item)
+                            )
+                            if rehydrated is not None:
+                                result_payload = rehydrated
+                            elif rehydrate_error:
+                                self._log(
+                                    f"Could not refresh reviewed outputs for "
+                                    f"{submitted_item.video_name}: {rehydrate_error}",
+                                    "WARNING",
+                                )
+                        video_results.append(result_payload)
+                        session.save_json(session_json_path)
                         if render_video_quicklook_bundle is not None and not stop_event.is_set():
                             figure_futures.append(
                                 figure_executor.submit(
@@ -1762,10 +2939,21 @@ class BatchPipeline:
                     continue
                 result_payload = future.result()
                 if result_payload:
-                    video_results.append(result_payload)
-                    session.save_json(session_json_path)
                     if str(getattr(session, "review_policy", "")).strip().lower() == "after_each" and review_callback is not None:
                         review_callback(submitted_item)
+                        rehydrated, rehydrate_error = (
+                            self._rehydrate_completed_video_result(submitted_item)
+                        )
+                        if rehydrated is not None:
+                            result_payload = rehydrated
+                        elif rehydrate_error:
+                            self._log(
+                                f"Could not refresh reviewed outputs for "
+                                f"{submitted_item.video_name}: {rehydrate_error}",
+                                "WARNING",
+                            )
+                    video_results.append(result_payload)
+                    session.save_json(session_json_path)
                     if render_video_quicklook_bundle is not None and not stop_event.is_set():
                         figure_futures.append(
                             figure_executor.submit(
@@ -1780,125 +2968,61 @@ class BatchPipeline:
             if stop_event.is_set():
                 cancelled = True
 
+            if any(
+                str(getattr(item, "inference_status", "")).strip() == "cancelled"
+                or str(getattr(item, "analytics_status", "")).strip() == "cancelled"
+                for item in active_videos
+            ):
+                cancelled = True
+
             if cancelled:
+                completed_count, failed_count = self._run_counts(active_videos)
                 return BatchRunResult(
-                    cancelled=True,
-                    message="Batch run cancelled.",
+                    status=OperationStatus.CANCELLED,
+                    message=(
+                        f"Batch run cancelled after {completed_count}/{len(active_videos)} video(s) completed"
+                        + (f"; {failed_count} failed." if failed_count else ".")
+                    ),
                     session_json_path=str(session_json_path),
                     video_results=video_results,
+                    total_count=len(active_videos),
+                    completed_count=completed_count,
+                    failed_count=failed_count,
+                    resumed_count=resumed_skip_count,
+                )
+
+            # Every included video must have a terminal state before a
+            # non-cancelled run can be classified. Treat an unexplained
+            # unfinished state as a failure rather than allowing a success
+            # result with missing cohort rows.
+            for item in active_videos:
+                inference_status = str(getattr(item, "inference_status", "")).strip()
+                analytics_status = str(getattr(item, "analytics_status", "")).strip()
+                if inference_status == "completed" and analytics_status == "completed":
+                    continue
+                if inference_status == "failed" or analytics_status == "failed":
+                    continue
+                if inference_status == "completed":
+                    item.analytics_status = "failed"
+                else:
+                    item.inference_status = "failed"
+                    item.analytics_status = "failed"
+                item.status_message = "Batch processing did not reach a completed state."
+                self._log(
+                    f"Batch video {item.video_name} did not reach a terminal completed state; marking it failed.",
+                    "ERROR",
                 )
 
             if figure_futures:
                 _progress("Finishing per-video figure jobs...", max(last_progress_value, 99.1))
                 _collect_done_figure_futures(wait_all=True)
 
-            check_fps_consistency(video_results, log_fn=self._log)
-            keypoint_df, kinematic_df, bout_df = collect_batch_frames(video_results)
-            video_summary_df = build_video_summary(video_results)
-            analysis_coverage_df = build_analysis_coverage(video_results)
-            module_bundle = collect_batch_module_tables(video_results)
-            module_file_index_df, module_table_index_df = export_batch_module_tables(
-                module_bundle,
-                output_dir=output_root / "module_tables",
-            )
-            analysis_coverage_csv = output_root / "analysis_coverage_table.csv"
-            (analysis_coverage_df if not analysis_coverage_df.empty else pd.DataFrame()).to_csv(
-                analysis_coverage_csv,
-                index=False,
-            )
-            class_capabilities = getattr(session, "model_capabilities", None)
-            supports_multiclass = bool(getattr(class_capabilities, "supports_multiclass_stats", False))
-            class_names = list(getattr(class_capabilities, "class_names", []) or [])
-            class_count = int(getattr(class_capabilities, "class_count", 0) or 0)
-            if class_count <= 0 and class_names:
-                class_count = len(class_names)
-            if class_count > 1:
-                supports_multiclass = True
-            elif class_count == 1:
-                supports_multiclass = False
-            stats_factors, removed_behavior_factors, removed_unavailable_factors = self._normalize_stats_categorical_factors(
-                getattr(session, "stats_categorical_factors", None),
-                supports_multiclass_stats=supports_multiclass,
-                available_columns=set(video_summary_df.columns),
-            )
-            if removed_behavior_factors:
-                self._log(
-                    f"Single-class mode detected; skipping behavior-like categorical factors in batch stats: {', '.join(removed_behavior_factors)}",
-                    "INFO",
-                )
-            if removed_unavailable_factors:
-                self._log(
-                    f"Batch stats ignored unavailable categorical factors: {', '.join(removed_unavailable_factors)}",
-                    "INFO",
-                )
-            stats_output_dir = output_root / "group_stats"
-            from integra_pose.logic.group_stats import export_group_stats_bundle
-
-            omnibus_df, pairwise_df, kpss_df, effects_df, _stats_artifacts = export_group_stats_bundle(
-                video_summary_df,
-                output_dir=stats_output_dir,
-                correction_method=str(session.stats_correction or "fdr_bh"),
-                include_kpss=bool(session.include_kpss),
-                categorical_factors=stats_factors,
-                render_plots=False,
-                log_fn=self._log,
-            )
-            figure_manifest_df = pd.DataFrame()
-            assay_figure_manifest_df = pd.DataFrame()
-            if figures_enabled:
-                try:
-                    _progress("Rendering publication figures...", max(last_progress_value, 99.2))
-                    from integra_pose.logic.batch_figures import export_batch_figure_bundle
-
-                    figure_manifest_df, figure_artifacts = export_batch_figure_bundle(
-                        video_summary_df=video_summary_df,
-                        omnibus_df=omnibus_df,
-                        pairwise_df=pairwise_df,
-                        output_dir=output_root / "figures",
-                        video_results=video_results,
-                        module_tables=module_bundle.tables,
-                        precomputed_figure_records=precomputed_figure_records,
-                        assay_preset_key=str(getattr(session, "analytics_assay_preset", "custom") or "custom"),
-                        export_mode=figure_export_mode,
-                        export_publication_figures=export_publication_figures,
-                        export_batch_dashboard=export_batch_dashboard,
-                        export_group_stats_overview=export_group_stats_overview,
-                        export_individual_profiles=export_individual_profiles,
-                        export_module_archive=export_module_archive,
-                        group_col="group",
-                        time_col="time_point",
-                    )
-                    if getattr(figure_artifacts, "figure_count", 0):
-                        self._log(
-                            f"Saved {figure_artifacts.figure_count} batch figure artifacts to {figure_artifacts.output_dir}",
-                            "INFO",
-                        )
-                    assay_manifest_path = str(getattr(figure_artifacts, "assay_manifest_csv", "") or "").strip()
-                    if assay_manifest_path:
-                        assay_path = Path(assay_manifest_path).expanduser()
-                        if assay_path.is_file():
-                            assay_figure_manifest_df = pd.read_csv(assay_path)
-                except Exception as exc:
-                    self._log(f"Batch figure rendering failed: {exc}\n{traceback.format_exc()}", "WARNING")
-            else:
-                self._log("Publication figure export disabled for this batch session.", "INFO")
-
-            workbook_path = output_root / "batch_results.xlsx"
-            workbook_file = write_batch_workbook(
-                workbook_path=workbook_path,
-                keypoint_df=keypoint_df,
-                kinematic_df=kinematic_df,
-                bout_df=bout_df,
-                video_summary_df=video_summary_df,
-                omnibus_df=omnibus_df,
-                pairwise_df=pairwise_df,
-                kpss_df=kpss_df,
-                effects_df=effects_df,
-                analysis_coverage_df=analysis_coverage_df,
-                figure_manifest_df=figure_manifest_df,
-                assay_figure_manifest_df=assay_figure_manifest_df,
-                module_file_index_df=module_file_index_df,
-                module_table_index_df=module_table_index_df,
+            workbook_file = self._export_batch_aggregates(
+                session=session,
+                video_results=video_results,
+                output_root=output_root,
+                progress_callback=_progress,
+                precomputed_figure_records=precomputed_figure_records,
             )
 
             if resume and resumed_skip_count:
@@ -1907,27 +3031,81 @@ class BatchPipeline:
                     f"processed {len(active_videos) - resumed_skip_count} new/incomplete video(s).",
                     "INFO",
                 )
-            completion_message = (
-                f"Batch run completed (resumed: skipped {resumed_skip_count} already-done)."
-                if resume and resumed_skip_count
-                else "Batch run completed."
+            completed_count, failed_count = self._run_counts(active_videos)
+            if completed_count == len(active_videos) and failed_count == 0:
+                run_status = OperationStatus.SUCCESS
+                completion_message = f"Batch run completed: {completed_count}/{len(active_videos)} video(s) succeeded."
+            elif completed_count > 0:
+                run_status = OperationStatus.PARTIAL
+                completion_message = (
+                    f"Batch run partially completed: {completed_count}/{len(active_videos)} video(s) succeeded; "
+                    f"{failed_count} failed."
+                )
+            else:
+                run_status = OperationStatus.FAILED
+                completion_message = (
+                    f"Batch run failed: no videos completed; {failed_count}/{len(active_videos)} video(s) failed."
+                )
+            if resume and resumed_skip_count:
+                completion_message = (
+                    f"{completion_message.rstrip('.')} "
+                    f"({resumed_skip_count} restored from prior completed outputs)."
+                )
+            review_issues = self._review_completion_issues(session, video_results)
+            module_warnings = self._invalidated_review_module_warnings(video_results)
+            aggregate_is_final = (
+                run_status is OperationStatus.SUCCESS and not review_issues
             )
+            self._write_batch_results_status(
+                output_root=output_root,
+                status="finalized" if aggregate_is_final else "draft",
+                workbook_path=workbook_file,
+                video_count=len(video_results),
+                review_policy=str(getattr(session, "review_policy", "") or ""),
+                source_kind=(
+                    self._finalized_source_kind(session, video_results)
+                    if aggregate_is_final
+                    else "automatic_pre_review_outputs"
+                ),
+                review_issues=review_issues,
+                warnings=module_warnings,
+                reason=(
+                    ""
+                    if aggregate_is_final
+                    else "Complete required reviews, then finalize to rebuild batch derivatives."
+                ),
+            )
+            if run_status is OperationStatus.SUCCESS and review_issues:
+                completion_message = (
+                    f"{completion_message} The current workbook is a draft based on "
+                    "automatic detections; complete reviews and choose Finalize "
+                    "Reviewed Results to rebuild it."
+                )
             return BatchRunResult(
-                cancelled=False,
+                status=run_status,
                 message=completion_message,
                 workbook_path=workbook_file,
                 session_json_path=str(session_json_path),
                 video_results=video_results,
+                total_count=len(active_videos),
+                completed_count=completed_count,
+                failed_count=failed_count,
+                resumed_count=resumed_skip_count,
             )
         except Exception as exc:
             self._log(f"Batch pipeline failed: {exc}\n{traceback.format_exc()}", "ERROR")
             session.save_json(session_json_path)
+            completed_count, failed_count = self._run_counts(active_videos)
             return BatchRunResult(
-                cancelled=False,
+                status=OperationStatus.FAILED,
                 message=f"Batch run failed: {exc}",
                 workbook_path="",
                 session_json_path=str(session_json_path),
                 video_results=video_results,
+                total_count=len(active_videos),
+                completed_count=completed_count,
+                failed_count=max(failed_count, len(active_videos) - completed_count),
+                resumed_count=resumed_skip_count,
             )
         finally:
             analytics_executor.shutdown(wait=True, cancel_futures=cancelled)

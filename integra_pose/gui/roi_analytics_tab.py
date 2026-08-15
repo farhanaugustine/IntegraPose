@@ -7,10 +7,10 @@ from .workflow_nav import add_workflow_footer
 from integra_pose.logic.analytics_metric_catalog import (
     apply_assay_preset,
     category_order_for_specs,
-    get_assay_preset,
     iter_assay_presets,
     iter_metric_specs,
 )
+from integra_pose.utils.object_interaction_geometry import OBJECT_DISTANCE_HELP_TEXT
 
 def create_roi_analytics_tab(app):
     """
@@ -222,6 +222,54 @@ def create_roi_analytics_tab(app):
         "Minimum frames an ROI visit must persist before it counts as an ROI entry/exit event in summaries and review videos.",
     )
 
+    class_mode_label = ttk.Label(
+        bout_params_frame,
+        text="Behavior Bout Classes:",
+    )
+    class_mode_label.grid(
+        row=2,
+        column=0,
+        sticky=tk.W,
+        padx=5,
+        pady=(5, 0),
+    )
+    exclusive_mode = ttk.Radiobutton(
+        bout_params_frame,
+        text="Mutually exclusive (one class per track/frame)",
+        variable=app.config.analytics.behavior_bout_class_mode_var,
+        value="mutually_exclusive",
+    )
+    exclusive_mode.grid(
+        row=2,
+        column=1,
+        columnspan=3,
+        sticky=tk.W,
+        padx=5,
+        pady=(5, 0),
+    )
+    multi_label_mode = ttk.Radiobutton(
+        bout_params_frame,
+        text="Multi-label (allow overlapping class bouts)",
+        variable=app.config.analytics.behavior_bout_class_mode_var,
+        value="multi_label",
+    )
+    multi_label_mode.grid(
+        row=2,
+        column=4,
+        columnspan=2,
+        sticky=tk.W,
+        padx=5,
+        pady=(5, 0),
+    )
+    class_mode_tip = (
+        "Mutually exclusive keeps the historical highest-confidence class "
+        "per track/frame. Multi-label builds each Class ID independently, "
+        "allowing legitimate concurrent behaviors such as rearing and "
+        "wall-rearing."
+    )
+    for widget in (class_mode_label, exclusive_mode, multi_label_mode):
+        CreateToolTip(widget, class_mode_tip)
+
     roi_params_frame = ttk.Frame(params_frame)
     roi_params_frame.grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=5)
 
@@ -307,21 +355,31 @@ def create_roi_analytics_tab(app):
         "Raw model keypoint index used as the interaction anchor for object interaction. This is separate from ROI entry/exit.",
     )
 
-    ttk.Label(object_params_frame, text="Distance threshold (px):").grid(row=2, column=3, sticky=tk.W, padx=5, pady=2)
+    object_distance_label = ttk.Label(
+        object_params_frame,
+        text="Distance from object edge (px):",
+    )
+    object_distance_label.grid(row=2, column=3, sticky=tk.W, padx=5, pady=2)
     object_distance_entry = ttk.Entry(
         object_params_frame,
         textvariable=app.config.analytics.object_interaction_distance_px_var,
         width=7,
     )
     object_distance_entry.grid(row=2, column=4, sticky=tk.W, padx=5, pady=2)
-    CreateToolTip(object_distance_entry, "Counts near-object interaction when the anchor keypoint is within this many pixels of the object ROI boundary.")
+    CreateToolTip(object_distance_label, OBJECT_DISTANCE_HELP_TEXT)
+    CreateToolTip(object_distance_entry, OBJECT_DISTANCE_HELP_TEXT)
 
     object_guidance = ttk.Label(
         object_params_frame,
-        text="Keep these ROIs for discrete stimuli or targets. Use the regular ROI tools for arena zones such as center, corners, or nests.",
+        text=(
+            "Orange dotted outline = selected-keypoint activation boundary. "
+            "Keep object ROIs for discrete stimuli or targets; regular arena "
+            "ROIs separately use the selected bbox-overlap or ROI-keypoint mode."
+        ),
         wraplength=520,
         justify=tk.LEFT,
     )
+    CreateToolTip(object_guidance, OBJECT_DISTANCE_HELP_TEXT)
     object_guidance.grid(row=3, column=0, columnspan=8, sticky=tk.W, padx=5, pady=(4, 0))
 
     def _refresh_roi_entry_controls() -> None:
@@ -650,14 +708,33 @@ def create_roi_analytics_tab(app):
     actions_frame.columnconfigure(1, weight=1)
     actions_frame.columnconfigure(2, weight=1)
 
-    review_button = ttk.Button(actions_frame, text="Review & Confirm Detected Bouts", command=app._open_bout_confirmer, style="Accent.TButton")
+    review_button = ttk.Button(actions_frame, text="Review Behavior Bouts", command=app._open_bout_confirmer, style="Accent.TButton")
     review_button.grid(row=0, column=0, sticky='ew', padx=(0, 5))
+    CreateToolTip(
+        review_button,
+        "Open the IntegraPose review workspace in behavior mode. Confirm, "
+        "reject, reclassify, correct track IDs and boundaries, add, split, "
+        "merge, and score Class ID bouts. The legacy confirmer remains the "
+        "fallback when no run manifest is available.",
+    )
 
-    advanced_button = ttk.Button(actions_frame, text="Advanced Bout Corrections", command=app._open_advanced_analyzer)
+    advanced_button = ttk.Button(actions_frame, text="Manual Bout Scorer...", command=app._open_advanced_analyzer)
     advanced_button.grid(row=0, column=1, sticky='ew', padx=5)
+    CreateToolTip(
+        advanced_button,
+        "Creates a separate manual scoring sidecar for exploratory annotation. "
+        "Canonical downstream analytics are updated only after a scope is "
+        "completed and exported from the integrated Bout Review Workspace.",
+    )
 
-    roi_review_button = ttk.Button(actions_frame, text="Review ROI Entries / Exits", command=app._open_roi_event_reviewer)
+    roi_review_button = ttk.Button(actions_frame, text="Review ROI / Object Bouts", command=app._open_roi_event_reviewer)
     roi_review_button.grid(row=0, column=2, sticky='ew', padx=(5, 0))
+    CreateToolTip(
+        roi_review_button,
+        "Open the same review workspace in spatial mode. Concurrent ROI, "
+        "exclusive ROI-X, and object-interaction bouts remain separate and "
+        "can be corrected on a frame-accurate timeline.",
+    )
 
     tab7_button = ttk.Button(
         actions_frame,

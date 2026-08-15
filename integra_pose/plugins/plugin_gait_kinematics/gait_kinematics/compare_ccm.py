@@ -6,10 +6,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 import logging
-from itertools import groupby
-from scipy.interpolate import interp1d
-from scipy.stats import ttest_ind
-import networkx as nx
+from .scientific_utils import contiguous_difference
 try:
     import pyEDM
 except ImportError:  # pragma: no cover - optional dependency
@@ -17,16 +14,42 @@ except ImportError:  # pragma: no cover - optional dependency
 
 logger = logging.getLogger(__name__)
 
-PAIRS_TO_TEST = [('tail_base_speed', 'turning_speed_rad_per_frame'), ('Left Front Paw_speed', 'Right Rear Paw_speed')]
+PAIRS_TO_TEST = [
+    ('speed_px_per_s', 'turning_speed_rad_per_s'),
+    ('Left Front Paw_speed_px_per_s', 'Right Rear Paw_speed_px_per_s'),
+]
 EMBED_DIM = 3
 TAU = 1
 
 def find_longest_bout(df, target_behavior, min_duration):
-    """Finds the longest contiguous bout of a specified behavior."""
-    bouts = [list(g) for b, g in groupby(df.index, key=lambda i: df.at[i, 'smoothed_behavior']) if b == target_behavior]
-    if not bouts: return None
-    longest_bout_indices = max(bouts, key=len)
-    return df.loc[longest_bout_indices] if len(longest_bout_indices) >= min_duration else None
+    """Find the longest frame-contiguous target bout within one track."""
+    required = {'track_id', 'frame', 'smoothed_behavior'}
+    if not required.issubset(df.columns):
+        return None
+    ordered = df.sort_values(['track_id', 'frame']).copy()
+    track_change = ordered['track_id'].ne(ordered['track_id'].shift())
+    frame_gap = ordered.groupby('track_id', sort=False)['frame'].diff().ne(1)
+    behavior_change = ordered['smoothed_behavior'].ne(ordered['smoothed_behavior'].shift())
+    bout_ids = (track_change | frame_gap | behavior_change).cumsum()
+    candidates = [
+        bout
+        for _, bout in ordered.groupby(bout_ids, sort=False)
+        if bout['smoothed_behavior'].iloc[0] == target_behavior and len(bout) >= min_duration
+    ]
+    return max(candidates, key=len).copy() if candidates else None
+
+
+def _longest_complete_metric_segment(bout_df, variables):
+    finite = np.isfinite(bout_df[list(variables)].to_numpy(dtype=float)).all(axis=1)
+    finite_series = pd.Series(finite, index=bout_df.index)
+    breaks = bout_df['frame'].diff().ne(1) | ~finite_series
+    segment_ids = breaks.cumsum()
+    candidates = [
+        segment
+        for _, segment in bout_df[finite].groupby(segment_ids[finite], sort=False)
+        if len(segment) > 100
+    ]
+    return max(candidates, key=len).copy() if candidates else None
 
 def main(base_results_dir, group_config, config_obj):
     if pyEDM is None:
@@ -55,18 +78,23 @@ def main(base_results_dir, group_config, config_obj):
                     continue
                 
                 df = pd.read_csv(data_path)
-                
+                df = df.sort_values(['track_id', 'frame']).reset_index(drop=True)
+                 
                 for v in [var1, var2]:
-                    if v.endswith('_speed') and v not in df.columns:
-                        paw_name = v.replace('_speed', '')
-                        if f'{paw_name}_x' in df.columns:
-                             df[v] = np.sqrt(df.groupby('track_id')[f'{paw_name}_x'].diff()**2 + df.groupby('track_id')[f'{paw_name}_y'].diff()**2)
+                    if v.endswith('_speed_px_per_s') and v not in df.columns:
+                        paw_name = v.removesuffix('_speed_px_per_s')
+                        if f'{paw_name}_x' in df.columns and 'video_fps' in df.columns:
+                            dx = contiguous_difference(df, f'{paw_name}_x')
+                            dy = contiguous_difference(df, f'{paw_name}_y')
+                            per_frame = np.sqrt(dx**2 + dy**2)
+                            df[v] = per_frame * pd.to_numeric(df['video_fps'], errors='coerce')
 
                 bout_df = find_longest_bout(df, target_behavior, min_bout_duration)
                 
                 if bout_df is not None and var1 in bout_df.columns and var2 in bout_df.columns:
-                    ccm_df_original = bout_df[[var1, var2]].dropna()
-                    if len(ccm_df_original) > 100:
+                    complete_bout = _longest_complete_metric_segment(bout_df, (var1, var2))
+                    if complete_bout is not None:
+                        ccm_df_original = complete_bout[[var1, var2]]
                         try:
                             safe_var1 = 'v1'
                             safe_var2 = 'v2'
@@ -94,7 +122,11 @@ def main(base_results_dir, group_config, config_obj):
         plt.figure(figsize=(8, 7))
         sns.boxplot(data=df_plot, x="Group", y="Final Rho", hue="Group", palette="muted")
         sns.stripplot(data=df_plot, x="Group", y="Final Rho", color=".25")
-        plt.title(f'Causality during "{target_behavior}" [{var1.replace("_", " ")} → {var2.replace("_", " ")}]', fontsize=16)
+        plt.title(
+            f'CCM prediction during "{target_behavior}" '
+            f'[{var1.replace("_", " ")} xmap {var2.replace("_", " ")}]',
+            fontsize=16,
+        )
         plt.ylabel('Final Prediction Skill ($\\rho$)')
         plt.xlabel('Experimental Group')
         plt.tight_layout()

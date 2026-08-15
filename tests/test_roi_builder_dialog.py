@@ -49,6 +49,10 @@ class TestRoiBuilderRowDataclass(unittest.TestCase):
         row = RoiBuilderRow(shape=SHAPE_POLYGON, polygon_vertices="six")  # type: ignore[arg-type]
         self.assertEqual(row.polygon_vertices, POLYGON_DEFAULT_VERTICES)
 
+    def test_size_is_available_and_clamped(self) -> None:
+        self.assertEqual(RoiBuilderRow(size_px=72).size_px, 72)
+        self.assertEqual(RoiBuilderRow(size_px=1).size_px, 2)
+
 
 class TestRoiBuilderDialog(unittest.TestCase):
     """Behaviour tests for the modal — needs Tk."""
@@ -80,6 +84,21 @@ class TestRoiBuilderDialog(unittest.TestCase):
             row = dlg._collect_rows()[0]
             self.assertEqual(row.name, "ROI 1")
             self.assertEqual(row.shape, SHAPE_RECTANGLE)
+        finally:
+            dlg.destroy()
+
+    def test_object_dialog_seeds_editable_size_from_gui_default(self) -> None:
+        dlg = RoiBuilderDialog(
+            self.root,
+            on_confirm=self._on_confirm,
+            default_size_px=56,
+            size_required=True,
+            title="Place Objects for Queue",
+        )
+        try:
+            row = dlg._collect_rows()[0]
+            self.assertEqual(row.size_px, 56)
+            self.assertIsNone(dlg._validate([row]))
         finally:
             dlg.destroy()
 

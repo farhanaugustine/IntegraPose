@@ -26,6 +26,11 @@ from integra_pose.logic.batch_preflight import (
 )
 from integra_pose.utils import video_creator
 from integra_pose.utils.batch_session import BatchModelCapabilities
+from integra_pose.utils.frame_identity import (
+    FrameIdentityError,
+    load_frame_label_class_metadata,
+    resolve_frame_label_indices,
+)
 
 
 class AnalyticsService:
@@ -79,8 +84,16 @@ class AnalyticsService:
         self,
         *,
         yaml_path: str,
+        labels_folder: str,
         capabilities: BatchModelCapabilities,
     ) -> tuple[list[str] | None, str]:
+        label_metadata = (
+            load_frame_label_class_metadata(labels_folder) if labels_folder else {}
+        )
+        saved_names = list(label_metadata.get("class_names") or [])
+        if saved_names:
+            return saved_names, "inference label metadata"
+
         yaml_text = str(yaml_path or "").strip()
         if yaml_text and os.path.isfile(yaml_text):
             return None, "dataset YAML"
@@ -161,6 +174,7 @@ class AnalyticsService:
             labels_root=str(app.config.get_setting("analytics.yolo_output_path_var") or "").strip(),
             object_interaction_enabled=bool(app.config.get_setting("analytics.object_interaction_enabled_var")),
             object_count=max(0, object_count),
+            include_mixed_effects=False,
             include_kpss=False,
             class_count=max(0, class_count),
             enabled_metrics=collect_enabled_metric_keys(getattr(app.config, "analytics", None)),
@@ -260,8 +274,12 @@ class AnalyticsService:
     def preview_preflight(self, *, show_dialog: bool = True) -> dict[str, object]:
         capabilities = self._get_model_capabilities()
         yaml_path = str(self.app.config.get_setting("analytics.roi_analytics_yaml_path_var") or "").strip()
+        labels_folder = str(
+            self.app.config.get_setting("analytics.yolo_output_path_var") or ""
+        ).strip()
         behavior_override, behavior_source = self._resolve_behavior_name_override(
             yaml_path=yaml_path,
+            labels_folder=labels_folder,
             capabilities=capabilities,
         )
         self._apply_metric_gating(capabilities)
@@ -324,21 +342,37 @@ class AnalyticsService:
                 "assay_preset_override": str(app.config.get_setting("analytics.assay_preset_var") or "custom").strip() or "custom",
                 "min_bout_frames": int(app.config.get_setting("analytics.min_bout_duration_var")),
                 "max_gap_frames": int(app.config.get_setting("analytics.max_frame_gap_var")),
+                "behavior_bout_class_mode": str(
+                    app.config.get_setting(
+                        "analytics.behavior_bout_class_mode_var"
+                    )
+                    or "mutually_exclusive"
+                ),
                 "roi_min_dwell_frames": int(app.config.get_setting("analytics.roi_min_dwell_frames_var") or 1),
                 "roi_max_gap_frames": int(app.config.get_setting("analytics.roi_max_gap_frames_var") or 0),
                 "create_video": app.config.get_setting("analytics.create_video_output_var"),
+                "single_animal_mode_override": bool(
+                    app.config.get_setting("analytics.single_animal_analysis_var")
+                ),
                 "object_interaction_enabled": bool(app.config.get_setting("analytics.object_interaction_enabled_var")),
                 "object_count": max(0, int(object_count)),
                 "object_roi_size_px": max(2, int(object_roi_size_px)),
                 "object_roi_shape": str(app.config.get_setting("analytics.object_roi_shape_var") or "circle").strip().lower() or "circle",
                 "object_interaction_keypoint_index": max(0, int(object_keypoint_index)),
                 "object_interaction_distance_px": max(0.0, float(object_distance_px)),
+                # There is one temporal-debounce control in Tab 6. Apply it
+                # consistently to zone visits and object interactions.
+                "object_min_dwell_frames": int(app.config.get_setting("analytics.roi_min_dwell_frames_var") or 1),
+                "object_max_gap_frames": int(app.config.get_setting("analytics.roi_max_gap_frames_var") or 0),
                 "object_roi_polygon_map_override": app.object_roi_manager.to_serializable() if hasattr(app, "object_roi_manager") else {},
             }
             params.update(roi_entry_settings)
             behavior_names_override = preflight.get("behavior_names_override")
             if behavior_names_override:
                 params["behavior_names_override"] = behavior_names_override
+            params["behavior_names_source"] = str(
+                preflight.get("behavior_source") or "unresolved"
+            )
             enabled_metrics = sorted(collect_enabled_metric_keys(app.config.analytics))
             params["enabled_metrics_override"] = enabled_metrics
             params["enabled_modules_override"] = expand_metrics_to_modules(enabled_metrics)
@@ -347,18 +381,35 @@ class AnalyticsService:
             yaml_path = str(params["yaml_file"] or "").strip()
             if yaml_path and not os.path.isfile(yaml_path):
                 app.log_message(
-                    f"Analytics YAML not found at {yaml_path}. Proceeding with Setup-tab behavior names instead.",
+                    f"Analytics YAML not found at {yaml_path}. Proceeding with the resolved behavior-name fallback.",
                     "WARNING",
                 )
                 params["yaml_file"] = ""
             if not os.path.isdir(params["yolo_folder"]):
                 raise ValueError(f"YOLO output directory does not exist: {params['yolo_folder']}")
-            txt_files = [f for f in os.listdir(params["yolo_folder"]) if f.endswith(".txt")]
-            if not txt_files:
-                raise ValueError(
-                    f"No .txt files found in YOLO output directory: {params['yolo_folder']}. Please run inference first or select a valid directory."
+            txt_files = [
+                f
+                for f in os.listdir(params["yolo_folder"])
+                if f.lower().endswith(".txt") and not f.startswith(".")
+            ]
+            try:
+                frame_files = resolve_frame_label_indices(
+                    txt_files,
+                    source=params["video_file"],
                 )
-            app.log_message(f"Starting Bout Analysis with {len(txt_files)} .txt files in {params['yolo_folder']}", "INFO")
+            except FrameIdentityError as exc:
+                raise ValueError(str(exc)) from exc
+            if not frame_files:
+                raise ValueError(
+                    "No frame-indexed detection TXT files were found in YOLO output directory: "
+                    f"{params['yolo_folder']}. Please run inference first or select a valid directory."
+                )
+            ignored_count = len(txt_files) - len(frame_files)
+            app.log_message(
+                f"Starting Bout Analysis with {len(frame_files)} frame label files "
+                f"in {params['yolo_folder']} ({ignored_count} auxiliary TXT ignored).",
+                "INFO",
+            )
             app.update_status("Analytics started...")
             app._set_job_status("Analytics running")
             app._set_process_activity("analytics", "running")
@@ -435,6 +486,9 @@ class AnalyticsService:
                 roi_events,
                 app.additional_module_outputs,
             ) = app.analytics.run_analysis(params)
+            # Preserve the detector output separately from any later review
+            # projection. Review decisions must never overwrite this source.
+            app.raw_detected_bouts_df = app.detailed_bouts_df.copy(deep=True)
             app._ensure_roi_lookup(force=True)
             try:
                 app.last_tab6_run_folder = output_folder
@@ -516,6 +570,9 @@ class AnalyticsService:
                             object_rois=object_rois,
                             object_metrics=object_metrics,
                             object_events=object_events,
+                            single_animal_mode=bool(
+                                params.get("single_animal_mode_override", False)
+                            ),
                         )
                     )
                 except Exception as exc:

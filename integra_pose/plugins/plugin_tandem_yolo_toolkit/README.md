@@ -104,4 +104,4 @@ This installs the Qt workspace, YOLO-facing runtime dependencies, telemetry supp
 
 ## Inference
 
-Use the Inference tab for file, folder, camera-index, or RTSP/HTTP stream sources. Enable **Real-time source** for camera or live-stream runs. While inference runs, TandemYTC shows live telemetry for processed FPS, windows/sec, per-window latency, classifier time, CPU, GPU utilization, and GPU memory; the same samples are written to a sidecar metrics CSV when **Log runtime metrics** is enabled.
+Use the Inference tab for file, folder, camera-index, or RTSP/HTTP stream sources. Enable **Real-time source** for camera or live-stream runs. While inference runs, TandemYTC shows live telemetry for processed FPS, windows/sec, per-window latency, classifier time, CPU, GPU utilization, and GPU memory; the same samples are written to a sidecar metrics CSV when **Log runtime metrics** is enabled. The editable **YOLO tracker** field provides ByteTrack and BoT-SORT presets and also accepts a custom Ultralytics tracker YAML.

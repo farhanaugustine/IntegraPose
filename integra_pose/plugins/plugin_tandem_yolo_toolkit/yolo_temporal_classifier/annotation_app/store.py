@@ -667,7 +667,12 @@ class AnnotationStore:
                 hotkey=hotkey,
             )
 
-    def import_videos(self, project_id: int, paths: Iterable[Path]) -> int:
+    def import_videos(
+        self,
+        project_id: int,
+        paths: Iterable[Path],
+        warnings_out: list[dict] | None = None,
+    ) -> int:
         imported = 0
         for path in paths:
             video_path = Path(path).resolve()
@@ -685,13 +690,28 @@ class AnnotationStore:
             if exists is not None:
                 continue
             metadata = probe_video(video_path)
+            video_warnings = list(metadata.get("warnings") or [])
+            if video_warnings and warnings_out is not None:
+                warnings_out.append(
+                    {
+                        "filename": video_path.name,
+                        "warnings": video_warnings,
+                        "variable_frame_rate": bool(metadata.get("variable_frame_rate")),
+                    }
+                )
+            if metadata.get("variable_frame_rate"):
+                note = "[import] Variable frame rate detected; frame numbers are approximate."
+            elif str(metadata.get("fps_source") or "").startswith("default"):
+                note = "[import] Frame rate could not be read; assumed 30 fps."
+            else:
+                note = ""
             now = utc_now()
             self.conn.execute(
                 """
                 INSERT INTO videos
                 (project_id, path, filename, sha256, file_size, fps, total_frames,
                  duration_ms, width, height, codec, imported_at, last_position_ms, status, notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'unseen', '')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'unseen', ?)
                 """,
                 (
                     project_id,
@@ -706,6 +726,7 @@ class AnnotationStore:
                     metadata["height"],
                     metadata["codec"],
                     now,
+                    note,
                 ),
             )
             imported += 1
@@ -1034,6 +1055,21 @@ def partial_sha256(path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
 
 
 def probe_video(path: Path) -> dict[str, int | float | str]:
+    """Probe video metadata, reconciling OpenCV with ffprobe when available.
+
+    Returns the fps/total_frames/duration_ms/width/height/codec the rest of the
+    app relies on, plus timing diagnostics (``variable_frame_rate``,
+    ``fps_source``, ``warnings``, ...). See
+    :func:`video_probe.probe_video_metadata`. Falls back to an OpenCV-only probe
+    if the robust module is somehow unavailable, so imports never hard-fail.
+    """
+    try:
+        from .video_probe import probe_video_metadata
+
+        return probe_video_metadata(path)
+    except Exception:
+        pass
+
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {path}")
@@ -1065,6 +1101,9 @@ def probe_video(path: Path) -> dict[str, int | float | str]:
         "width": width,
         "height": height,
         "codec": codec or "unknown",
+        "variable_frame_rate": None,
+        "fps_source": "opencv",
+        "warnings": [],
     }
 
 

@@ -165,9 +165,13 @@ def _draw_header(
     thickness: int = 1,
 ) -> None:
     h, w = frame.shape[:2]
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, header_height), (0, 0, 0), thickness=-1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, dst=frame)
+    # The old implementation copied and blended the entire frame even though
+    # only the header strip changed. Darkening the header ROI in place is
+    # pixel-equivalent and avoids another full-resolution memcpy per frame.
+    header_rows = min(h, max(0, int(header_height)) + 1)
+    if header_rows:
+        header_roi = frame[:header_rows]
+        cv2.addWeighted(header_roi, 0.4, header_roi, 0.0, 0, dst=header_roi)
 
     # Left column: label + confidence
     if label is not None:

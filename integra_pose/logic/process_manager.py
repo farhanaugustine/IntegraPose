@@ -8,6 +8,8 @@ import re
 from tkinter import messagebox
 import traceback
 
+from integra_pose.utils.operation_result import OperationResult
+
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
@@ -20,19 +22,28 @@ class ProcessManager:
         if getattr(self.app, process_attr, None) and getattr(self.app, process_attr).poll() is None:
             self.app.log_message(f"A {process_attr} is already running.", "WARNING")
             messagebox.showwarning("In Progress", "A process is already running.", parent=self.app.root)
-            return
+            return False
         
         try:
             cmd, err = command_builder_func(self.app)
             if err:
                 self.app.log_message(f"Command Builder Error: {err}", "ERROR")
                 messagebox.showerror("Input Validation Error", err, parent=self.app.root)
-                return
+                self._schedule_finish(
+                    on_finish_callback,
+                    OperationResult.failure("Process configuration failed.", error=str(err)),
+                )
+                return False
             
-            self._start_and_stream_process(cmd, process_attr, on_finish_callback)
+            return self._start_and_stream_process(cmd, process_attr, on_finish_callback)
         except Exception as e:
             self.app.log_message(f"Process Start Error: {e}\n{traceback.format_exc()}", "ERROR")
             messagebox.showerror("Process Error", f"Failed to start process: {e}", parent=self.app.root)
+            self._schedule_finish(
+                on_finish_callback,
+                OperationResult.failure("Process failed to start.", error=str(e)),
+            )
+            return False
 
     def _start_and_stream_process(self, command, process_attribute, on_finish_callback=None):
         self.app.log_message(f"--- Starting Command ---\n{' '.join(command)}\n------------------------", "INFO")
@@ -46,9 +57,11 @@ class ProcessManager:
                 )
                 self.app.log_message(msg, "ERROR")
                 messagebox.showerror("Command Not Found", msg, parent=self.app.root)
-                if on_finish_callback:
-                    self.app.root.after(0, on_finish_callback)
-                return
+                self._schedule_finish(
+                    on_finish_callback,
+                    OperationResult.failure("Command was not found.", error=msg),
+                )
+                return False
 
             popen_kwargs = {'stdout': subprocess.PIPE, 'stderr': subprocess.STDOUT, 'text': True, 'encoding': 'utf-8', 'errors': 'replace', 'bufsize': 1}
             if sys.platform != "win32":
@@ -56,10 +69,14 @@ class ProcessManager:
             process = subprocess.Popen(command, **popen_kwargs)
             setattr(self.app, process_attribute, process)
             threading.Thread(target=self._stream_process_output, args=(process, on_finish_callback), daemon=True).start()
+            return True
         except Exception as e:
             self.app.log_message(f"ERROR starting process: {e}\n{traceback.format_exc()}", "ERROR")
-            if on_finish_callback:
-                self.app.root.after(0, on_finish_callback)
+            self._schedule_finish(
+                on_finish_callback,
+                OperationResult.failure("Process failed to start.", error=str(e)),
+            )
+            return False
 
     def _stream_process_output(self, process, on_finish_callback):
         for line in iter(process.stdout.readline, ''):
@@ -69,8 +86,19 @@ class ProcessManager:
                 self.app.log_queue.put(cleaned)
         rc = process.wait()
         self.app.log_queue.put(f"--- Process finished with exit code {rc} ---")
-        if on_finish_callback:
-            self.app.root.after(0, on_finish_callback)
+        if rc == 0:
+            result = OperationResult.success("Process completed successfully.")
+        else:
+            result = OperationResult.failure(
+                f"Process exited with code {rc}.",
+                returncode=int(rc),
+            )
+        self._schedule_finish(on_finish_callback, result)
+
+    def _schedule_finish(self, callback, result: OperationResult) -> None:
+        if callback is None:
+            return
+        self.app.root.after(0, lambda: callback(result))
 
     def terminate_process(self, process_attribute):
         process = getattr(self.app, process_attribute, None)

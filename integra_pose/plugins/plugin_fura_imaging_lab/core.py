@@ -10,7 +10,6 @@ import cv2
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageSequence
-from scipy.interpolate import UnivariateSpline
 from scipy.signal import savgol_filter
 
 try:  # pragma: no cover - optional dependency
@@ -38,6 +37,10 @@ class AlignedRecording:
     channel_340: np.ndarray
     channel_380: np.ndarray
     time_s: np.ndarray
+    time_340_s: np.ndarray
+    time_380_s: np.ndarray
+    source_index_340: np.ndarray
+    source_index_380: np.ndarray
     width: int
     height: int
     crop_x: int = 0
@@ -179,8 +182,8 @@ class AxiLoader:
             source_label=str(self.file_path),
             channel_340=np.asarray(data_340, dtype=np.float32),
             channel_380=np.asarray(data_380, dtype=np.float32),
-            time_340=np.asarray(times_340, dtype=np.float32),
-            time_380=np.asarray(times_380, dtype=np.float32),
+            time_340=np.asarray(times_340, dtype=np.float64),
+            time_380=np.asarray(times_380, dtype=np.float64),
             width=int(self.width),
             height=int(self.height),
             crop_x=int(self.crop_x),
@@ -287,8 +290,8 @@ def load_tiff_pair_recording(
         source_label=f"{path_340} | {path_380}",
         channel_340=stack_340.astype(np.float32, copy=False),
         channel_380=stack_380.astype(np.float32, copy=False),
-        time_340=np.arange(count_340, dtype=np.float32) * float(frame_interval_s),
-        time_380=np.arange(count_380, dtype=np.float32) * float(frame_interval_s),
+        time_340=np.arange(count_340, dtype=np.float64) * float(frame_interval_s),
+        time_380=np.arange(count_380, dtype=np.float64) * float(frame_interval_s),
         width=int(stack_340.shape[2]),
         height=int(stack_340.shape[1]),
         crop_x=0,
@@ -326,19 +329,98 @@ def _read_tiff_stack(path: str | Path) -> np.ndarray:
 
 
 def align_recording(recording: RecordingData) -> AlignedRecording:
-    n_frames = min(len(recording.channel_340), len(recording.channel_380))
-    if n_frames <= 0:
+    stack_340, time_340 = _validate_channel_data(
+        "340 nm", recording.channel_340, recording.time_340
+    )
+    stack_380, time_380 = _validate_channel_data(
+        "380 nm", recording.channel_380, recording.time_380
+    )
+    if stack_340.shape[1:] != stack_380.shape[1:]:
+        raise ValueError("340 nm and 380 nm channels must have matching frame sizes.")
+    if stack_340.shape[1:] != (int(recording.height), int(recording.width)):
+        raise ValueError("Recording width/height metadata does not match the channel frames.")
+
+    pairs = _match_channel_timestamps(time_340, time_380)
+    if not pairs:
         raise ValueError("Recording contains no matched 340/380 frame pairs.")
+    indices_340 = np.asarray([pair[0] for pair in pairs], dtype=int)
+    indices_380 = np.asarray([pair[1] for pair in pairs], dtype=int)
+    pair_times = (time_340[indices_340] + time_380[indices_380]) / 2.0
     return AlignedRecording(
         source_label=recording.source_label,
-        channel_340=np.asarray(recording.channel_340[:n_frames], dtype=np.float32),
-        channel_380=np.asarray(recording.channel_380[:n_frames], dtype=np.float32),
-        time_s=np.asarray(recording.time_340[:n_frames], dtype=np.float32),
+        channel_340=stack_340[indices_340],
+        channel_380=stack_380[indices_380],
+        time_s=np.asarray(pair_times, dtype=np.float64),
+        time_340_s=time_340[indices_340],
+        time_380_s=time_380[indices_380],
+        source_index_340=indices_340,
+        source_index_380=indices_380,
         width=recording.width,
         height=recording.height,
         crop_x=recording.crop_x,
         crop_y=recording.crop_y,
     )
+
+
+def _validate_channel_data(
+    channel_name: str,
+    stack: np.ndarray,
+    timestamps: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    stack_array = np.asarray(stack, dtype=np.float32)
+    time_array = np.asarray(timestamps, dtype=np.float64)
+    if stack_array.ndim != 3:
+        raise ValueError(f"{channel_name} channel must have shape [frames, height, width].")
+    if time_array.ndim != 1 or len(time_array) != len(stack_array):
+        raise ValueError(f"{channel_name} timestamps must contain one value per frame.")
+    if len(time_array) == 0:
+        raise ValueError(f"{channel_name} channel contains no frames.")
+    if not np.isfinite(time_array).all():
+        raise ValueError(f"{channel_name} timestamps must all be finite.")
+    if len(time_array) > 1 and not np.all(np.diff(time_array) > 0):
+        raise ValueError(f"{channel_name} timestamps must be strictly increasing.")
+    return stack_array, time_array
+
+
+def _match_channel_timestamps(time_340: np.ndarray, time_380: np.ndarray) -> list[tuple[int, int]]:
+    """Greedily select mutual-nearest, order-preserving channel pairs."""
+    spacings = []
+    for times in (time_340, time_380):
+        if len(times) > 1:
+            spacings.extend(np.diff(times).tolist())
+    tolerance = np.inf if not spacings else 0.75 * float(np.median(spacings))
+    tolerance = max(tolerance, np.finfo(float).eps)
+
+    pairs: list[tuple[int, int]] = []
+    idx_340 = 0
+    idx_380 = 0
+    while idx_340 < len(time_340) and idx_380 < len(time_380):
+        current_delta = abs(float(time_340[idx_340] - time_380[idx_380]))
+        next_380_delta = (
+            abs(float(time_340[idx_340] - time_380[idx_380 + 1]))
+            if idx_380 + 1 < len(time_380)
+            else np.inf
+        )
+        next_340_delta = (
+            abs(float(time_340[idx_340 + 1] - time_380[idx_380]))
+            if idx_340 + 1 < len(time_340)
+            else np.inf
+        )
+        if next_380_delta < current_delta:
+            idx_380 += 1
+            continue
+        if next_340_delta < current_delta:
+            idx_340 += 1
+            continue
+        if current_delta <= tolerance:
+            pairs.append((idx_340, idx_380))
+            idx_340 += 1
+            idx_380 += 1
+        elif time_340[idx_340] < time_380[idx_380]:
+            idx_340 += 1
+        else:
+            idx_380 += 1
+    return pairs
 
 
 def build_reference_frame(
@@ -354,11 +436,14 @@ def build_reference_frame(
 
 def estimate_drift_shifts(stack: np.ndarray, reference_frame: np.ndarray) -> np.ndarray:
     ref = _prepare_phase_image(reference_frame)
-    if ref.size == 0:
-        return np.zeros((stack.shape[0], 2), dtype=np.float32)
+    if ref.size == 0 or float(np.std(ref)) < 1e-8:
+        raise ValueError("Drift correction requires a reference image with spatial contrast.")
     shifts = np.zeros((stack.shape[0], 2), dtype=np.float32)
     for idx, frame in enumerate(stack):
-        shifts[idx] = _estimate_phase_shift(ref, _prepare_phase_image(frame))
+        current = _prepare_phase_image(frame)
+        if current.size == 0 or float(np.std(current)) < 1e-8:
+            raise ValueError(f"Drift correction frame {idx} has insufficient spatial contrast.")
+        shifts[idx] = _estimate_phase_shift(ref, current)
     return shifts
 
 
@@ -377,12 +462,12 @@ def _prepare_phase_image(frame: np.ndarray) -> np.ndarray:
 
 def _estimate_phase_shift(reference_frame: np.ndarray, current_frame: np.ndarray) -> np.ndarray:
     if reference_frame.shape != current_frame.shape:
-        return np.zeros(2, dtype=np.float32)
-    try:
-        shift_xy, _response = cv2.phaseCorrelate(reference_frame, current_frame)
-        return np.asarray(shift_xy, dtype=np.float32)
-    except Exception:
-        return np.zeros(2, dtype=np.float32)
+        raise ValueError("Drift-correction frames must have matching shapes.")
+    shift_xy, response = cv2.phaseCorrelate(reference_frame, current_frame)
+    shift = np.asarray(shift_xy, dtype=np.float32)
+    if not np.isfinite(shift).all() or not np.isfinite(response) or response <= 0:
+        raise ValueError("Phase correlation could not estimate a reliable finite drift shift.")
+    return shift
 
 
 def apply_frame_shifts(stack: np.ndarray, shifts_xy: np.ndarray) -> np.ndarray:
@@ -408,6 +493,22 @@ def run_tracking(
 ) -> TrackingResult:
     if not seeds:
         raise ValueError("Add at least one ROI before running tracking.")
+    if config.reference_channel not in {"340", "380"}:
+        raise ValueError("Reference channel must be '340' or '380'.")
+    if config.reference_average_count < 1:
+        raise ValueError("Reference average frame count must be at least one.")
+    if config.search_radius < 0:
+        raise ValueError("Tracking search radius cannot be negative.")
+    if not 0.0 <= config.adaptive_template_rate <= 1.0:
+        raise ValueError("Adaptive template rate must be between 0 and 1.")
+    seed_names = [seed.name.strip() for seed in seeds]
+    if any(not name for name in seed_names):
+        raise ValueError("Every ROI must have a non-empty name.")
+    if len(set(seed_names)) != len(seed_names):
+        raise ValueError("ROI names must be unique.")
+    invalid_kinds = sorted({seed.kind for seed in seeds} - {"cell", "background"})
+    if invalid_kinds:
+        raise ValueError(f"Unsupported ROI kind(s): {', '.join(invalid_kinds)}")
     aligned = align_recording(recording)
     ref_stack = aligned.channel_340 if config.reference_channel == "340" else aligned.channel_380
     reference_frame = build_reference_frame(
@@ -428,6 +529,10 @@ def run_tracking(
         channel_340=corrected_340,
         channel_380=corrected_380,
         time_s=aligned.time_s,
+        time_340_s=aligned.time_340_s,
+        time_380_s=aligned.time_380_s,
+        source_index_340=aligned.source_index_340,
+        source_index_380=aligned.source_index_380,
         width=aligned.width,
         height=aligned.height,
         crop_x=aligned.crop_x,
@@ -477,8 +582,16 @@ def _track_on_corrected_frames(
         templates[seed.name] = _extract_patch(reference_frame, seed_box)
 
     rows: list[dict[str, object]] = []
-    ratio_table = pd.DataFrame({"Time": aligned.time_s})
-    signal_table = pd.DataFrame({"Time": aligned.time_s})
+    pair_metadata = {
+        "Time": aligned.time_s,
+        "Time_340": aligned.time_340_s,
+        "Time_380": aligned.time_380_s,
+        "Pair_Delta_s": np.abs(aligned.time_340_s - aligned.time_380_s),
+        "Source_Index_340": aligned.source_index_340,
+        "Source_Index_380": aligned.source_index_380,
+    }
+    ratio_table = pd.DataFrame(pair_metadata)
+    signal_table = pd.DataFrame(pair_metadata)
     bg340_series = np.zeros(len(aligned.time_s), dtype=np.float32)
     bg380_series = np.zeros(len(aligned.time_s), dtype=np.float32)
 
@@ -497,8 +610,8 @@ def _track_on_corrected_frames(
             bg340 = float(np.nanmean(bg_vals_340))
             bg380 = float(np.nanmean(bg_vals_380))
         else:
-            bg340 = 0.0
-            bg380 = 0.0
+            bg340 = float("nan")
+            bg380 = float("nan")
         bg340_series[frame_idx] = bg340
         bg380_series[frame_idx] = bg380
 
@@ -519,16 +632,23 @@ def _track_on_corrected_frames(
 
             mean_340 = _mean_in_seed(frame_340, seed, box)
             mean_380 = _mean_in_seed(frame_380, seed, box)
-            bg_sub_340 = mean_340 - bg340
-            bg_sub_380 = mean_380 - bg380
-            raw_ratio = mean_340 / max(mean_380, 1e-6)
-            bg_sub_ratio = bg_sub_340 / max(bg_sub_380, 1e-6)
+            bg_sub_340 = mean_340 - bg340 if np.isfinite(bg340) else float("nan")
+            bg_sub_380 = mean_380 - bg380 if np.isfinite(bg380) else float("nan")
+            raw_ratio = _safe_fura_ratio(mean_340, mean_380)
+            bg_sub_ratio = _safe_fura_ratio(bg_sub_340, bg_sub_380)
             area_px = polygon_area(polygon_for_seed(seed, box))
             x, y, w, h = box
             rows.append(
                 {
                     "frame": int(frame_idx),
                     "time_s": float(time_s),
+                    "time_340_s": float(aligned.time_340_s[frame_idx]),
+                    "time_380_s": float(aligned.time_380_s[frame_idx]),
+                    "pair_delta_s": float(
+                        abs(aligned.time_340_s[frame_idx] - aligned.time_380_s[frame_idx])
+                    ),
+                    "source_index_340": int(aligned.source_index_340[frame_idx]),
+                    "source_index_380": int(aligned.source_index_380[frame_idx]),
                     "cell_id": seed.name,
                     "x": int(x),
                     "y": int(y),
@@ -563,6 +683,13 @@ def _track_on_corrected_frames(
         ratio_table[f"{seed.name}_Ratio_Raw"] = cell_df["ratio_raw"].to_numpy(dtype=np.float32)
         ratio_table[f"{seed.name}_Ratio_BGSub"] = cell_df["ratio_bg_sub"].to_numpy(dtype=np.float32)
     return track_table, ratio_table, signal_table
+
+
+def _safe_fura_ratio(numerator: float, denominator: float) -> float:
+    """Return R340/380 only when the 380 denominator is physically usable."""
+    if not np.isfinite(numerator) or not np.isfinite(denominator) or denominator <= 1e-6:
+        return float("nan")
+    return float(numerator / denominator)
 
 
 def _track_template(
@@ -690,6 +817,8 @@ def parse_period_text(text: str) -> list[tuple[float, float]]:
         if len(parts) != 2:
             raise ValueError(f"Invalid interval line: '{line}'")
         start, end = float(parts[0]), float(parts[1])
+        if not np.isfinite(start) or not np.isfinite(end):
+            raise ValueError(f"Interval values must be finite: '{line}'")
         if end <= start:
             raise ValueError(f"Interval end must be greater than start: '{line}'")
         intervals.append((start, end))
@@ -698,6 +827,8 @@ def parse_period_text(text: str) -> list[tuple[float, float]]:
 
 def analyze_tracking_result(result: TrackingResult, config: AnalysisConfig) -> AnalysisResult:
     ratio_table = _build_analysis_input_table(result, config)
+    _validate_analysis_time(ratio_table["Time"])
+    _validate_analysis_config(config, ratio_table["Time"])
     anchor = _resolve_event_anchor(config)
     ratio_table["Time_Aligned"] = ratio_table["Time"] - anchor
     smoothed = pd.DataFrame({"Time": ratio_table["Time"], "Time_Aligned": ratio_table["Time_Aligned"]})
@@ -747,15 +878,23 @@ def _build_analysis_input_table(result: TrackingResult, config: AnalysisConfig) 
         "signal_340_raw": "_340nm_Raw",
         "signal_380_raw": "_380nm_Raw",
     }
-    suffix = family_suffix_map.get(config.signal_family, "_Ratio_BGSub")
+    if config.signal_family not in family_suffix_map:
+        raise ValueError(f"Unsupported analysis signal family: {config.signal_family}")
+    suffix = family_suffix_map[config.signal_family]
     out = pd.DataFrame({"Time": result.signal_table["Time"]})
     base_periods = config.baseline_periods
     for col in [c for c in result.signal_table.columns if c.endswith(suffix)]:
         values = pd.Series(pd.to_numeric(result.signal_table[col], errors="coerce"), index=result.signal_table.index)
+        if not np.isfinite(values.to_numpy(dtype=float)).any():
+            raise ValueError(f"Signal '{col}' has no finite values for analysis.")
         seed_name = col[: -len(suffix)]
         area_col = f"{seed_name}_Area_px"
         area_series = pd.Series(pd.to_numeric(result.signal_table.get(area_col, pd.Series(dtype=float)), errors="coerce"), index=result.signal_table.index)
         out[col] = _normalize_signal(values, area_series, out["Time"], config.normalization_mode, base_periods)
+    if len(out.columns) == 1:
+        raise ValueError(
+            f"No tracked cell signals are available for analysis family '{config.signal_family}'."
+        )
     return out
 
 
@@ -770,31 +909,72 @@ def _normalize_signal(
     if mode == "none":
         return values.copy()
     if mode == "divide_by_area":
-        denom = area_series.replace(0, np.nan)
-        normalized = values / denom
-        return normalized.replace([np.inf, -np.inf], np.nan)
+        raise ValueError(
+            "Area normalization is not valid for these traces because ROI values "
+            "are already mean intensities (or ratios of mean intensities)."
+        )
+    valid_modes = {
+        "delta_over_baseline",
+        "percent_change_from_baseline",
+        "zscore_baseline",
+    }
+    if mode not in valid_modes:
+        raise ValueError(f"Unsupported normalization mode: {mode}")
+    if not baseline_periods:
+        raise ValueError(f"Normalization mode '{mode}' requires at least one baseline period.")
 
     baseline_mask = pd.Series(False, index=values.index)
     for start, end in baseline_periods:
         baseline_mask |= (time_s >= start) & (time_s <= end)
     baseline_values = values[baseline_mask & values.notna()]
-    if baseline_values.empty:
-        return values.copy()
+    if len(baseline_values) < 2:
+        raise ValueError(
+            f"Normalization mode '{mode}' requires at least two finite baseline samples."
+        )
     baseline_mean = float(baseline_values.mean())
     baseline_std = float(baseline_values.std(ddof=0))
     if mode == "delta_over_baseline":
         if abs(baseline_mean) < 1e-9:
-            return values.copy()
+            raise ValueError("Cannot compute delta/F0 because the baseline mean is zero.")
         return (values - baseline_mean) / baseline_mean
     if mode == "percent_change_from_baseline":
         if abs(baseline_mean) < 1e-9:
-            return values.copy()
+            raise ValueError("Cannot compute percent baseline change because the baseline mean is zero.")
         return ((values - baseline_mean) / baseline_mean) * 100.0
     if mode == "zscore_baseline":
         if baseline_std < 1e-9:
-            return values - baseline_mean
+            raise ValueError("Cannot compute a baseline z-score because baseline variance is zero.")
         return (values - baseline_mean) / baseline_std
-    return values.copy()
+    raise ValueError(f"Unsupported normalization mode: {mode}")
+
+
+def _validate_analysis_time(time_s: pd.Series) -> None:
+    values = pd.to_numeric(time_s, errors="coerce").to_numpy(dtype=float)
+    if len(values) == 0 or not np.isfinite(values).all():
+        raise ValueError("Analysis timestamps must be finite and non-empty.")
+    if len(values) > 1 and not np.all(np.diff(values) > 0):
+        raise ValueError("Analysis timestamps must be strictly increasing.")
+
+
+def _validate_analysis_config(config: AnalysisConfig, time_s: pd.Series) -> None:
+    time_values = time_s.to_numpy(dtype=float)
+    if config.event_time is not None and not np.isfinite(config.event_time):
+        raise ValueError("Event time must be finite.")
+    if config.analysis_window_dur < 0 or config.auc_short_dur < 0:
+        raise ValueError("Analysis and AUC window durations cannot be negative.")
+    for label, intervals in (
+        ("baseline", config.baseline_periods),
+        ("stimulation", config.stimulations),
+    ):
+        for start, end in intervals:
+            if not np.isfinite(start) or not np.isfinite(end) or end <= start:
+                raise ValueError(f"Every {label} interval must have finite start < end values.")
+    for start, _end in config.stimulations:
+        if start < time_values[0] or start > time_values[-1]:
+            raise ValueError(
+                f"Stimulation start {start:g} s is outside the recorded time range "
+                f"[{time_values[0]:g}, {time_values[-1]:g}] s."
+            )
 
 
 def _resolve_event_anchor(config: AnalysisConfig) -> float:
@@ -824,7 +1004,7 @@ def _smooth_signal(signal: pd.Series, config: AnalysisConfig) -> pd.Series:
         smoothed = signal.copy()
         smoothed.loc[valid.index] = savgol_filter(valid.to_numpy(dtype=float), window_length=window, polyorder=poly)
         return smoothed
-    return signal.copy()
+    raise ValueError(f"Unsupported smoothing method: {method}")
 
 
 def _baseline_correct(
@@ -843,35 +1023,40 @@ def _baseline_correct(
         return corrected, baseline_series, info
 
     mask = pd.Series(False, index=signal.index)
+    anchor_times: list[float] = []
+    anchor_values: list[float] = []
     for start, end in baseline_periods:
-        mask |= (time_s >= start) & (time_s <= end)
+        period_mask = (time_s >= start) & (time_s <= end) & signal.notna() & time_s.notna()
+        mask |= period_mask
+        if period_mask.any():
+            anchor_times.append(float(pd.to_numeric(time_s[period_mask]).mean()))
+            anchor_values.append(float(pd.to_numeric(signal[period_mask]).mean()))
     valid = mask & signal.notna() & time_s.notna()
-    if valid.sum() < 4:
-        return corrected, baseline_series, info
+    if valid.sum() < 2 or not anchor_times:
+        raise ValueError("Baseline correction requires at least two finite baseline samples.")
 
-    base_time = pd.Series(time_s[valid], index=time_s[valid].index)
-    base_signal = pd.Series(signal[valid], index=signal[valid].index)
-    unique_time, unique_idx = np.unique(base_time.to_numpy(dtype=float), return_index=True)
-    if len(unique_time) < 4:
-        return corrected, baseline_series, info
-    unique_values = base_signal.to_numpy(dtype=float)[unique_idx]
-    try:
-        spline = UnivariateSpline(
-            unique_time,
-            unique_values,
-            k=min(3, len(unique_time) - 1),
-            s=max(len(unique_time) * 1e-6, 0.0),
-        )
-        baseline_vals = spline(time_s.to_numpy(dtype=float))
-        baseline_series = pd.Series(baseline_vals, index=signal.index)
-        corrected = signal - baseline_series
-        info = {
-            "applied": True,
-            "time_points": pd.Series(unique_time),
-            "indices": base_signal.index,
-        }
-    except Exception:
-        return signal.copy(), pd.Series(np.zeros(len(signal), dtype=float), index=signal.index), info
+    order = np.argsort(anchor_times)
+    ordered_times = np.asarray(anchor_times, dtype=float)[order]
+    ordered_values = np.asarray(anchor_values, dtype=float)[order]
+    unique_times, inverse = np.unique(ordered_times, return_inverse=True)
+    unique_values = np.asarray(
+        [ordered_values[inverse == idx].mean() for idx in range(len(unique_times))],
+        dtype=float,
+    )
+    # np.interp is constant outside the anchor range. This avoids creating an
+    # artificial post-stimulus trend by extrapolating an early baseline spline.
+    baseline_vals = np.interp(
+        time_s.to_numpy(dtype=float),
+        unique_times,
+        unique_values,
+    )
+    baseline_series = pd.Series(baseline_vals, index=signal.index)
+    corrected = signal - baseline_series
+    info = {
+        "applied": True,
+        "time_points": pd.Series(unique_times),
+        "indices": signal[valid].index,
+    }
     return corrected, baseline_series, info
 
 

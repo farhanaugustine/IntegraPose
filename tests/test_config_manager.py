@@ -110,6 +110,7 @@ class TestConfigManager(unittest.TestCase):
         analytics_cfg.temporal_trends_visual_var.set("Cumulative Line")
         analytics_cfg.activity_budget_visual_var.set("Stacked + Violin")
         analytics_cfg.bout_timeline_visual_var.set("CSV + Gantt")
+        analytics_cfg.behavior_bout_class_mode_var.set("multi_label")
 
         config_dict = self.config_manager._gather_config_as_dict()
         self.assertIn("analytics", config_dict)
@@ -117,6 +118,10 @@ class TestConfigManager(unittest.TestCase):
         self.assertEqual(analytics_section["temporal_trends_visual_var"], "Cumulative Line")
         self.assertEqual(analytics_section["activity_budget_visual_var"], "Stacked + Violin")
         self.assertEqual(analytics_section["bout_timeline_visual_var"], "CSV + Gantt")
+        self.assertEqual(
+            analytics_section["behavior_bout_class_mode_var"],
+            "multi_label",
+        )
 
         new_config_manager = ConfigManager(self.app)
         new_config_manager._apply_config_from_dict(config_dict)
@@ -125,6 +130,15 @@ class TestConfigManager(unittest.TestCase):
         self.assertEqual(new_analytics_cfg.temporal_trends_visual_var.get(), "Cumulative Line")
         self.assertEqual(new_analytics_cfg.activity_budget_visual_var.get(), "Stacked + Violin")
         self.assertEqual(new_analytics_cfg.bout_timeline_visual_var.get(), "CSV + Gantt")
+        self.assertEqual(
+            new_analytics_cfg.behavior_bout_class_mode_var.get(),
+            "multi_label",
+        )
+
+    def test_accelerator_auto_selection_is_the_default(self):
+        self.assertEqual(self.config_manager.training.device_var.get(), "-1")
+        self.assertEqual(self.config_manager.inference.infer_device_var.get(), "-1")
+        self.assertEqual(self.config_manager.webcam.webcam_device_var.get(), "-1")
 
 
 if __name__ == '__main__':

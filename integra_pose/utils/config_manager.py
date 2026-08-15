@@ -4,6 +4,7 @@ import math
 from tkinter import filedialog, messagebox
 
 from integra_pose.utils.overlay_presets import DEFAULT_OVERLAY_ORDER
+from integra_pose.utils.operation_result import OperationResult
 
 DEFAULT_MOUSE_12_KEYPOINT_NAMES = (
     "Nose",
@@ -174,7 +175,7 @@ class ConfigManager:
             self.weight_decay_var = tk.StringVar(value="0.0005")
             self.label_smoothing_var = tk.StringVar(value="0.0")
             self.patience_var = tk.StringVar(value="50")
-            self.device_var = tk.StringVar(value="cpu")
+            self.device_var = tk.StringVar(value="-1")
             self.hsv_h_var = tk.StringVar(value="0.015")
             self.hsv_s_var = tk.StringVar(value="0.7")
             self.hsv_v_var = tk.StringVar(value="0.4")
@@ -208,11 +209,8 @@ class ConfigManager:
             self.conf_thres_var = tk.StringVar(value="0.25")
             self.iou_thres_var = tk.StringVar(value="0.45")
             self.infer_imgsz_var = tk.StringVar(value="640")
-            # Default to "-1" — Ultralytics' "auto-pick the best idle GPU"
-            # flag. On a CPU-only machine, falls through cleanly without
-            # the CUDA-pollution that an explicit "cpu" triggers in the
-            # tracker code path. Users with multi-GPU rigs or who want a
-            # specific device can still type "0", "cuda:1", "cpu", etc.
+            # -1 requests automatic backend selection; users can still choose
+            # an explicit index or force CPU when reproducibility requires it.
             self.infer_device_var = tk.StringVar(value="-1")
             self.infer_max_det_var = tk.StringVar(value="300")
             self.infer_line_width_var = tk.StringVar(value="")
@@ -337,6 +335,9 @@ class ConfigManager:
             self.roi_analytics_yaml_path_var = tk.StringVar()
             self.max_frame_gap_var = tk.StringVar(value="5")
             self.min_bout_duration_var = tk.StringVar(value="3")
+            self.behavior_bout_class_mode_var = tk.StringVar(
+                value="mutually_exclusive"
+            )
             self.roi_max_gap_frames_var = tk.StringVar(value="5")
             self.roi_min_dwell_frames_var = tk.StringVar(value="3")
             self.video_fps_var = tk.StringVar(value="30")
@@ -406,7 +407,7 @@ class ConfigManager:
             self.video_path = tk.StringVar()
             self.video_folder = tk.StringVar()
             self.output_dir = tk.StringVar()
-            self.extraction_mode = tk.StringVar(value="stride")  # stride|random|interactive
+            self.extraction_mode = tk.StringVar(value="stride")  # stride|random|time_balanced|motion_rich|hybrid|interactive
             self.stride = tk.IntVar(value=5)
             self.sample_count = tk.IntVar(value=100)
             # Batch crop
@@ -418,6 +419,8 @@ class ConfigManager:
             # Frame transfer
             self.transfer_source_root = tk.StringVar()
             self.transfer_dest_root = tk.StringVar()
+            self.transfer_operation = tk.StringVar(value="copy")
+            self.transfer_shorten_names = tk.BooleanVar(value=True)
             self.transfer_dry_run = tk.BooleanVar(value=False)
 
     class SeedsConfig:
@@ -714,7 +717,7 @@ class ConfigManager:
     def save_project(self, config_data=None):
         """Saves the project to the current project file path."""
         if not self.project_file_path:
-            self.save_project_as()
+            return self.save_project_as()
         else:
             try:
                 roi_manager = self._get_app_attr('roi_manager')
@@ -732,8 +735,13 @@ class ConfigManager:
 
                 safe_write_json(self.project_file_path, config_data, indent=4)
                 self._call_app_method("update_status", f"Project saved to {os.path.basename(self.project_file_path)}")
+                return OperationResult.success(
+                    "Project saved successfully.",
+                    project_path=str(self.project_file_path),
+                )
             except Exception as e:
                 messagebox.showerror("Save Error", f"Failed to save project file:\n{e}", parent=self._get_app_attr('root'))
+                return OperationResult.failure("Project save failed.", error=str(e))
 
     def save_project_as(self, config_data=None):
         """Opens a file dialog to save the project to a new file."""
@@ -743,7 +751,14 @@ class ConfigManager:
             defaultextension=".json",
             parent=self._get_app_attr('root')
         )
-        if path:
-            self.project_file_path = path
-            self.save_project(config_data)
+        if not path:
+            return OperationResult.cancel("Project save was cancelled.")
+
+        previous_path = self.project_file_path
+        self.project_file_path = path
+        result = self.save_project(config_data)
+        if result.succeeded:
             self._call_app_method("update_title")
+        else:
+            self.project_file_path = previous_path
+        return result

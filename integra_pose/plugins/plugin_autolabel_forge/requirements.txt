@@ -4,15 +4,9 @@
 #   pip install -r requirements.txt
 #   pip install -r integra_pose/plugins/plugin_autolabel_forge/requirements.txt
 #
-# AutoLabel Forge currently depends on the GroundingDINO autodistill path plus Roboflow /
-# transformers runtime pieces that are not guaranteed to stay stable as transitive deps.
-# Base IntegraPose already installs numpy, opencv-python, PyYAML, supervision, tqdm, and ultralytics.
+# The main package already provides NumPy, GUI-enabled OpenCV, PyYAML,
+# Supervision, tqdm, and Ultralytics. Do not add packages that force the
+# headless OpenCV wheel into this desktop environment.
 autodistill==0.1.29
 autodistill-grounding-dino==0.1.4
-roboflow==1.2.13
-# Pinned because roboflow 1.2.13 hard-pins idna==3.7. Without this line,
-# pip lets a newer idna land first and then complains about a conflict
-# during the AutoLabel Forge install. Safe to keep at this version —
-# nothing else in the stack uses idna features above 3.7.
-idna==3.7
 transformers==4.57.6

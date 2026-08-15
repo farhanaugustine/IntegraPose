@@ -23,27 +23,32 @@ labeling is needed once you have a working pose model.
 | --- | --- |
 | Stride length | Distance covered per stride per paw |
 | Stride duration | Time per stride |
-| Speed | Track speed in pixels / sec (convert to physical units post-hoc) |
+| Speed | Mean body speed in pixels / second, using the video's verified FPS |
+| Stride duration | Strike-to-strike elapsed time in seconds |
 | Step length / width | Inter-paw stride geometry |
 | Paw angle | Paw orientation relative to direction of travel |
-| Group comparisons | Per-group means, distributions, and statistical comparisons |
+| Group comparisons | Per-video means and distributions, so videos remain the independent units |
 
-All metrics are emitted in **pixels** by default - IntegraPose's
-standardized unit. Convert to physical units (mm, cm) using your own
-calibration after export.
+Distances are emitted in **pixels** by default. Time metrics use seconds,
+and `stride_speed` uses pixels/second. The frame-level export also retains
+explicit `*_px_per_frame` columns for thresholding and compatibility.
+Convert pixel distances and speeds to physical units only with a spatial
+calibration from the same recording geometry.
 
 ## What it does
 
 1. Reads the pose-track stream from a project, Tab 6 manifest, or batch run.
-2. Detects strides per paw using configurable rolling-window heuristics.
+2. Detects strides per paw using the selected threshold or peak-based method.
 3. Computes per-stride and per-track metrics.
-4. Renders a dashboard with per-group distributions and side-by-side comparisons.
+4. Renders side-by-side group comparisons after averaging repeated strides within each video.
 5. Exports CSVs ready for downstream statistics.
 
 ## Practical advice
 
 - Pose accuracy is the upstream constraint; if paw keypoints have low confidence, gait metrics will be noisy. Re-train or re-augment the pose model first.
-- The default rolling window assumes ~30 fps. Higher frame rates can use a longer window without losing temporal resolution.
+- Video FPS metadata must be valid. The analysis stops rather than reporting a per-second metric from an assumed frame rate.
+- Derivatives and phase transitions require consecutive frame numbers. A missing detection is exported as an unavailable derivative and an internally incomplete stride is excluded.
+- `start_frame` and `end_frame` are foot-strike endpoints. `stride_duration_frames` is `end_frame - start_frame`, not the inclusive row count.
 - Group videos by condition before importing so the dashboard's group comparisons line up with your study design.
 
 ## Where this fits in the GUI workflow

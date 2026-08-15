@@ -16,6 +16,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
 import seaborn as sns
 
@@ -847,6 +848,697 @@ def _collect_existing_analytics_figures(video_results: list[dict[str, Any]] | No
     return records
 
 
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return parsed if np.isfinite(parsed) else float(default)
+
+
+def _video_plot_context(video_result: dict[str, Any]) -> dict[str, Any]:
+    """Resolve plotting metadata from the per-video result and run manifest."""
+    manifest = _safe_read_json(video_result.get("run_manifest_json", ""))
+    inputs = manifest.get("inputs", {}) if isinstance(manifest.get("inputs"), dict) else {}
+    parameters = manifest.get("parameters", {}) if isinstance(manifest.get("parameters"), dict) else {}
+    video_meta = manifest.get("video", {}) if isinstance(manifest.get("video"), dict) else {}
+
+    roi_polygons = video_result.get("roi_polygons")
+    if not isinstance(roi_polygons, dict) or not roi_polygons:
+        roi_polygons = inputs.get("roi_polygons", {})
+    object_polygons = video_result.get("object_roi_polygons")
+    if not isinstance(object_polygons, dict) or not object_polygons:
+        object_polygons = inputs.get("object_roi_polygons", {})
+
+    source_video = str(video_result.get("video_path", "") or inputs.get("video_file", "") or "").strip()
+    return {
+        "fps": max(0.0, _finite_float(parameters.get("fps"), 0.0)),
+        "width": max(0, int(_finite_float(video_meta.get("width"), 0.0))),
+        "height": max(0, int(_finite_float(video_meta.get("height"), 0.0))),
+        "source_video": source_video,
+        "roi_polygons": roi_polygons if isinstance(roi_polygons, dict) else {},
+        "object_polygons": object_polygons if isinstance(object_polygons, dict) else {},
+        "interaction_distance_px": max(
+            0.0,
+            _finite_float(
+                video_result.get(
+                    "object_interaction_distance_px",
+                    parameters.get("object_interaction_distance_px", 0.0),
+                ),
+                0.0,
+            ),
+        ),
+    }
+
+
+def _load_background_frame(video_path: str) -> np.ndarray | None:
+    target = Path(str(video_path or "")).expanduser()
+    if not target.is_file():
+        return None
+    try:
+        import cv2
+
+        capture = cv2.VideoCapture(str(target))
+        try:
+            if not capture.isOpened():
+                return None
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if frame_count > 1:
+                capture.set(cv2.CAP_PROP_POS_FRAMES, float(frame_count // 2))
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                capture.set(cv2.CAP_PROP_POS_FRAMES, 0.0)
+                ok, frame = capture.read()
+            if not ok or frame is None:
+                return None
+            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        finally:
+            capture.release()
+    except Exception:
+        return None
+
+
+def _normalise_named_polygons(raw_map: Any) -> list[tuple[str, np.ndarray]]:
+    polygons: list[tuple[str, np.ndarray]] = []
+    if not isinstance(raw_map, dict):
+        return polygons
+    for raw_name, payload in raw_map.items():
+        if isinstance(payload, dict):
+            raw_polygons = payload.get("polygons")
+            if raw_polygons is None and payload.get("polygon") is not None:
+                raw_polygons = [payload.get("polygon")]
+        else:
+            raw_polygons = payload
+        if not isinstance(raw_polygons, (list, tuple)) or not raw_polygons:
+            continue
+        first = raw_polygons[0]
+        if isinstance(first, (list, tuple, np.ndarray)) and len(first) >= 2:
+            try:
+                first_x = float(first[0])
+                first_y = float(first[1])
+                if np.isfinite(first_x) and np.isfinite(first_y):
+                    raw_polygons = [raw_polygons]
+            except (TypeError, ValueError, IndexError):
+                pass
+        for raw_polygon in raw_polygons:
+            try:
+                points = np.asarray(raw_polygon, dtype=float)
+            except (TypeError, ValueError):
+                continue
+            if points.ndim != 2 or points.shape[0] < 3 or points.shape[1] < 2:
+                continue
+            points = points[:, :2]
+            if not np.isfinite(points).all():
+                continue
+            polygons.append((str(raw_name), points))
+    return polygons
+
+
+def _prepare_trajectory(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    if metrics_df is None or metrics_df.empty or "frame" not in metrics_df.columns:
+        return pd.DataFrame()
+    coordinate_pair = next(
+        (
+            pair
+            for pair in (
+                ("anchor_x_px", "anchor_y_px"),
+                ("centroid_x_px", "centroid_y_px"),
+                ("center_x_px", "center_y_px"),
+            )
+            if set(pair).issubset(metrics_df.columns)
+        ),
+        None,
+    )
+    if coordinate_pair is None:
+        return pd.DataFrame()
+
+    track_column = "object_id" if "object_id" in metrics_df.columns else "track_id" if "track_id" in metrics_df.columns else ""
+    output = pd.DataFrame(index=metrics_df.index)
+    output["frame"] = pd.to_numeric(metrics_df["frame"], errors="coerce")
+    output["x"] = pd.to_numeric(metrics_df[coordinate_pair[0]], errors="coerce")
+    output["y"] = pd.to_numeric(metrics_df[coordinate_pair[1]], errors="coerce")
+    output["track"] = metrics_df[track_column].fillna(0).astype(str) if track_column else "0"
+    output["speed"] = (
+        pd.to_numeric(metrics_df["movement_speed_px_per_frame"], errors="coerce")
+        if "movement_speed_px_per_frame" in metrics_df.columns
+        else np.nan
+    )
+    output["path_length"] = (
+        pd.to_numeric(metrics_df["total_path_length_px"], errors="coerce")
+        if "total_path_length_px" in metrics_df.columns
+        else np.nan
+    )
+    output = output.dropna(subset=["frame", "x", "y"])
+    if output.empty:
+        return output
+    finite_mask = np.isfinite(output[["frame", "x", "y"]].to_numpy(dtype=float)).all(axis=1)
+    output = output.loc[finite_mask].copy()
+    output["frame"] = output["frame"].astype(int)
+    return output.sort_values(["track", "frame"], kind="stable").reset_index(drop=True)
+
+
+def _trajectory_segments(track_df: pd.DataFrame, *, max_gap_frames: int = 1) -> tuple[np.ndarray, np.ndarray]:
+    if len(track_df.index) < 2:
+        return np.empty((0, 2, 2), dtype=float), np.empty((0,), dtype=int)
+    points = track_df[["x", "y"]].to_numpy(dtype=float)
+    frames = track_df["frame"].to_numpy(dtype=int)
+    frame_delta = np.diff(frames)
+    left_indices = np.flatnonzero((frame_delta >= 1) & (frame_delta <= max(1, int(max_gap_frames))))
+    if not len(left_indices):
+        return np.empty((0, 2, 2), dtype=float), left_indices
+    return np.stack((points[left_indices], points[left_indices + 1]), axis=1), left_indices
+
+
+def _spatial_dimensions(
+    trajectory: pd.DataFrame,
+    context: dict[str, Any],
+    background: np.ndarray | None,
+) -> tuple[int, int]:
+    if background is not None:
+        height, width = background.shape[:2]
+        return max(1, int(width)), max(1, int(height))
+    width = int(context.get("width", 0) or 0)
+    height = int(context.get("height", 0) or 0)
+    if width <= 0 and not trajectory.empty:
+        width = int(np.ceil(float(trajectory["x"].max()))) + 10
+    if height <= 0 and not trajectory.empty:
+        height = int(np.ceil(float(trajectory["y"].max()))) + 10
+    return max(1, width), max(1, height)
+
+
+def _draw_interaction_zone(
+    ax: plt.Axes,
+    *,
+    object_polygons: list[tuple[str, np.ndarray]],
+    threshold_px: float,
+    width: int,
+    height: int,
+) -> bool:
+    if threshold_px <= 0.0 or not object_polygons or width <= 0 or height <= 0:
+        return False
+    try:
+        import cv2
+
+        mask = np.zeros((height, width), dtype=np.uint8)
+        for _name, polygon in object_polygons:
+            clipped = np.rint(polygon).astype(np.int32)
+            cv2.fillPoly(mask, [clipped.reshape((-1, 1, 2))], 255)
+        outside = (mask == 0).astype(np.uint8)
+        distance = cv2.distanceTransform(outside, cv2.DIST_L2, 5)
+        zone = (mask == 0) & (distance <= float(threshold_px))
+        if not zone.any():
+            return False
+        rgba = np.zeros((height, width, 4), dtype=np.uint8)
+        rgba[zone] = (249, 115, 22, 62)
+        ax.imshow(rgba, origin="upper", zorder=2)
+        return True
+    except Exception:
+        return False
+
+
+def _draw_spatial_context(
+    ax: plt.Axes,
+    *,
+    trajectory: pd.DataFrame,
+    context: dict[str, Any],
+    background: np.ndarray | None,
+) -> tuple[int, int]:
+    width, height = _spatial_dimensions(trajectory, context, background)
+    if background is not None:
+        ax.imshow(background, origin="upper", zorder=0)
+    else:
+        ax.set_facecolor("#f8fafc")
+
+    roi_polygons = _normalise_named_polygons(context.get("roi_polygons", {}))
+    object_polygons = _normalise_named_polygons(context.get("object_polygons", {}))
+    threshold_drawn = _draw_interaction_zone(
+        ax,
+        object_polygons=object_polygons,
+        threshold_px=float(context.get("interaction_distance_px", 0.0) or 0.0),
+        width=width,
+        height=height,
+    )
+    for name, polygon in roi_polygons:
+        closed = np.vstack((polygon, polygon[0]))
+        ax.plot(closed[:, 0], closed[:, 1], color="#06b6d4", linewidth=1.6, linestyle="--", zorder=6)
+        center = polygon.mean(axis=0)
+        ax.text(center[0], center[1], name, color="#083344", fontsize=7.5, ha="center", va="center", zorder=8,
+                bbox={"facecolor": "white", "edgecolor": "#06b6d4", "alpha": 0.78, "pad": 1.5})
+    for name, polygon in object_polygons:
+        closed = np.vstack((polygon, polygon[0]))
+        ax.plot(closed[:, 0], closed[:, 1], color="#e11d48", linewidth=2.0, zorder=7)
+        center = polygon.mean(axis=0)
+        ax.text(center[0], center[1], name, color="#881337", fontsize=7.5, ha="center", va="center", zorder=8,
+                bbox={"facecolor": "white", "edgecolor": "#e11d48", "alpha": 0.82, "pad": 1.5})
+
+    legend_handles: list[Line2D] = []
+    if roi_polygons:
+        legend_handles.append(Line2D([0], [0], color="#06b6d4", linewidth=1.6, linestyle="--", label="Arena ROI"))
+    if object_polygons:
+        legend_handles.append(Line2D([0], [0], color="#e11d48", linewidth=2.0, label="Object placement"))
+    if threshold_drawn:
+        threshold = float(context.get("interaction_distance_px", 0.0) or 0.0)
+        legend_handles.append(Line2D([0], [0], color="#f97316", linewidth=6.0, alpha=0.45, label=f"Interaction zone ({threshold:g}px)"))
+    if legend_handles:
+        ax.legend(handles=legend_handles, loc="upper right", frameon=True, framealpha=0.82, fontsize=7.5)
+    ax.set_xlim(0, width)
+    ax.set_ylim(height, 0)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_axis_off()
+    return width, height
+
+
+def _save_individual_figure(
+    fig: plt.Figure,
+    *,
+    video_result: dict[str, Any],
+    output_root: Path,
+    suffix: str,
+    figure_type: str,
+    title: str,
+    metric: str = "",
+) -> list[dict[str, str]]:
+    video_key = f"{video_result.get('video_id', '')}_{video_result.get('video_name', '')}"
+    base_path = output_root / f"{_slugify(video_key)}_{suffix}"
+    return [
+        _manifest_row(
+            scope="individual",
+            figure_type=figure_type,
+            metric=metric,
+            video_id=str(video_result.get("video_id", "") or ""),
+            video_name=str(video_result.get("video_name", "") or ""),
+            group=str(video_result.get("group", "") or ""),
+            subject_id=str(video_result.get("subject_id", "") or ""),
+            time_point=str(video_result.get("time_point", "") or ""),
+            title=title,
+            source="batch_spatial_kinematics",
+            path=saved_path,
+        )
+        for saved_path in _save_figure(fig, base_path)
+    ]
+
+
+def _render_path_trace_figure(
+    trajectory: pd.DataFrame,
+    *,
+    video_result: dict[str, Any],
+    output_root: Path,
+    context: dict[str, Any],
+    background: np.ndarray | None,
+) -> list[dict[str, str]]:
+    if trajectory.empty:
+        return []
+    fig, ax = plt.subplots(figsize=(11.5, 7.5))
+    _draw_spatial_context(ax, trajectory=trajectory, context=context, background=background)
+
+    fps = float(context.get("fps", 0.0) or 0.0)
+    all_frames = trajectory["frame"].to_numpy(dtype=float)
+    all_time = all_frames / fps if fps > 0.0 else all_frames
+    value_min = float(np.nanmin(all_time))
+    value_max = float(np.nanmax(all_time))
+    if value_max <= value_min:
+        value_min -= 0.5
+        value_max += 0.5
+    norm = matplotlib.colors.Normalize(vmin=value_min, vmax=value_max)
+    cmap = plt.get_cmap("turbo")
+    has_trace = False
+    for _track, group in trajectory.groupby("track", sort=False):
+        group = group.sort_values("frame", kind="stable").reset_index(drop=True)
+        segments, left_indices = _trajectory_segments(group, max_gap_frames=1)
+        if len(segments):
+            frames = group["frame"].to_numpy(dtype=float)
+            segment_values = (frames[left_indices] + frames[left_indices + 1]) / 2.0
+            if fps > 0.0:
+                segment_values = segment_values / fps
+            collection = LineCollection(
+                segments,
+                cmap=cmap,
+                norm=norm,
+                linewidths=2.1,
+                alpha=0.9,
+                capstyle="round",
+                joinstyle="round",
+                zorder=5,
+            )
+            collection.set_array(segment_values)
+            ax.add_collection(collection)
+            has_trace = True
+        else:
+            point_values = group["frame"].to_numpy(dtype=float)
+            if fps > 0.0:
+                point_values = point_values / fps
+            ax.scatter(group["x"], group["y"], c=point_values, cmap=cmap, norm=norm, s=14, zorder=5)
+            has_trace = True
+        first = group.iloc[0]
+        last = group.iloc[-1]
+        ax.scatter([first["x"]], [first["y"]], color="#22c55e", edgecolor="white", s=42, zorder=9)
+        ax.scatter([last["x"]], [last["y"]], color="#ef4444", edgecolor="white", s=42, zorder=9)
+
+    if has_trace:
+        scalar_map = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        scalar_map.set_array([])
+        colorbar = fig.colorbar(scalar_map, ax=ax, fraction=0.035, pad=0.025)
+        colorbar.set_label("Time (s)" if fps > 0.0 else "Frame")
+    title = str(video_result.get("video_name", "") or video_result.get("video_id", "") or "Video")
+    ax.set_title(
+        f"{title} | Thorax/anchor path through time\nGreen = start, red = end; gaps longer than one frame are not connected",
+        loc="left",
+        fontweight="bold",
+    )
+    fig.tight_layout()
+    return _save_individual_figure(
+        fig,
+        video_result=video_result,
+        output_root=output_root,
+        suffix="path_trace",
+        figure_type="path_trace",
+        title=f"{title} path trace",
+        metric="anchor_position_px",
+    )
+
+
+def _render_speed_dwell_path_figure(
+    trajectory: pd.DataFrame,
+    *,
+    video_result: dict[str, Any],
+    output_root: Path,
+    context: dict[str, Any],
+    background: np.ndarray | None,
+) -> list[dict[str, str]]:
+    if trajectory.empty or trajectory["speed"].notna().sum() == 0:
+        return []
+    fig, ax = plt.subplots(figsize=(11.8, 7.6))
+    width, _height = _draw_spatial_context(ax, trajectory=trajectory, context=context, background=background)
+
+    density = ax.hexbin(
+        trajectory["x"].to_numpy(dtype=float),
+        trajectory["y"].to_numpy(dtype=float),
+        gridsize=max(12, int(width // 60)),
+        mincnt=1,
+        cmap="Greys",
+        alpha=0.32,
+        zorder=3,
+    )
+    finite_speeds = trajectory.loc[trajectory["speed"].notna(), "speed"].to_numpy(dtype=float)
+    finite_speeds = finite_speeds[np.isfinite(finite_speeds)]
+    if not len(finite_speeds):
+        plt.close(fig)
+        return []
+    speed_min, speed_max = np.nanpercentile(finite_speeds, [2.0, 98.0])
+    if speed_max <= speed_min:
+        padding = max(0.5, abs(float(speed_min)) * 0.05)
+        speed_min = max(0.0, float(speed_min) - padding)
+        speed_max = float(speed_max) + padding
+    speed_norm = matplotlib.colors.Normalize(vmin=float(speed_min), vmax=float(speed_max), clip=True)
+    cmap = plt.get_cmap("viridis")
+    trace_drawn = False
+    for _track, group in trajectory.groupby("track", sort=False):
+        group = group.sort_values("frame", kind="stable").reset_index(drop=True)
+        segments, left_indices = _trajectory_segments(group, max_gap_frames=1)
+        if len(segments):
+            speeds = group["speed"].to_numpy(dtype=float)
+            segment_speeds = (speeds[left_indices] + speeds[left_indices + 1]) / 2.0
+            finite = np.isfinite(segment_speeds)
+            if finite.any():
+                collection = LineCollection(
+                    segments[finite],
+                    cmap=cmap,
+                    norm=speed_norm,
+                    linewidths=2.2,
+                    alpha=0.92,
+                    capstyle="round",
+                    joinstyle="round",
+                    zorder=5,
+                )
+                collection.set_array(segment_speeds[finite])
+                ax.add_collection(collection)
+                trace_drawn = True
+        if not len(segments):
+            finite = group["speed"].notna().to_numpy()
+            if finite.any():
+                ax.scatter(
+                    group.loc[finite, "x"],
+                    group.loc[finite, "y"],
+                    c=group.loc[finite, "speed"],
+                    cmap=cmap,
+                    norm=speed_norm,
+                    s=13,
+                    zorder=5,
+                )
+                trace_drawn = True
+    if not trace_drawn:
+        plt.close(fig)
+        return []
+
+    speed_map = plt.cm.ScalarMappable(cmap=cmap, norm=speed_norm)
+    speed_map.set_array([])
+    speed_bar = fig.colorbar(speed_map, ax=ax, fraction=0.035, pad=0.025)
+    speed_bar.set_label("Speed (px/frame)")
+    density_bar = fig.colorbar(density, ax=ax, fraction=0.035, pad=0.075)
+    density_bar.set_label("Retained positions per spatial bin")
+
+    title = str(video_result.get("video_name", "") or video_result.get("video_id", "") or "Video")
+    ax.set_title(
+        f"{title} | Speed-coded path and dwell density\nGray density shows repeated occupancy; path color shows instantaneous speed",
+        loc="left",
+        fontweight="bold",
+    )
+    fig.tight_layout()
+    return _save_individual_figure(
+        fig,
+        video_result=video_result,
+        output_root=output_root,
+        suffix="path_speed_dwell",
+        figure_type="path_speed_trace",
+        title=f"{title} speed-coded path and dwell density",
+        metric="movement_speed_px_per_frame",
+    )
+
+
+def _render_kinematic_timeseries_figure(
+    trajectory: pd.DataFrame,
+    *,
+    video_result: dict[str, Any],
+    output_root: Path,
+    context: dict[str, Any],
+) -> list[dict[str, str]]:
+    if trajectory.empty or trajectory["speed"].notna().sum() == 0:
+        return []
+    fps = float(context.get("fps", 0.0) or 0.0)
+    rolling_window = max(3, int(round(fps * 0.5))) if fps > 0.0 else 15
+    fig, (ax_speed, ax_path) = plt.subplots(2, 1, figsize=(12.0, 7.2), sharex=True)
+    colors = sns.color_palette("tab10", n_colors=max(1, trajectory["track"].nunique()))
+    path_plotted = False
+    for color, (track, group) in zip(colors, trajectory.groupby("track", sort=False)):
+        group = group.sort_values("frame", kind="stable").reset_index(drop=True)
+        x_values = group["frame"].to_numpy(dtype=float)
+        if fps > 0.0:
+            x_values = x_values / fps
+        speeds = group["speed"]
+        smooth = speeds.rolling(rolling_window, center=True, min_periods=1).median()
+        label = f"Track {track}" if trajectory["track"].nunique() > 1 else "Raw speed"
+        ax_speed.plot(x_values, speeds, color=color, linewidth=0.7, alpha=0.26, label=label)
+        smooth_label = f"Track {track} rolling median" if trajectory["track"].nunique() > 1 else "0.5 s rolling median" if fps > 0.0 else f"{rolling_window}-frame rolling median"
+        ax_speed.plot(x_values, smooth, color=color, linewidth=1.7, alpha=0.95, label=smooth_label)
+
+        path_length = group["path_length"]
+        if path_length.notna().any():
+            ax_path.plot(x_values, path_length, color=color, linewidth=1.7, label=f"Track {track}")
+            path_plotted = True
+
+    ax_speed.set_ylabel("Speed (px/frame)")
+    ax_speed.set_title("Instantaneous and smoothed speed", loc="left", fontweight="bold")
+    ax_speed.legend(loc="upper right", fontsize=8, ncol=2)
+    if path_plotted:
+        ax_path.set_ylabel("Cumulative path length (px)")
+        ax_path.set_title("Distance travelled", loc="left", fontweight="bold")
+        if trajectory["track"].nunique() > 1:
+            ax_path.legend(loc="upper left", fontsize=8)
+    else:
+        ax_path.axis("off")
+        ax_path.text(0.0, 0.5, "Cumulative path length was not available.", color="#64748b")
+    ax_path.set_xlabel("Time (s)" if fps > 0.0 else "Frame")
+    title = str(video_result.get("video_name", "") or video_result.get("video_id", "") or "Video")
+    fig.suptitle(f"{title} | Locomotor kinematics", x=0.07, y=0.995, ha="left", fontweight="bold")
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.97])
+    return _save_individual_figure(
+        fig,
+        video_result=video_result,
+        output_root=output_root,
+        suffix="kinematic_timeseries",
+        figure_type="kinematic_timeseries",
+        title=f"{title} locomotor kinematics",
+        metric="movement_speed_px_per_frame,total_path_length_px",
+    )
+
+
+def _draw_dwell_distribution(
+    ax: plt.Axes,
+    dwell_df: pd.DataFrame,
+    *,
+    name_column: str,
+    summary_df: pd.DataFrame,
+) -> None:
+    if not dwell_df.empty and {name_column, "Duration (s)"}.issubset(dwell_df.columns):
+        work = dwell_df[[name_column, "Duration (s)"]].copy()
+        work[name_column] = work[name_column].fillna("").astype(str).str.strip()
+        work["Duration (s)"] = pd.to_numeric(work["Duration (s)"], errors="coerce")
+        work = work[(work[name_column] != "") & work["Duration (s)"].notna()]
+        groups = [(name, values["Duration (s)"].to_numpy(dtype=float)) for name, values in work.groupby(name_column, sort=True)]
+        groups = [(name, values[np.isfinite(values)]) for name, values in groups if len(values)]
+        if groups:
+            labels = [name for name, _values in groups]
+            values = [samples for _name, samples in groups]
+            boxes = ax.boxplot(values, vert=False, labels=labels, patch_artist=True, showfliers=False)
+            for patch in boxes["boxes"]:
+                patch.set_facecolor("#c4b5fd")
+                patch.set_alpha(0.75)
+            for index, samples in enumerate(values, start=1):
+                offsets = np.linspace(-0.12, 0.12, len(samples)) if len(samples) > 1 else np.asarray([0.0])
+                ax.scatter(samples, index + offsets, s=13, color="#6d28d9", alpha=0.58, zorder=4)
+            ax.set_xlabel("Visit duration (s)")
+            ax.set_ylabel("")
+            ax.set_title("Individual dwell events", loc="left", fontweight="bold")
+            return
+
+    median_column = next(
+        (column for column in ("Median Dwell Duration (s)", "Mean Dwell Duration (s)") if column in summary_df.columns),
+        "",
+    )
+    if median_column and name_column in summary_df.columns:
+        work = summary_df[[name_column, median_column]].copy()
+        work[median_column] = pd.to_numeric(work[median_column], errors="coerce")
+        work = work.dropna(subset=[median_column])
+        if not work.empty:
+            ax.barh(work[name_column].astype(str), work[median_column], color="#8b5cf6")
+            ax.set_xlabel(_display_label(median_column))
+            ax.set_title("Dwell-duration summary", loc="left", fontweight="bold")
+            return
+    ax.axis("off")
+    ax.text(0.0, 0.55, "No dwell-event durations available", color="#64748b")
+
+
+def _render_roi_dwell_figure(
+    roi_df: pd.DataFrame,
+    dwell_df: pd.DataFrame,
+    *,
+    video_result: dict[str, Any],
+    output_root: Path,
+) -> list[dict[str, str]]:
+    if roi_df.empty and not dwell_df.empty and {"ROI Name", "Duration (s)"}.issubset(dwell_df.columns):
+        roi_df = dwell_df.groupby("ROI Name", as_index=False)["Duration (s)"].sum().rename(columns={"Duration (s)": "Time in ROI (s)"})
+    if roi_df.empty or "ROI Name" not in roi_df.columns:
+        return []
+    value_column = "Time in ROI (s)" if "Time in ROI (s)" in roi_df.columns else "Entries" if "Entries" in roi_df.columns else ""
+    if not value_column:
+        return []
+    work = roi_df[["ROI Name", value_column]].copy()
+    work[value_column] = pd.to_numeric(work[value_column], errors="coerce")
+    work["ROI Name"] = work["ROI Name"].fillna("").astype(str).str.strip()
+    work = work[(work["ROI Name"] != "") & work[value_column].notna()]
+    if work.empty:
+        return []
+    work = work.groupby("ROI Name", as_index=False)[value_column].sum().sort_values(value_column, ascending=True)
+
+    fig, (ax_total, ax_dwell) = plt.subplots(1, 2, figsize=(12.2, max(5.2, 0.45 * len(work.index) + 3.2)))
+    ax_total.barh(work["ROI Name"], work[value_column], color="#0891b2")
+    ax_total.set_xlabel(value_column)
+    ax_total.set_ylabel("Arm / arena ROI")
+    ax_total.set_title("Exclusive time allocation" if value_column == "Time in ROI (s)" else "ROI entries", loc="left", fontweight="bold")
+    for row_index, value in enumerate(work[value_column].to_numpy(dtype=float)):
+        ax_total.text(value, row_index, f" {value:.2f}", va="center", fontsize=8)
+    _draw_dwell_distribution(ax_dwell, dwell_df, name_column="ROI Name", summary_df=roi_df)
+
+    title = str(video_result.get("video_name", "") or video_result.get("video_id", "") or "Video")
+    fig.suptitle(
+        f"{title} | Arm/ROI occupancy and dwell times\nExclusive primary ROI assignment prevents overlapping arms from double-counting time",
+        x=0.05,
+        y=0.995,
+        ha="left",
+        fontweight="bold",
+    )
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.94])
+    return _save_individual_figure(
+        fig,
+        video_result=video_result,
+        output_root=output_root,
+        suffix="roi_dwell_profile",
+        figure_type="roi_dwell_profile",
+        title=f"{title} ROI occupancy and dwell times",
+        metric=value_column,
+    )
+
+
+def _render_object_interaction_figure(
+    object_df: pd.DataFrame,
+    dwell_df: pd.DataFrame,
+    *,
+    video_result: dict[str, Any],
+    output_root: Path,
+    context: dict[str, Any],
+) -> list[dict[str, str]]:
+    if object_df.empty and not dwell_df.empty and {"Object ROI", "Duration (s)"}.issubset(dwell_df.columns):
+        object_df = dwell_df.groupby("Object ROI", as_index=False)["Duration (s)"].sum().rename(columns={"Duration (s)": "Time Interacting (s)"})
+    if object_df.empty or "Object ROI" not in object_df.columns:
+        return []
+    time_columns = [
+        column
+        for column in ("Time Contact (s)", "Time Proximity Only (s)", "Time Interacting (s)")
+        if column in object_df.columns
+    ]
+    if not time_columns:
+        return []
+    work = object_df[["Object ROI", *time_columns]].copy()
+    work["Object ROI"] = work["Object ROI"].fillna("").astype(str).str.strip()
+    for column in time_columns:
+        work[column] = pd.to_numeric(work[column], errors="coerce").fillna(0.0)
+    work = work[work["Object ROI"] != ""]
+    if work.empty:
+        return []
+    work = work.groupby("Object ROI", as_index=False)[time_columns].sum()
+    if "Time Interacting (s)" in work.columns:
+        work = work.sort_values("Time Interacting (s)", ascending=True)
+    else:
+        work["_total"] = work[time_columns].sum(axis=1)
+        work = work.sort_values("_total", ascending=True)
+
+    fig, (ax_total, ax_dwell) = plt.subplots(1, 2, figsize=(12.2, max(5.2, 0.45 * len(work.index) + 3.2)))
+    names = work["Object ROI"].astype(str).tolist()
+    if {"Time Contact (s)", "Time Proximity Only (s)"}.issubset(work.columns):
+        contact = work["Time Contact (s)"].to_numpy(dtype=float)
+        proximity = work["Time Proximity Only (s)"].to_numpy(dtype=float)
+        ax_total.barh(names, contact, color="#e11d48", label="Contact / inside object ROI")
+        ax_total.barh(names, proximity, left=contact, color="#fb923c", label="Near object only")
+        ax_total.legend(loc="lower right", fontsize=8)
+    else:
+        total_column = "Time Interacting (s)" if "Time Interacting (s)" in work.columns else time_columns[0]
+        ax_total.barh(names, work[total_column], color="#f43f5e")
+    ax_total.set_xlabel("Time (s)")
+    ax_total.set_ylabel("Petri dish / object ROI")
+    ax_total.set_title("Object interaction time", loc="left", fontweight="bold")
+    _draw_dwell_distribution(ax_dwell, dwell_df, name_column="Object ROI", summary_df=object_df)
+
+    threshold = float(context.get("interaction_distance_px", 0.0) or 0.0)
+    title = str(video_result.get("video_name", "") or video_result.get("video_id", "") or "Video")
+    fig.suptitle(
+        f"{title} | Petri-dish/object interaction and dwell\nNear-object threshold: {threshold:g}px from the placed object boundary",
+        x=0.05,
+        y=0.995,
+        ha="left",
+        fontweight="bold",
+    )
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.94])
+    return _save_individual_figure(
+        fig,
+        video_result=video_result,
+        output_root=output_root,
+        suffix="object_interaction_profile",
+        figure_type="object_interaction_profile",
+        title=f"{title} object interaction and dwell",
+        metric="Time Interacting (s)",
+    )
+
+
 def render_video_quicklook_bundle(
     video_result: dict[str, Any],
     *,
@@ -858,12 +1550,24 @@ def render_video_quicklook_bundle(
     summary_df = _safe_read_csv(video_result.get("summary_bouts_csv", ""))
     detailed_df = _safe_read_csv(video_result.get("detailed_bouts_csv", ""))
     roi_df = _safe_read_csv(video_result.get("roi_overview_csv", ""))
+    roi_dwell_df = _safe_read_csv(video_result.get("roi_dwell_events_csv", ""))
     object_df = _safe_read_csv(video_result.get("object_interactions_csv", ""))
+    object_dwell_df = _safe_read_csv(video_result.get("object_dwell_events_csv", ""))
+    trajectory_df = _prepare_trajectory(_safe_read_csv(video_result.get("metrics_csv", "")))
     metrics_df = _safe_read_csv(video_result.get("metrics_summary_by_track_csv", ""))
     if metrics_df.empty:
         metrics_df = _safe_read_csv(video_result.get("metrics_csv", ""))
 
-    if summary_df.empty and detailed_df.empty and roi_df.empty and object_df.empty and metrics_df.empty:
+    if (
+        summary_df.empty
+        and detailed_df.empty
+        and roi_df.empty
+        and roi_dwell_df.empty
+        and object_df.empty
+        and object_dwell_df.empty
+        and metrics_df.empty
+        and trajectory_df.empty
+    ):
         return []
 
     _apply_publication_theme()
@@ -1020,6 +1724,51 @@ def render_video_quicklook_bundle(
                 path=saved_path,
             )
         )
+    context = _video_plot_context(video_result)
+    background = _load_background_frame(str(context.get("source_video", "") or "")) if not trajectory_df.empty else None
+    records.extend(
+        _render_path_trace_figure(
+            trajectory_df,
+            video_result=video_result,
+            output_root=output_root,
+            context=context,
+            background=background,
+        )
+    )
+    records.extend(
+        _render_speed_dwell_path_figure(
+            trajectory_df,
+            video_result=video_result,
+            output_root=output_root,
+            context=context,
+            background=background,
+        )
+    )
+    records.extend(
+        _render_kinematic_timeseries_figure(
+            trajectory_df,
+            video_result=video_result,
+            output_root=output_root,
+            context=context,
+        )
+    )
+    records.extend(
+        _render_roi_dwell_figure(
+            roi_df,
+            roi_dwell_df,
+            video_result=video_result,
+            output_root=output_root,
+        )
+    )
+    records.extend(
+        _render_object_interaction_figure(
+            object_df,
+            object_dwell_df,
+            video_result=video_result,
+            output_root=output_root,
+            context=context,
+        )
+    )
     return records
 
 
@@ -2220,6 +2969,11 @@ def _build_assay_figure_index(
         "group_stats_overview",
         "video_summary_profile",
         "video_quicklook",
+        "path_trace",
+        "path_speed_trace",
+        "kinematic_timeseries",
+        "roi_dwell_profile",
+        "object_interaction_profile",
         "group_distribution",
         "timecourse",
         "omnibus_heatmap",
@@ -2244,7 +2998,12 @@ def _build_assay_figure_index(
         "module_temporal_trend": 19,
         "module_activity_budget": 20,
         "video_quicklook": 30,
-        "video_summary_profile": 31,
+        "path_trace": 31,
+        "path_speed_trace": 32,
+        "kinematic_timeseries": 33,
+        "roi_dwell_profile": 34,
+        "object_interaction_profile": 35,
+        "video_summary_profile": 36,
         "existing_analytics_plot": 40,
     }
 

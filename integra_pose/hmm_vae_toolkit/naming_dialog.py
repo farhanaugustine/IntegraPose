@@ -1,22 +1,15 @@
-"""ADP-4 Commit G — Cluster naming dialog (per-class sub-cluster naming).
+"""Cluster naming dialog for per-class sub-clusters.
 
-Per the user's locked design (2026-04-26):
-
-  * 3-frame strips per bout (start / middle / end) — disambiguates motion
-    without needing video playback.
-  * 9 longest bouts per sub-cluster, laid out as a 3×3 grid of triptychs.
-  * Names persist to ``state_names.json`` next to the run output.
-  * No video playback in v1 (Commit H is the optional follow-up).
+The dialog displays start, middle, and end frames for up to nine of the
+longest bouts in each sub-cluster. Names are stored in ``state_names.json``
+next to the run output.
 
 The dialog walks the user through one sub-cluster at a time. They type a
 name (or skip), click "Save & Next", and on "Save & Close" the entire
 ``state_names.json`` is written. Existing names from a prior run are
 loaded so re-opening the dialog continues where they left off.
 
-The dialog is intentionally lightweight: synchronous frame extraction
-(takes a few seconds per cluster), single-pane layout, no fancy
-animations. Sufficient for the user's stated mission ("ease of use") and
-does not require us to manage a thread pool / Tk-safe image cache.
+Frame extraction is synchronous and the interface uses a single-pane layout.
 """
 
 from __future__ import annotations
@@ -46,13 +39,11 @@ GRID_COLS = 3
 def load_state_names(output_folder: str, expected_run_id: Optional[str] = None) -> dict:
     """Read ``state_names.json`` from ``output_folder``, honouring run_id.
 
-    When ``expected_run_id`` is provided AND the file's stored ``run_id``
-    is non-empty AND they don't match, return ``{}`` and log a warning —
-    cluster ids likely mean different things between runs.
-
-    A file without a ``run_id`` field (older schema v1 saves) is loaded
-    unconditionally — the user's previous workflow shouldn't break just
-    because we added the field.
+    When ``expected_run_id`` is provided, the stored ``run_id`` must match.
+    A missing or conflicting identifier returns ``{}`` and logs a warning
+    because cluster ids can mean different things between runs. Legacy files
+    remain readable when the caller does not supply a current run id, but are
+    never applied automatically to a known new run.
     """
     if not output_folder:
         return {}
@@ -70,13 +61,8 @@ def load_state_names(output_folder: str, expected_run_id: Optional[str] = None) 
         return {}
     file_run_id = str(payload.get("run_id") or "").strip()
     expected = str(expected_run_id or "").strip()
-    # Stale-state guard. The previous check only treated the file as stale
-    # when BOTH ids were present and differed. That left a hole: an older
-    # state_names.json without a run_id field would be loaded for a
-    # brand-new run and silently apply names to clusters that may have
-    # shifted (different parameters, different data, different cluster IDs).
-    # Now we require an exact match whenever the caller supplies an
-    # expected_run_id; missing or mismatched file ids both count as stale.
+    # Require exact provenance whenever the caller knows the current run.
+    # Missing and mismatched file ids are both scientifically ambiguous.
     if expected:
         if not file_run_id or file_run_id != expected:
             logger.warning(
@@ -98,7 +84,7 @@ class ClusterNamingDialog(tk.Toplevel):
             otherwise alphabetical for stability.
 
     The dialog uses the cached ``last_sub_behavior_result`` from
-    BehaviorAnalysisApp, plus the optional signal_report (Commit F)
+    BehaviorAnalysisApp, plus the optional signal report,
     so users can name strongest candidates first.
     """
 
@@ -124,7 +110,7 @@ class ClusterNamingDialog(tk.Toplevel):
         self._class_names = class_names or {}
         self._output_folder = output_folder or "."
         self._on_close_callback = on_close
-        # ADP-4: per-run UUID. When set, ``state_names.json`` is stamped
+        # Per-run UUID. When set, ``state_names.json`` is stamped
         # with it; the loader skips a names file whose run_id doesn't
         # match (different params → different clusters → stale names).
         self._run_id = str(run_id) if run_id else ""

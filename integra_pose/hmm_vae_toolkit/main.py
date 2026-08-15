@@ -11,10 +11,7 @@ from collections import defaultdict, Counter
 
 import pandas as pd
 import numpy as np
-import umap
-import hdbscan
 import cv2
-from scipy.spatial.distance import pdist, squareform
 from jsonschema import ValidationError, Draft7Validator
 
 from integra_pose.gui.windowing import apply_adaptive_window_geometry
@@ -24,9 +21,6 @@ from integra_pose.gui.theme import (
     INLINE_BOLD_FONT,
     MUTED_FG,
 )
-
-from .data_processing_hdbscan import read_detections as helper_read_detections
-
 
 logger = logging.getLogger(__name__)
 
@@ -235,27 +229,65 @@ def validate_roi_definitions(roi_definitions):
 def compute_feature_vectors(detections_df, keypoint_names, conf_threshold,
                             normalization_ref_points=('left_shoulder', 'right_shoulder'),
                             use_bbox=False, location_mode='none', location_grid_size=50, 
-                            roi_definitions=None, social_mode=False):
+                            roi_definitions=None, social_mode=False,
+                            temporal_max_frame_gap=1):
     """
-    Computes pose feature vectors with group-aware normalization, advanced location-awareness,
-    and time-series augmentation. Now with flexible normalization reference points.
+    Compute dimensionless pose, location, social, and temporal features.
+
+    Spatial distances are normalized to a source-level body reference so videos
+    stored in pixels and videos stored in normalized coordinates are comparable.
+    Temporal derivatives are expressed per source-video frame and are reset when
+    the elapsed frame interval exceeds ``temporal_max_frame_gap``.
     """
     logger.info(f"Computing feature vectors with location_mode='{location_mode}', social_mode={social_mode}.")
     N_keypoints = len(keypoint_names)
-    LOW_CONF_THRESHOLD = 0.01
     EPSILON = 1e-6
 
-    conf_threshold = float(conf_threshold)
+    try:
+        conf_threshold = float(conf_threshold)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Confidence threshold must be a number between 0 and 1.") from exc
+    if not np.isfinite(conf_threshold) or not 0.0 <= conf_threshold <= 1.0:
+        raise ValueError(
+            f"Confidence threshold must be finite and between 0 and 1; got {conf_threshold!r}."
+        )
+
+    try:
+        temporal_max_frame_gap = int(temporal_max_frame_gap)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Temporal maximum frame gap must be a positive integer.") from exc
+    if temporal_max_frame_gap <= 0:
+        raise ValueError(
+            f"Temporal maximum frame gap must be positive; got {temporal_max_frame_gap}."
+        )
+
+    detections_df = detections_df.copy()
+    detections_df['_feature_row_id'] = np.arange(len(detections_df), dtype=np.int64)
+
     diagnostics = {
         'frames_processed': len(detections_df),
         'low_confidence_frames': 0,
         'bbox_clamped': 0,
         'nonfinite_repaired': 0,
+        'normalization_fallbacks': 0,
+        'social_missing_centroids': 0,
+        'social_rows_without_neighbors': 0,
+        'temporal_irregular_intervals': 0,
+        'temporal_gap_resets': 0,
+        'temporal_nonmonotonic_resets': 0,
         'warnings': [],
         'warning_overflow': False,
         'requested_confidence_threshold': conf_threshold,
-        'applied_confidence_threshold': None,
-        'threshold_lowered': False
+        'applied_confidence_threshold': conf_threshold,
+        'confidence_threshold_policy': 'configured',
+        'threshold_lowered': False,
+        'temporal_max_frame_gap': temporal_max_frame_gap,
+        'distance_normalization': 'source_body_reference',
+        'coordinate_spaces': {},
+        'source_normalization': [],
+        'velocity_units': 'body_lengths_per_source_frame',
+        'acceleration_units': 'body_lengths_per_source_frame_squared',
+        'social_missing_value_policy': 'zero_model_input_with_diagnostic',
     }
     MAX_WARNINGS = 30
 
@@ -277,42 +309,158 @@ def compute_feature_vectors(detections_df, keypoint_names, conf_threshold,
             logger.error(f"ROI validation failed: {e}")
             raise
 
-    if conf_threshold > LOW_CONF_THRESHOLD:
-        logger.info(f"Lowering confidence threshold from {conf_threshold:.2f} to {LOW_CONF_THRESHOLD:.2f} to retain marginal keypoints for VAE stability.")
-    confidence_cutoff = LOW_CONF_THRESHOLD
-    diagnostics['applied_confidence_threshold'] = confidence_cutoff
-    diagnostics['threshold_lowered'] = conf_threshold > confidence_cutoff
+    confidence_cutoff = conf_threshold
+    logger.info("Using configured keypoint confidence threshold %.3f.", confidence_cutoff)
 
-    group_ref_distances = {}
-    for group_name, group_df in detections_df.groupby('group'):
-        logger.info(f"Calculating reference distances for group: {group_name}")
+    def coordinate_space(det):
+        """Return the loader-declared coordinate space and validate dimensions."""
+        dimensions = []
+        for name in ('video_width', 'video_height'):
+            value = det.get(name)
+            if value is None or (isinstance(value, (float, np.floating)) and np.isnan(value)):
+                dimensions.append(None)
+                continue
+            try:
+                value = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be numeric when supplied; got {value!r}.") from exc
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive and finite when supplied; got {value!r}.")
+            dimensions.append(value)
+
+        if dimensions[0] is None and dimensions[1] is None:
+            return 'normalized', None
+        if dimensions[0] is None or dimensions[1] is None:
+            raise ValueError("video_width and video_height must either both be supplied or both be absent.")
+        return 'pixel', tuple(dimensions)
+
+    def confident_xy(keypoints, keypoint_name, *, context):
+        try:
+            values = keypoints[keypoint_name]
+            x, y, confidence = values[:3]
+            confidence = float(confidence)
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            raise ValueError(
+                f"Malformed keypoint {keypoint_name!r} at {context}; expected (x, y, confidence)."
+            ) from exc
+        if not np.isfinite(confidence):
+            raise ValueError(f"Non-finite confidence for keypoint {keypoint_name!r} at {context}.")
+        if confidence < confidence_cutoff:
+            return None
+        xy = np.asarray((x, y), dtype=float)
+        if not np.all(np.isfinite(xy)):
+            raise ValueError(f"Non-finite coordinates for keypoint {keypoint_name!r} at {context}.")
+        return xy
+
+    source_ref_distances = {}
+    source_groups = detections_df.groupby(
+        ['group', 'directory'], sort=False, dropna=False
+    )
+    for source_key, source_df in source_groups:
+        group_name, directory = source_key
+        logger.info(
+            "Calculating reference distances for group %r, source %r.",
+            group_name,
+            directory,
+        )
+
+        spaces = set()
+        pixel_dimensions = set()
+        for _, det in source_df.iterrows():
+            space, dimensions = coordinate_space(det)
+            spaces.add(space)
+            if dimensions is not None:
+                pixel_dimensions.add(dimensions)
+        if len(spaces) != 1:
+            raise ValueError(
+                f"Source {directory!r} mixes pixel and normalized coordinates. "
+                "Re-import it with one consistent coordinate system."
+            )
+        source_space = next(iter(spaces))
+        if len(pixel_dimensions) > 1:
+            raise ValueError(
+                f"Source {directory!r} contains conflicting video dimensions: "
+                f"{sorted(pixel_dimensions)!r}."
+            )
+        diagnostics['coordinate_spaces'][source_space] = (
+            diagnostics['coordinate_spaces'].get(source_space, 0) + 1
+        )
+        if source_space == 'normalized':
+            record_warning(
+                f"Source {directory!r} has no video dimensions. Distances are "
+                "body-normalized in the source's normalized coordinate space."
+            )
+
         pair_distances = defaultdict(list)
-        for _, det in group_df.iterrows():
+        for _, det in source_df.iterrows():
             keypoints = det['keypoints']
+            context = f"source {directory!r}, frame {det['frame']!r}"
             for i in range(N_keypoints):
                 for j in range(i + 1, N_keypoints):
                     kp1_name, kp2_name = keypoint_names[i], keypoint_names[j]
-                    if keypoints[kp1_name][2] >= confidence_cutoff and keypoints[kp2_name][2] >= confidence_cutoff:
-                        dist = np.linalg.norm(np.array(keypoints[kp1_name][:2]) - np.array(keypoints[kp2_name][:2]))
-                        pair_distances[(kp1_name, kp2_name)].append(dist)
+                    kp1_xy = confident_xy(keypoints, kp1_name, context=context)
+                    kp2_xy = confident_xy(keypoints, kp2_name, context=context)
+                    if kp1_xy is not None and kp2_xy is not None:
+                        dist = np.linalg.norm(kp1_xy - kp2_xy)
+                        pair_distances[tuple(sorted((kp1_name, kp2_name)))].append(dist)
 
         median_distances = {pair: np.median(dists) for pair, dists in pair_distances.items() if dists}
 
         ref_pair = tuple(sorted(normalization_ref_points))
         body_ref_dist = median_distances.get(ref_pair)
+        used_fallback = False
 
         if body_ref_dist is None or body_ref_dist <= EPSILON:
-            logger.warning(f"Reference key pair {normalization_ref_points} not found or invalid for group '{group_name}'.")
+            logger.warning(
+                "Reference key pair %r not found or invalid for source %r.",
+                normalization_ref_points,
+                directory,
+            )
             if median_distances:
                 body_ref_dist = np.median(list(median_distances.values()))
-                logger.warning(f"Falling back to median of all keypoint pairs for normalization: {body_ref_dist:.2f}")
+                used_fallback = True
+                diagnostics['normalization_fallbacks'] += 1
+                warning_msg = (
+                    f"Source {directory!r}: reference pair {normalization_ref_points!r} "
+                    f"was unavailable at confidence >= {confidence_cutoff:.3f}; using the "
+                    f"median of all valid keypoint-pair distances ({body_ref_dist:.6g})."
+                )
+                logger.warning(warning_msg)
+                record_warning(warning_msg)
             else:
-                raise ValueError(f"Could not determine any valid reference distance for group '{group_name}'. "
-                                 "Check keypoint data and confidence threshold. Cannot proceed with feature computation.")
+                raise ValueError(
+                    f"Could not determine a valid body reference distance for source {directory!r} "
+                    f"at the configured confidence threshold {confidence_cutoff:.3f}. "
+                    "Check the reference keypoints or lower the threshold explicitly."
+                )
 
         body_ref_dist = max(body_ref_dist, EPSILON)
-        logger.info(f"Group '{group_name}' body reference distance for normalization: {body_ref_dist:.2f}")
-        group_ref_distances[group_name] = {'body_ref': body_ref_dist, 'medians': median_distances}
+        logger.info(
+            "Source %r body reference distance for normalization: %.6g (%s coordinates).",
+            directory,
+            body_ref_dist,
+            source_space,
+        )
+        source_ref_distances[source_key] = {
+            'body_ref': body_ref_dist,
+            'medians': median_distances,
+            'coordinate_space': source_space,
+        }
+        diagnostics['source_normalization'].append(
+            {
+                'group': str(group_name),
+                'directory': str(directory),
+                'coordinate_space': source_space,
+                'video_dimensions': (
+                    list(next(iter(pixel_dimensions)))
+                    if pixel_dimensions
+                    else None
+                ),
+                'body_reference_distance': float(body_ref_dist),
+                'reference_keypoints': list(normalization_ref_points),
+                'used_reference_fallback': used_fallback,
+            }
+        )
 
     if location_mode == 'roi' and roi_definitions:
         roi_names = sorted(roi_definitions.keys())
@@ -325,71 +473,123 @@ def compute_feature_vectors(detections_df, keypoint_names, conf_threshold,
     inter_animal_features = {}
     if social_mode:
         logger.info("Social mode enabled: Computing inter-animal interaction features.")
-        grouped = detections_df.groupby(['group', 'directory', 'frame'])
+        grouped = detections_df.groupby(
+            ['group', 'directory', 'frame'], sort=False, dropna=False
+        )
         for (_group, _directory, frame), frame_df in grouped:
-            if len(frame_df) > 1:
-                centroids = []
-                for _, det in frame_df.iterrows():
-                    confident_kps = np.array([det['keypoints'][kp][:2] for kp in keypoint_names if det['keypoints'][kp][2] >= confidence_cutoff])
-                    centroid = np.mean(confident_kps, axis=0) if len(confident_kps) > 0 else np.array([0.0, 0.0])
-                    centroids.append(centroid)
+            valid_row_ids = []
+            centroids = []
+            for _, det in frame_df.iterrows():
+                context = f"source {_directory!r}, frame {frame!r}"
+                confident_kps = [
+                    xy
+                    for kp in keypoint_names
+                    if (xy := confident_xy(det['keypoints'], kp, context=context)) is not None
+                ]
+                row_id = int(det['_feature_row_id'])
+                if not confident_kps:
+                    diagnostics['social_missing_centroids'] += 1
+                    inter_animal_features[row_id] = {
+                        'mean_inter_dist': 0.0,
+                        'min_inter_dist': 0.0,
+                    }
+                    continue
+                valid_row_ids.append(row_id)
+                centroids.append(np.mean(np.vstack(confident_kps), axis=0))
 
-                if len(centroids) > 1:
-                    dist_matrix = squareform(pdist(centroids, 'euclidean'))
-                else:
-                    dist_matrix = np.zeros((len(frame_df), len(frame_df)))
-
-                mean_dists = np.mean(dist_matrix, axis=1)
-                min_dists = np.min(dist_matrix + np.eye(len(dist_matrix)) * np.inf, axis=1)
-
-                for idx, row_idx in enumerate(frame_df.index):
-                    inter_animal_features[row_idx] = {
-                        'mean_inter_dist': mean_dists[idx],
-                        'min_inter_dist': min_dists[idx],
+            if len(centroids) > 1:
+                centroid_array = np.vstack(centroids)
+                pairwise = np.linalg.norm(
+                    centroid_array[:, np.newaxis, :] - centroid_array[np.newaxis, :, :],
+                    axis=2,
+                )
+                off_diagonal = pairwise[~np.eye(len(pairwise), dtype=bool)].reshape(
+                    len(pairwise), len(pairwise) - 1
+                )
+                mean_dists = np.mean(off_diagonal, axis=1)
+                min_dists = np.min(off_diagonal, axis=1)
+                for position, row_id in enumerate(valid_row_ids):
+                    inter_animal_features[row_id] = {
+                        'mean_inter_dist': float(mean_dists[position]),
+                        'min_inter_dist': float(min_dists[position]),
                     }
             else:
-                for row_idx in frame_df.index:
-                    inter_animal_features[row_idx] = {'mean_inter_dist': 0.0, 'min_inter_dist': 0.0}
+                diagnostics['social_rows_without_neighbors'] += len(frame_df)
+                for row_id in valid_row_ids:
+                    inter_animal_features[row_id] = {
+                        'mean_inter_dist': 0.0,
+                        'min_inter_dist': 0.0,
+                    }
 
-    detections_df = detections_df.sort_values(['group', 'directory', 'track_id', 'frame'])
-    detections_df['prev_keypoints'] = detections_df.groupby(['group', 'directory', 'track_id'])['keypoints'].shift(1)
-    detections_df['prev_prev_keypoints'] = detections_df.groupby(['group', 'directory', 'track_id'])['keypoints'].shift(2)
+        if diagnostics['social_missing_centroids']:
+            record_warning(
+                f"{diagnostics['social_missing_centroids']} social-feature rows had no "
+                f"keypoints at confidence >= {confidence_cutoff:.3f}; their social "
+                "distances were marked unavailable with zero-valued model inputs."
+            )
+
+    sort_columns = ['group', 'directory', 'track_id', 'frame']
+    detections_df = detections_df.sort_values(sort_columns, kind='mergesort')
+    track_groups = detections_df.groupby(
+        ['group', 'directory', 'track_id'], sort=False, dropna=False
+    )
+    detections_df['prev_keypoints'] = track_groups['keypoints'].shift(1)
+    detections_df['prev_prev_keypoints'] = track_groups['keypoints'].shift(2)
+    detections_df['prev_frame'] = track_groups['frame'].shift(1)
+    detections_df['prev_prev_frame'] = track_groups['frame'].shift(2)
 
     feature_vectors = []
     for idx, det in detections_df.iterrows():
         keypoints = det['keypoints']
-        prev_keypoints = det['prev_keypoints'] if pd.notnull(det['prev_keypoints']) else keypoints
-        prev_prev_keypoints = det['prev_prev_keypoints'] if pd.notnull(det['prev_prev_keypoints']) else prev_keypoints
+        prev_keypoints = det['prev_keypoints'] if isinstance(det['prev_keypoints'], dict) else None
+        prev_prev_keypoints = (
+            det['prev_prev_keypoints']
+            if isinstance(det['prev_prev_keypoints'], dict)
+            else None
+        )
 
         group = det['group']
-        body_ref_dist = group_ref_distances.get(group, {}).get('body_ref', 1.0)
-        median_distances = group_ref_distances.get(group, {}).get('medians', {})
+        source_key = (group, det['directory'])
+        source_reference = source_ref_distances[source_key]
+        body_ref_dist = source_reference['body_ref']
+        median_distances = source_reference['medians']
         body_ref_safe = max(body_ref_dist, EPSILON)
 
         vec = []
-        confidences = [keypoints[kp][2] for kp in keypoint_names]
-        if not any(conf >= confidence_cutoff for conf in confidences):
+        context = (
+            f"source {det['directory']!r}, frame {det['frame']!r}, "
+            f"track {det['track_id']!r}"
+        )
+        current_xy = {
+            kp: confident_xy(keypoints, kp, context=context)
+            for kp in keypoint_names
+        }
+        if not any(xy is not None for xy in current_xy.values()):
             diagnostics['low_confidence_frames'] += 1
-            warning_msg = f"Frame {det['frame']} (track {det['track_id']}, group {group}) has no keypoints above {confidence_cutoff:.2f}. Using fallback statistics."
+            warning_msg = (
+                f"Frame {det['frame']} (track {det['track_id']}, group {group}) has no "
+                f"keypoints at confidence >= {confidence_cutoff:.3f}. Using explicit "
+                "missing-keypoint defaults."
+            )
             logger.warning(warning_msg)
             record_warning(warning_msg)
 
         for i in range(N_keypoints):
             for j in range(i + 1, N_keypoints):
                 kp1, kp2 = keypoint_names[i], keypoint_names[j]
-                if keypoints[kp1][2] >= confidence_cutoff and keypoints[kp2][2] >= confidence_cutoff:
-                    dist = np.linalg.norm(np.array(keypoints[kp1][:2]) - np.array(keypoints[kp2][:2]))
+                if current_xy[kp1] is not None and current_xy[kp2] is not None:
+                    dist = np.linalg.norm(current_xy[kp1] - current_xy[kp2])
                 else:
                     dist = median_distances.get(tuple(sorted((kp1, kp2))), 0.0)
-                vec.append(dist)
+                vec.append(dist / body_ref_safe)
 
         for i in range(N_keypoints):
             for j in range(i + 1, N_keypoints):
                 for k in range(j + 1, N_keypoints):
                     kp1, kp2, kp3 = keypoint_names[i], keypoint_names[j], keypoint_names[k]
-                    if (keypoints[kp1][2] >= confidence_cutoff and keypoints[kp2][2] >= confidence_cutoff and keypoints[kp3][2] >= confidence_cutoff):
-                        v1 = np.array(keypoints[kp1][:2]) - np.array(keypoints[kp2][:2])
-                        v2 = np.array(keypoints[kp3][:2]) - np.array(keypoints[kp2][:2])
+                    if all(current_xy[kp] is not None for kp in (kp1, kp2, kp3)):
+                        v1 = current_xy[kp1] - current_xy[kp2]
+                        v2 = current_xy[kp3] - current_xy[kp2]
                         norm_v1, norm_v2 = np.linalg.norm(v1), np.linalg.norm(v2)
                         if norm_v1 > 0 and norm_v2 > 0:
                             cos_angle = np.clip(np.dot(v1, v2) / (norm_v1 * norm_v2), -1.0, 1.0)
@@ -400,8 +600,12 @@ def compute_feature_vectors(detections_df, keypoint_names, conf_threshold,
                         angle = 0.0
                     vec.append(angle)
 
-        confident_kps = np.array([keypoints[kp][:2] for kp in keypoint_names if keypoints[kp][2] >= confidence_cutoff])
-        centroid = np.mean(confident_kps, axis=0) if len(confident_kps) > 0 else np.array([0.0, 0.0])
+        confident_kps = [xy for xy in current_xy.values() if xy is not None]
+        centroid = (
+            np.mean(np.vstack(confident_kps), axis=0)
+            if confident_kps
+            else np.array([0.0, 0.0])
+        )
 
         if det['bbox'] and use_bbox:
             x_c, y_c, w, h = det['bbox']
@@ -412,17 +616,17 @@ def compute_feature_vectors(detections_df, keypoint_names, conf_threshold,
             width = max(w, EPSILON)
             height = max(h, EPSILON)
             for kp in keypoint_names:
-                if keypoints[kp][2] >= confidence_cutoff:
-                    norm_x = (keypoints[kp][0] - (x_c - width / 2)) / width
-                    norm_y = (keypoints[kp][1] - (y_c - height / 2)) / height
+                if current_xy[kp] is not None:
+                    norm_x = (current_xy[kp][0] - (x_c - width / 2)) / width
+                    norm_y = (current_xy[kp][1] - (y_c - height / 2)) / height
                 else:
                     norm_x, norm_y = 0.5, 0.5
                 vec.extend([norm_x, norm_y])
         else:
             for kp in keypoint_names:
-                if keypoints[kp][2] >= confidence_cutoff:
-                    norm_x = (keypoints[kp][0] - centroid[0]) / body_ref_safe
-                    norm_y = (keypoints[kp][1] - centroid[1]) / body_ref_safe
+                if current_xy[kp] is not None:
+                    norm_x = (current_xy[kp][0] - centroid[0]) / body_ref_safe
+                    norm_y = (current_xy[kp][1] - centroid[1]) / body_ref_safe
                 else:
                     norm_x, norm_y = 0.0, 0.0
                 vec.extend([norm_x, norm_y])
@@ -442,24 +646,87 @@ def compute_feature_vectors(detections_df, keypoint_names, conf_threshold,
                 roi_vector[num_rois] = 1
             vec.extend(roi_vector)
         elif location_mode == 'unsupervised':
-            norm_grid_x = bbox_center_x / det['video_width'] if det['video_width'] else 0.0
-            norm_grid_y = bbox_center_y / det['video_height'] if det['video_height'] else 0.0
+            if source_reference['coordinate_space'] == 'normalized':
+                norm_grid_x, norm_grid_y = bbox_center_x, bbox_center_y
+            else:
+                norm_grid_x = bbox_center_x / float(det['video_width'])
+                norm_grid_y = bbox_center_y / float(det['video_height'])
             vec.extend([norm_grid_x, norm_grid_y])
 
         if social_mode:
-            inter_feats = inter_animal_features.get(idx, {'mean_inter_dist': 0.0, 'min_inter_dist': 0.0})
+            row_id = int(det['_feature_row_id'])
+            inter_feats = inter_animal_features.get(
+                row_id,
+                {'mean_inter_dist': 0.0, 'min_inter_dist': 0.0},
+            )
             vec.append(inter_feats['mean_inter_dist'] / body_ref_safe)
             vec.append(inter_feats['min_inter_dist'] / body_ref_safe)
 
-        for kp in keypoint_names:
-            curr_pos = np.array(keypoints[kp][:2]) if keypoints[kp][2] >= confidence_cutoff else np.array([0.0, 0.0])
-            prev_valid = isinstance(prev_keypoints, dict) and prev_keypoints.get(kp, [0, 0, 0])[2] >= confidence_cutoff
-            prev_prev_valid = isinstance(prev_prev_keypoints, dict) and prev_prev_keypoints.get(kp, [0, 0, 0])[2] >= confidence_cutoff
-            prev_pos = np.array(prev_keypoints[kp][:2]) if prev_valid else curr_pos
-            prev_prev_pos = np.array(prev_prev_keypoints[kp][:2]) if prev_prev_valid else prev_pos
+        try:
+            current_frame = float(det['frame'])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Frame number must be numeric at {context}.") from exc
+        if not np.isfinite(current_frame):
+            raise ValueError(f"Frame number must be finite at {context}.")
 
-            velocity = curr_pos - prev_pos
-            acceleration = velocity - (prev_pos - prev_prev_pos)
+        current_dt = None
+        current_interval_valid = False
+        if prev_keypoints is not None:
+            previous_frame = float(det['prev_frame'])
+            current_dt = current_frame - previous_frame
+            if current_dt <= 0:
+                diagnostics['temporal_nonmonotonic_resets'] += 1
+                record_warning(
+                    f"Temporal history reset at {context}: frame interval was {current_dt:g}."
+                )
+            elif current_dt > temporal_max_frame_gap:
+                diagnostics['temporal_gap_resets'] += 1
+                record_warning(
+                    f"Temporal history reset at {context}: {current_dt:g}-frame interval "
+                    f"exceeded the configured maximum of {temporal_max_frame_gap}."
+                )
+            else:
+                current_interval_valid = True
+                if current_dt != 1:
+                    diagnostics['temporal_irregular_intervals'] += 1
+
+        previous_dt = None
+        previous_interval_valid = False
+        if prev_keypoints is not None and prev_prev_keypoints is not None:
+            previous_frame = float(det['prev_frame'])
+            previous_previous_frame = float(det['prev_prev_frame'])
+            previous_dt = previous_frame - previous_previous_frame
+            previous_interval_valid = 0 < previous_dt <= temporal_max_frame_gap
+
+        for kp in keypoint_names:
+            velocity = np.zeros(2, dtype=float)
+            acceleration = np.zeros(2, dtype=float)
+            curr_pos = current_xy[kp]
+
+            prev_pos = None
+            if current_interval_valid and curr_pos is not None:
+                prev_pos = confident_xy(
+                    prev_keypoints,
+                    kp,
+                    context=f"previous sample before {context}",
+                )
+                if prev_pos is not None:
+                    velocity = (curr_pos - prev_pos) / current_dt
+
+            if (
+                previous_interval_valid
+                and curr_pos is not None
+                and prev_pos is not None
+            ):
+                prev_prev_pos = confident_xy(
+                    prev_prev_keypoints,
+                    kp,
+                    context=f"second previous sample before {context}",
+                )
+                if prev_prev_pos is not None:
+                    previous_velocity = (prev_pos - prev_prev_pos) / previous_dt
+                    velocity_interval = (current_dt + previous_dt) / 2.0
+                    acceleration = (velocity - previous_velocity) / velocity_interval
 
             norm_vel = np.linalg.norm(velocity) / body_ref_safe
             norm_acc = np.linalg.norm(acceleration) / body_ref_safe
@@ -478,7 +745,17 @@ def compute_feature_vectors(detections_df, keypoint_names, conf_threshold,
         feature_vectors.append(vec_array.tolist())
 
     detections_df['feature_vector'] = feature_vectors
-    detections_df.drop(columns=['prev_keypoints', 'prev_prev_keypoints'], inplace=True, errors='ignore')
+    detections_df.drop(
+        columns=[
+            'prev_keypoints',
+            'prev_prev_keypoints',
+            'prev_frame',
+            'prev_prev_frame',
+            '_feature_row_id',
+        ],
+        inplace=True,
+        errors='ignore',
+    )
     return detections_df, diagnostics
 
 
@@ -552,7 +829,7 @@ class BehaviorAnalysisApp:
         self.umap_components = tk.StringVar(value="5")
         self.min_cluster_size = tk.StringVar(value="10")
         self.social_mode = tk.BooleanVar(value=False)
-        # ADP-4 Commit E — opt-in stability audit. When True, the
+        # Opt-in stability audit. When True, the
         # sub-behavior runner re-clusters with N seeds and reports
         # per-class mean ARI alongside the primary results. Off by
         # default so the first run is fast.
@@ -730,7 +1007,11 @@ class BehaviorAnalysisApp:
         self._ui_call(self.update_state_summary)
 
     def _read_runtime_detections(self, group_dirs, keypoint_names_str, behavior_names_str, use_bbox_hint=True, *, video_path_map=None, subject_id_map=None):
-        return helper_read_detections(
+        # The loader pulls in optional clustering dependencies. Keep it lazy so
+        # importing the GUI or feature helpers does not pay that startup cost.
+        from .data_processing_hdbscan import read_detections  # noqa: PLC0415
+
+        return read_detections(
             group_dirs,
             keypoint_names_str,
             behavior_names_str,
@@ -892,7 +1173,7 @@ class BehaviorAnalysisApp:
         preset_combo.grid(row=3, column=1, sticky=tk.W)
         ttk.Button(gen_frame, text="Apply", command=self.apply_session_preset).grid(row=3, column=2, padx=(5, 0), sticky=tk.W)
 
-        # ADP-4 Commit E — opt-in stability audit row.
+        # Opt-in stability audit row.
         # When checked, the Sub-Behavior Discovery run re-clusters with
         # N seeds and reports per-class mean ARI alongside the primary
         # results. Off by default — costs N× the primary runtime.
@@ -961,7 +1242,8 @@ class BehaviorAnalysisApp:
             umap_n_entry,
             "UMAP `n_neighbors`. Larger values preserve global structure; "
             "smaller values emphasize local pose differences. 15 is the UMAP "
-            "default and works well for most projects.",
+            "default and works well for most projects. Set 0 to skip UMAP and "
+            "cluster the normalized feature vectors directly.",
         )
 
         ttk.Label(cluster_frame, text="UMAP Components:").grid(row=2, column=0, sticky=tk.W, pady=2)
@@ -1083,9 +1365,16 @@ class BehaviorAnalysisApp:
             ("Low-confidence frames", diagnostics.get('low_confidence_frames', 0)),
             ("Bounding box clamps", diagnostics.get('bbox_clamped', 0)),
             ("Non-finite repairs", diagnostics.get('nonfinite_repaired', 0)),
+            ("Normalization fallbacks", diagnostics.get('normalization_fallbacks', 0)),
+            ("Social centroids unavailable", diagnostics.get('social_missing_centroids', 0)),
+            ("Temporal irregular intervals", diagnostics.get('temporal_irregular_intervals', 0)),
+            ("Temporal gap resets", diagnostics.get('temporal_gap_resets', 0)),
+            ("Temporal nonmonotonic resets", diagnostics.get('temporal_nonmonotonic_resets', 0)),
             ("Requested conf. threshold", diagnostics.get('requested_confidence_threshold')),
             ("Applied conf. cutoff", diagnostics.get('applied_confidence_threshold')),
-            ("Threshold lowered", diagnostics.get('threshold_lowered', False)),
+            ("Confidence threshold policy", diagnostics.get('confidence_threshold_policy')),
+            ("Temporal maximum frame gap", diagnostics.get('temporal_max_frame_gap')),
+            ("Distance normalization", diagnostics.get('distance_normalization')),
         ]
         for metric, value in rows:
             self.diagnostics_tree.insert('', 'end', values=(metric, fmt_value(value)))
@@ -1327,7 +1616,7 @@ class BehaviorAnalysisApp:
             manifest = json.load(fh)
         if not isinstance(manifest, dict):
             raise ValueError("Manifest JSON must be an object.")
-        # Accept v1 (pre-ADP-4) and v2 (adds optional `provenance` block).
+        # Accept schema v1 and v2 (v2 adds an optional `provenance` block).
         # v1 has no subject_id; v2 may have an empty provenance block when
         # the run wasn't created via the batch pipeline.
         schema = manifest.get("schema_version")
@@ -1383,7 +1672,7 @@ class BehaviorAnalysisApp:
             "detailed_bouts_csv": str(Path(detailed_csv).resolve()),
             "keypoint_names": keypoint_names if isinstance(keypoint_names, list) else [],
             "behavior_names": behavior_names if isinstance(behavior_names, list) else [],
-            # ADP-4: pull subject identity through. Empty strings for v1
+            # Pull subject identity through. Empty strings for v1
             # manifests and v2 manifests without batch context.
             "subject_id": str(provenance.get("subject_id") or "").strip(),
             "manifest_group": str(provenance.get("group") or "").strip(),
@@ -1475,9 +1764,9 @@ class BehaviorAnalysisApp:
             "tab6_run_dir": run_folder,
             "tab6_detailed_bouts_csv": payload.get("detailed_bouts_csv"),
             "tab6_yaml": payload.get("yaml_file"),
-            # ADP-4: subject_id from manifest provenance (v2). Empty for v1
+            # Subject ID from manifest provenance (v2). Empty for v1
             # manifests or batches with no subject id assigned. Tab 7's
-            # auto-split helper (Commit C) keys on this.
+            # auto-split helper keys on this value.
             "subject_id": str(payload.get("subject_id") or "").strip(),
             "time_point": str(payload.get("time_point") or "").strip(),
         }
@@ -1578,7 +1867,7 @@ class BehaviorAnalysisApp:
             'umap_neighbors': self.umap_neighbors.get(),
             'umap_components': self.umap_components.get(),
             'min_cluster_size': self.min_cluster_size.get(),
-            # ADP-4 Commit E — stability audit flags.
+            # Stability-audit flags.
             'run_stability_audit': bool(self.run_stability_audit.get()),
             'stability_n_seeds': self.stability_n_seeds.get(),
             'social_mode': self.social_mode.get(),
@@ -1599,7 +1888,7 @@ class BehaviorAnalysisApp:
         identifier comes from the manifest provenance (v2 manifests, set by
         the batch pipeline). When absent, we fall back to the pose-dir
         basename so each source still has a unique stable id — that's what
-        the Tab 7 auto-split helper (Commit C) groups on. Manual / raw
+        the Tab 7 auto-split helper groups on. Manual / raw
         imports without a manifest land here too and get the basename
         fallback automatically.
         """
@@ -1622,7 +1911,7 @@ class BehaviorAnalysisApp:
                 valid_pose_dirs.append(pose_dir)
                 if video_path:
                     video_path_map[pose_dir] = video_path
-                # ADP-4: subject_id from manifest provenance, with basename
+                # Subject ID from manifest provenance, with basename
                 # fallback for v1 manifests / manual imports.
                 src_subject_id = str((src or {}).get("subject_id") or "").strip()
                 if not src_subject_id:
@@ -1890,11 +2179,18 @@ class BehaviorAnalysisApp:
             float(self.conf_threshold.get())
             int(self.max_frame_gap.get())
             int(self.min_bout_duration.get())
-            int(self.umap_neighbors.get())
-            int(self.umap_components.get())
-            int(self.min_cluster_size.get())
+            umap_neighbors = int(self.umap_neighbors.get())
+            umap_components = int(self.umap_components.get())
+            min_cluster_size = int(self.min_cluster_size.get())
         except ValueError as e:
             raise ValueError(f"Invalid numerical parameter. Please check your inputs. Error: {e}")
+
+        if umap_neighbors < 0 or umap_neighbors == 1:
+            raise ValueError("UMAP Neighbors must be 0 (disabled) or at least 2.")
+        if umap_components < 1:
+            raise ValueError("UMAP Components must be at least 1.")
+        if min_cluster_size < 2:
+            raise ValueError("HDBSCAN Min Cluster Size must be at least 2.")
 
         if not self.normalization_left.get() or not self.normalization_right.get():
             raise ValueError("Both normalization reference keypoints must be selected.")
@@ -1966,19 +2262,15 @@ class BehaviorAnalysisApp:
         self._set_status_progress_async(current=current, total=total, message=message)
 
     # =========================================================================
-    # ADP-4 Commit D-MVP — Sub-Behavior Discovery worker
+    # Sub-Behavior Discovery worker
     #
-    # New analysis path that REPLACES the HMM-on-pooled-data approach for the
-    # user's mission ("dissect sub-behaviors within YOLO classes"). Per-class
-    # HDBSCAN on UMAP-reduced features, results aggregated into bouts and
-    # saved next to the user's chosen output folder. This worker is wired
-    # behind a separate "Run Sub-Behavior Discovery" button so the legacy
-    # HMM/VAE/Hybrid paths stay clickable while the user verifies the new
-    # flow on real data.
+    # Per-class HDBSCAN on UMAP-reduced features, with results aggregated
+    # into bouts and saved in the selected output folder. The legacy
+    # HMM/VAE/Hybrid paths remain available as separate analysis modes.
     # =========================================================================
 
     def run_sub_behavior_discovery_analysis(self, params=None, *, notify=True):
-        """Cluster sub-behaviors WITHIN each YOLO class (ADP-4 Commit D-MVP).
+        """Cluster sub-behaviors within each YOLO class.
 
         Pipeline:
             1. Read detections + features (same plumbing as legacy paths).
@@ -2002,19 +2294,15 @@ class BehaviorAnalysisApp:
             self._set_status_progress_async(message="Initializing...", progress=0)
             params = params or self._ui_call_sync(self._capture_analysis_params)
 
-            # Generate a per-run UUID so state_names.json from a prior
-            # run with different parameters can't pollute clip filenames
-            # for THIS run. Saved alongside the result; the export
-            # helper compares before loading names.
+            # Generate a per-run UUID so names from incompatible runs are
+            # not applied to current clip filenames.
             import uuid  # noqa: PLC0415
 
             run_id = str(uuid.uuid4())
 
-            # Per advisor: don't preemptively wipe the cached result.
-            # If THIS run fails, the user can still review / export the
-            # prior successful run. Only `feature_diagnostics` is reset
-            # because it's purely a per-run artifact and stale values
-            # would be misleading during the in-progress run.
+            # Retain the previous successful result until this run completes.
+            # Feature diagnostics are reset because they apply only to the
+            # current run.
             self.feature_diagnostics = {}
             self._refresh_diagnostics_async()
 
@@ -2060,6 +2348,7 @@ class BehaviorAnalysisApp:
                 location_grid_size=grid_size,
                 roi_definitions=roi_defs,
                 social_mode=params['social_mode'],
+                temporal_max_frame_gap=int(params.get('max_frame_gap', 5)),
             )
             self.feature_diagnostics = feature_diag
             self._refresh_diagnostics_async()
@@ -2093,8 +2382,7 @@ class BehaviorAnalysisApp:
                 state_column='cluster_label',
             )
 
-            # ADP-4 Commit E — optional stability audit. The user can
-            # opt in via the "Run stability audit" checkbox. We re-cluster
+            # Optional stability audit. The checkbox enables re-clustering
             # with N seeds and compute per-class mean ARI. Cost is N×
             # the primary clustering, so it's behind a flag.
             stability_report = None
@@ -2125,9 +2413,8 @@ class BehaviorAnalysisApp:
                     logger.warning("Stability audit failed: %s", exc, exc_info=True)
                     stability_report = None
 
-            # ADP-4 Commit F: signal scoring — always runs (cheap, no
-            # extra clustering). Ranks sub-clusters by candidate strength
-            # so the user can review strongest first.
+            # Signal scoring ranks sub-clusters by candidate strength without
+            # performing additional clustering.
             try:
                 from .signal_score import compute_signal_scores  # noqa: PLC0415
                 self.progress_callback(80, 100, "Scoring sub-clusters...")
@@ -2149,6 +2436,7 @@ class BehaviorAnalysisApp:
                 bouts=bouts,
                 multi_result=multi_result,
                 class_names=class_names,
+                feature_diagnostics=feature_diag,
                 stability_report=stability_report,
                 signal_report=signal_report,
                 run_id=run_id,
@@ -2182,6 +2470,7 @@ class BehaviorAnalysisApp:
                 'video_path_map': video_map,
                 'output_folder': output_folder,
                 'saved_paths': saved_paths,
+                'feature_diagnostics': feature_diag,
                 'stability_report': stability_report,
                 'signal_report': signal_report,
             }
@@ -2201,9 +2490,7 @@ class BehaviorAnalysisApp:
 
         except Exception as exc:  # pragma: no cover - surfaced to UI
             logger.error("Sub-behavior discovery failed: %s", exc, exc_info=True)
-            # Per advisor: be explicit that the prior successful run's
-            # outputs (if any) are still available for review/export —
-            # the failed run did not wipe them.
+            # A failed run does not replace prior successful output.
             prior = getattr(self, "last_sub_behavior_result", None)
             suffix = (
                 "\n\nThe previous successful run is still available — the "
@@ -2218,12 +2505,12 @@ class BehaviorAnalysisApp:
             self.running = False
             self._set_status_progress_async(progress=0)
 
-    def _save_sub_behavior_outputs(self, *, output_folder, clustered_df, bouts, multi_result, class_names, stability_report=None, signal_report=None, run_id: str = ""):
+    def _save_sub_behavior_outputs(self, *, output_folder, clustered_df, bouts, multi_result, class_names, feature_diagnostics=None, stability_report=None, signal_report=None, run_id: str = ""):
         """Write per-frame and bout CSVs into the output folder.
 
         Returns a dict with the absolute paths so the summary message and
         the Export button can quote them. When ``stability_report`` is
-        provided (Commit E), an additional ``stability.json`` is written
+        provided, an additional ``stability.json`` is written
         with per-class ARI matrices and the headline mean ARI.
 
         ``run_id`` is a UUID stamped on every artefact so that downstream
@@ -2240,6 +2527,10 @@ class BehaviorAnalysisApp:
         bouts_path = os.path.join(out_root, "sub_behavior_bouts.csv")
         summary_path = os.path.join(out_root, "sub_behavior_summary.txt")
         run_id_path = os.path.join(out_root, "sub_behavior_run_id.txt")
+        feature_diagnostics_path = os.path.join(
+            out_root,
+            "sub_behavior_feature_diagnostics.json",
+        )
 
         # Per-frame CSV — drop the heavy columns the user doesn't need
         # in tabular form (keypoints dict, raw feature_vector). They keep
@@ -2313,6 +2604,18 @@ class BehaviorAnalysisApp:
             "summary_txt": summary_path,
         }
 
+        if feature_diagnostics is not None:
+            try:
+                diagnostic_payload = {
+                    "run_id": str(run_id or ""),
+                    **dict(feature_diagnostics),
+                }
+                with open(feature_diagnostics_path, "w", encoding="utf-8") as fh:
+                    json.dump(diagnostic_payload, fh, indent=2, sort_keys=True)
+                saved["feature_diagnostics_json"] = feature_diagnostics_path
+            except Exception as exc:
+                logger.warning("Failed to write feature diagnostics: %s", exc)
+
         # Stamp this run's UUID to disk. The naming dialog and clip
         # exporter both compare this against state_names.json's stored
         # run_id; mismatch ⇒ stale, ignored.
@@ -2324,7 +2627,7 @@ class BehaviorAnalysisApp:
             except Exception as exc:
                 logger.warning("Failed to write run_id sidecar: %s", exc)
 
-        # ADP-4 Commit F: signal-score CSV. Always written when scores
+        # Signal-score CSV. Written whenever scores
         # were computed — the review panel and external readers both
         # consume this. Sorted desc by score.
         if signal_report is not None and signal_report.candidates:
@@ -2363,7 +2666,7 @@ class BehaviorAnalysisApp:
             except Exception as exc:
                 logger.warning("Failed to write candidate scores CSV: %s", exc)
 
-        # ADP-4 Commit E: optional stability JSON.
+        # Optional stability JSON.
         if stability_report is not None:
             stability_path = os.path.join(out_root, "sub_behavior_stability.json")
             try:
@@ -2502,10 +2805,10 @@ class BehaviorAnalysisApp:
         ).start()
 
     def export_sub_cluster_clips_action(self):
-        """Handler for the 'Export Sub-cluster Clips' button (Commit I).
+        """Handle the 'Export Sub-cluster Clips' button.
 
         Writes one .mp4 per **bout**, organized into per-behavior folders
-        for direct use as classifier training input (BehaviorScope-style).
+        for direct use as downstream-classifier training input.
         Layout::
 
             <output_folder>/sub_cluster_clips/
@@ -2557,7 +2860,7 @@ class BehaviorAnalysisApp:
         output_folder = result.get("output_folder") or self.output_folder.get() or "."
         class_names = result.get("class_names") or {}
         run_id = str(result.get("run_id") or "")
-        # ADP-4 Commit G: prefer user-supplied names from state_names.json
+        # Prefer user-supplied names from state_names.json
         # for folder/clip names. Loader compares run_id to skip stale files.
         state_names = self._load_state_names_for_export(output_folder, result)
 
@@ -2588,7 +2891,7 @@ class BehaviorAnalysisApp:
             f"Will write up to {n_real_bouts} clip file(s) to:\n\n"
             f"  {os.path.join(output_folder, 'sub_cluster_clips')}\n\n"
             f"Folders are named after sub-behaviors (state_names.json) so "
-            f"the layout drops directly into BehaviorScope / classifier "
+            f"the layout drops directly into downstream-classifier "
             f"training. Proceed?",
         )
         if not proceed:
@@ -2741,7 +3044,7 @@ class BehaviorAnalysisApp:
             pass
 
     def open_cluster_naming_dialog(self):
-        """Launch the naming dialog (ADP-4 Commit G)."""
+        """Launch the cluster-naming dialog."""
         result = getattr(self, "last_sub_behavior_result", None)
         if not result:
             return messagebox.showinfo(
@@ -2789,7 +3092,7 @@ class BehaviorAnalysisApp:
             messagebox.showerror("Name Sub-Behaviors", str(exc))
 
     def open_review_candidates_dialog(self):
-        """Show the ranked sub-cluster review panel (ADP-4 Commit F)."""
+        """Show the ranked sub-cluster review panel."""
         result = getattr(self, "last_sub_behavior_result", None)
         if not result:
             return messagebox.showinfo(
@@ -2907,7 +3210,7 @@ class BehaviorAnalysisApp:
             pass
 
     # =========================================================================
-    # End ADP-4 Commit D-MVP
+    # End Sub-Behavior Discovery worker
     # =========================================================================
 
 if __name__ == "__main__":

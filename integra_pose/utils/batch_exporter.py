@@ -32,6 +32,15 @@ def _safe_read_csv(path: str | Path) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _preferred_bout_csv(result: dict[str, Any]) -> str:
+    """Prefer a complete authoritative review over the immutable detections."""
+
+    explicit = str(result.get("reviewed_bouts_csv", "") or "").strip()
+    if explicit and Path(explicit).expanduser().is_file():
+        return explicit
+    return str(result.get("detailed_bouts_csv", "") or "").strip()
+
+
 def _safe_read_json(path: str | Path) -> dict[str, Any]:
     target = Path(str(path or "")).expanduser()
     if not target.is_file():
@@ -327,6 +336,14 @@ def build_analysis_coverage(video_results: list[dict[str, Any]]) -> pd.DataFrame
         parameters = manifest.get("parameters", {}) if isinstance(manifest.get("parameters"), dict) else {}
         outputs = manifest.get("outputs", {}) if isinstance(manifest.get("outputs"), dict) else {}
         module_outputs = outputs.get("modules", {}) if isinstance(outputs.get("modules"), dict) else {}
+        invalidated_module_outputs: dict[str, Any] = {}
+        for invalidated_key in (
+            "invalidated_raw_bout_modules",
+            "invalidated_raw_roi_modules",
+        ):
+            payload = outputs.get(invalidated_key)
+            if isinstance(payload, dict):
+                invalidated_module_outputs.update(payload)
         enabled_modules = {
             str(name).strip()
             for name in (parameters.get("enabled_modules", []) if isinstance(parameters.get("enabled_modules"), list) else [])
@@ -349,11 +366,15 @@ def build_analysis_coverage(video_results: list[dict[str, Any]]) -> pd.DataFrame
             variables: str,
             paths_payload: Any,
             required_outputs_min: int = 1,
+            status_override: str = "",
         ) -> None:
             file_paths = _flatten_paths(paths_payload)
             outputs_expected = int(len(file_paths))
             outputs_found = _existing_file_count(file_paths)
-            if not enabled:
+            if status_override:
+                status = status_override
+                completion_ratio = 0.0
+            elif not enabled:
                 status = "not_enabled"
                 completion_ratio = 0.0
             elif outputs_expected <= 0:
@@ -394,6 +415,7 @@ def build_analysis_coverage(video_results: list[dict[str, Any]]) -> pd.DataFrame
                 outputs.get("detailed_bouts_csv"),
                 outputs.get("summary_csv"),
                 outputs.get("excel_summary"),
+                result.get("reviewed_bouts_csv"),
                 result.get("detailed_bouts_csv"),
                 result.get("summary_bouts_csv"),
             ],
@@ -435,18 +457,32 @@ def build_analysis_coverage(video_results: list[dict[str, Any]]) -> pd.DataFrame
         for module_key, module_label, variables in _ANALYTICS_MODULE_SPECS:
             payload = module_outputs.get(module_key)
             payload_dict = payload if isinstance(payload, dict) else {}
+            invalidated_payload = invalidated_module_outputs.get(module_key)
+            invalidated_payload_dict = (
+                invalidated_payload if isinstance(invalidated_payload, dict) else {}
+            )
             files = payload_dict.get("files") if isinstance(payload_dict.get("files"), dict) else {}
+            invalidated_files = (
+                invalidated_payload_dict.get("files")
+                if isinstance(invalidated_payload_dict.get("files"), dict)
+                else {}
+            )
             if enabled_modules:
                 enabled = module_key in enabled_modules
             else:
-                enabled = bool(payload_dict)
+                enabled = bool(payload_dict or invalidated_payload_dict)
             _add_row(
                 key=module_key,
                 label=module_label,
                 enabled=enabled,
                 variables=variables,
-                paths_payload=files,
+                paths_payload=files or invalidated_files,
                 required_outputs_min=1,
+                status_override=(
+                    "invalidated_after_review"
+                    if invalidated_payload_dict and not payload_dict
+                    else ""
+                ),
             )
 
     if not rows:
@@ -552,9 +588,9 @@ def check_fps_consistency(
                 log_fn(
                     (
                         f"Cross-video FPS heterogeneity detected (spread={spread:g} "
-                        f"fps, range {min_fps:g}-{max_fps:g}). Per-second metrics "
-                        f"aggregated across these videos may not be directly "
-                        f"comparable. Per-video FPS: {pretty}."
+                        f"fps, range {min_fps:g}-{max_fps:g}). Verify that temporal "
+                        "thresholds are configured in seconds or intentionally use "
+                        f"legacy frames. Per-video FPS: {pretty}."
                     ),
                     "WARNING",
                 )
@@ -612,7 +648,7 @@ def collect_batch_frames(video_results: list[dict[str, Any]]) -> tuple[pd.DataFr
                 )
             )
 
-        detailed = _safe_read_csv(result.get("detailed_bouts_csv", ""))
+        detailed = _safe_read_csv(_preferred_bout_csv(result))
         if not detailed.empty:
             bout_rows.append(
                 _attach_video_context(
@@ -663,12 +699,13 @@ def collect_batch_frames(video_results: list[dict[str, Any]]) -> tuple[pd.DataFr
 def build_video_summary(video_results: list[dict[str, Any]]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for result in video_results:
-        detailed = _safe_read_csv(result.get("detailed_bouts_csv", ""))
+        detailed = _safe_read_csv(_preferred_bout_csv(result))
         roi_overview = _safe_read_csv(result.get("roi_overview_csv", ""))
         metrics_track = _safe_read_csv(result.get("metrics_summary_by_track_csv", ""))
         if metrics_track.empty:
             metrics_track = _safe_read_csv(result.get("metrics_csv", ""))
         object_interactions = _safe_read_csv(result.get("object_interactions_csv", ""))
+        object_dwell_events = _safe_read_csv(result.get("object_dwell_events_csv", ""))
 
         durations = pd.to_numeric(detailed.get("Duration (s)"), errors="coerce") if "Duration (s)" in detailed.columns else pd.Series(dtype=float)
         total_duration = float(durations.fillna(0).sum()) if not durations.empty else np.nan
@@ -677,14 +714,37 @@ def build_video_summary(video_results: list[dict[str, Any]]) -> pd.DataFrame:
 
         entries_total = np.nan
         exits_total = np.nan
-        dwell_total_s = np.nan
+        raw_roi_occupancy_total_s = np.nan
+        qualified_roi_dwell_total_s = np.nan
         if not roi_overview.empty:
             if "Entries" in roi_overview.columns:
                 entries_total = float(pd.to_numeric(roi_overview["Entries"], errors="coerce").fillna(0).sum())
             if "Exits" in roi_overview.columns:
                 exits_total = float(pd.to_numeric(roi_overview["Exits"], errors="coerce").fillna(0).sum())
-            if "Time in ROI (s)" in roi_overview.columns:
-                dwell_total_s = float(pd.to_numeric(roi_overview["Time in ROI (s)"], errors="coerce").fillna(0).sum())
+            raw_roi_column = next(
+                (
+                    column
+                    for column in ("Raw Occupancy Time (s)", "Time in ROI (s)")
+                    if column in roi_overview.columns
+                ),
+                None,
+            )
+            if raw_roi_column:
+                raw_roi_occupancy_total_s = float(
+                    pd.to_numeric(roi_overview[raw_roi_column], errors="coerce").fillna(0).sum()
+                )
+            qualified_roi_column = next(
+                (
+                    column
+                    for column in ("Qualified Dwell Time (s)", "Total Dwell Time (s)")
+                    if column in roi_overview.columns
+                ),
+                None,
+            )
+            if qualified_roi_column:
+                qualified_roi_dwell_total_s = float(
+                    pd.to_numeric(roi_overview[qualified_roi_column], errors="coerce").fillna(0).sum()
+                )
 
         mean_speed = np.nan
         mean_turns = np.nan
@@ -694,16 +754,37 @@ def build_video_summary(video_results: list[dict[str, Any]]) -> pd.DataFrame:
             if "turn_count" in metrics_track.columns:
                 mean_turns = float(pd.to_numeric(metrics_track["turn_count"], errors="coerce").dropna().mean())
 
-        object_interaction_time_s = np.nan
+        object_raw_interaction_time_s = np.nan
+        object_qualified_interaction_time_s = np.nan
         object_interaction_entries = np.nan
         if not object_interactions.empty:
-            if "Time Interacting (s)" in object_interactions.columns:
-                object_interaction_time_s = float(
-                    pd.to_numeric(object_interactions["Time Interacting (s)"], errors="coerce").fillna(0).sum()
+            raw_object_column = next(
+                (
+                    column
+                    for column in ("Raw Interaction Time (s)", "Time Interacting (s)")
+                    if column in object_interactions.columns
+                ),
+                None,
+            )
+            if raw_object_column:
+                object_raw_interaction_time_s = float(
+                    pd.to_numeric(object_interactions[raw_object_column], errors="coerce").fillna(0).sum()
+                )
+            if "Qualified Interaction Time (s)" in object_interactions.columns:
+                object_qualified_interaction_time_s = float(
+                    pd.to_numeric(
+                        object_interactions["Qualified Interaction Time (s)"],
+                        errors="coerce",
+                    ).fillna(0).sum()
                 )
             if "Entries" in object_interactions.columns:
                 object_interaction_entries = float(
                     pd.to_numeric(object_interactions["Entries"], errors="coerce").fillna(0).sum()
+                )
+        if np.isnan(object_qualified_interaction_time_s) and not object_dwell_events.empty:
+            if "Duration (s)" in object_dwell_events.columns:
+                object_qualified_interaction_time_s = float(
+                    pd.to_numeric(object_dwell_events["Duration (s)"], errors="coerce").fillna(0).sum()
                 )
 
         rows.append(
@@ -719,10 +800,18 @@ def build_video_summary(video_results: list[dict[str, Any]]) -> pd.DataFrame:
                 "bout_duration_mean_s": mean_duration,
                 "roi_entries_total": entries_total,
                 "roi_exits_total": exits_total,
-                "roi_dwell_total_s": dwell_total_s,
+                "roi_raw_occupancy_total_s": raw_roi_occupancy_total_s,
+                "roi_qualified_dwell_total_s": qualified_roi_dwell_total_s,
+                # Backward-compatible name now has the scientifically correct
+                # dwell-qualified meaning.
+                "roi_dwell_total_s": qualified_roi_dwell_total_s,
                 "mean_speed_px_per_frame": mean_speed,
                 "mean_turn_count": mean_turns,
-                "object_interaction_total_s": object_interaction_time_s,
+                "object_raw_interaction_total_s": object_raw_interaction_time_s,
+                "object_qualified_interaction_total_s": object_qualified_interaction_time_s,
+                # Backward-compatible name now excludes visits below the
+                # configured object minimum-dwell threshold.
+                "object_interaction_total_s": object_qualified_interaction_time_s,
                 "object_interaction_entries_total": object_interaction_entries,
             }
         )

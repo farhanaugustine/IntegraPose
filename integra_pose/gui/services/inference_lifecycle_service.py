@@ -6,6 +6,8 @@ import threading
 import traceback
 from tkinter import messagebox
 
+from integra_pose.utils.operation_result import OperationResult
+
 
 class InferenceLifecycleService:
     """Owns the Supervision runner thread/stop event and UI cleanup hooks."""
@@ -32,15 +34,15 @@ class InferenceLifecycleService:
         app._supervision_stop_event = self._stop_event
 
         def _worker():
+            result = OperationResult.success("Inference completed successfully.")
+            error_for_dialog = None
+            error_traceback = ""
             try:
                 runner.run()
             except Exception as exc:
-                app.log_message(
-                    f"Supervision inference failed: {exc}\n{traceback.format_exc()}",
-                    "ERROR",
-                )
-                app._set_process_activity("inference", "error")
-                app.root.after(0, lambda exc=exc: messagebox.showerror("Inference Error", str(exc), parent=app.root))
+                result = OperationResult.failure("Inference failed.", error=str(exc))
+                error_for_dialog = exc
+                error_traceback = traceback.format_exc()
             finally:
                 self._active_runner = None
                 app._active_supervision_runner = None
@@ -49,7 +51,27 @@ class InferenceLifecycleService:
                 app._supervision_thread = None
                 app._supervision_stop_event = None
                 if on_finish:
-                    app.root.after(0, on_finish)
+                    try:
+                        app.root.after(0, lambda result=result: on_finish(result))
+                    except Exception as exc:
+                        app.log_message(f"Failed to schedule inference completion callback: {exc}", "ERROR")
+                if error_for_dialog is not None:
+                    app.log_message(
+                        f"Supervision inference failed: {error_for_dialog}\n{error_traceback}",
+                        "ERROR",
+                    )
+                    app._set_process_activity("inference", "error")
+                    try:
+                        app.root.after(
+                            0,
+                            lambda exc=error_for_dialog: messagebox.showerror(
+                                "Inference Error",
+                                str(exc),
+                                parent=app.root,
+                            ),
+                        )
+                    except Exception as exc:
+                        app.log_message(f"Failed to schedule inference error dialog: {exc}", "ERROR")
 
         self._thread = threading.Thread(target=_worker, daemon=True)
         self._thread.start()

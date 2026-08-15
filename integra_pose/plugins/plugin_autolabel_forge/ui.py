@@ -20,7 +20,7 @@ from tkinter import filedialog, messagebox, ttk
 from integra_pose.gui.plugin_chrome import apply_plugin_chrome, build_plugin_header
 from integra_pose.gui.scrollable import create_scrollable_section
 from integra_pose.gui.windowing import apply_adaptive_window_geometry
-from integra_pose.plugins.plugin_autolabel_forge.autolabel_runtime import VIDEO_EXTS
+from integra_pose.plugins.plugin_autolabel_forge.autolabel_runtime import VIDEO_EXTS, create_run_id
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 MANUAL_MODEL_PRESETS = (
     "sam_b.pt",
@@ -510,6 +510,7 @@ class AutoLabelForgeWindow(tk.Toplevel):
 
         self._auto_run_btn.configure(state="disabled")
         job = {
+            "run_id": create_run_id(),
             "project_dir": Path(self._auto_project_var.get().strip()),
             "video_dir": Path(self._auto_video_var.get().strip()),
             "frames_dir": Path(self._auto_frames_var.get().strip()),
@@ -563,6 +564,7 @@ class AutoLabelForgeWindow(tk.Toplevel):
         _parse_ontology(str(job["ontology_text"]))
 
         job_payload = {
+            "run_id": str(job["run_id"]),
             "project_dir": str(Path(job["project_dir"])),
             "video_dir": str(Path(job["video_dir"])),
             "frames_dir": str(Path(job["frames_dir"])),
@@ -608,7 +610,8 @@ class AutoLabelForgeWindow(tk.Toplevel):
             summary = next((line for line in reversed(output_lines) if line.strip()), "GroundingDINO worker failed.")
             raise AutoLabelForgeUIError(summary)
 
-        preview_dir = dataset_dir / "previews"
+        run_dataset_dir = dataset_dir / "runs" / str(job["run_id"])
+        preview_dir = run_dataset_dir / "previews"
         self.after(
             0,
             lambda path=preview_dir: self._append_log(f"Annotation previews are available at: {path}"),
@@ -617,7 +620,7 @@ class AutoLabelForgeWindow(tk.Toplevel):
             0,
             lambda: messagebox.showinfo(
                 "AutoLabel Forge",
-                f"Autolabeling complete.\nDataset folder:\n{dataset_dir}\n\nPreview folder:\n{preview_dir}",
+                f"Autolabeling complete.\nDataset folder:\n{run_dataset_dir}\n\nPreview folder:\n{preview_dir}",
                 parent=self,
             ),
         )

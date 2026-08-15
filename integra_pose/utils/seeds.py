@@ -20,6 +20,8 @@ import random as py_random
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Optional
 
+from integra_pose.utils.torch_backend import manual_seed_cuda_api_if_available
+
 
 DEFAULT_SEED = 42
 
@@ -88,8 +90,7 @@ def apply_global_seed(seeds: SeedsConfig, *, log_fn: Optional[Any] = None) -> No
         import torch  # type: ignore
 
         torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+        manual_seed_cuda_api_if_available(seed, torch_module=torch)
         if seeds.cudnn_deterministic:
             try:
                 torch.backends.cudnn.deterministic = True

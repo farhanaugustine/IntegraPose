@@ -1,4 +1,4 @@
-"""Tests for ADP-4 Commit B — aggregate_states_into_bouts.
+"""Tests for ``aggregate_states_into_bouts``.
 
 Builds a synthetic per-frame dataframe in pandas (no ML, no GUI), then
 asserts the aggregator slices it into the expected bouts. Covers:
@@ -12,8 +12,7 @@ asserts the aggregator slices it into the expected bouts. Covers:
   - Empty dataframe returns [] without raising.
   - Missing state column raises a clear ValueError.
 
-These tests are deterministic and fast — they hit the fastest single-stage
-of the Tab 7 pipeline in isolation, so a regression here is hard to miss.
+The tests isolate the aggregation stage from GUI and model dependencies.
 """
 
 from __future__ import annotations

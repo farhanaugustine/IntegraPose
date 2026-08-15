@@ -44,6 +44,10 @@ Common controls include:
 - max detections
 - project folder and run name
 
+`Max Detections` is a hard per-frame output cap. IntegraPose passes it to Ultralytics and verifies the returned result before annotations, ROI metrics, CSV/TXT labels, or crops are written. When Single Animal Analysis is enabled, the effective cap is `1`.
+
+The default device value is `-1`. IntegraPose resolves it to an available CUDA/ROCm accelerator, Apple MPS, or CPU. Batch-managed runs record both the requested value and the runtime device in their inference metadata.
+
 ## 3. Output options
 
 Typical options:
@@ -54,7 +58,26 @@ Typical options:
 - save YOLO text results
 - save cropped detections
 
-If you want to use later analytics, keep `Save Results (.txt)` enabled.
+`Save Results (.txt)` is **off by default**. Turn it on before
+running whenever Bout Analytics, Tab 7, label reuse, or an auditable per-frame
+record is planned.
+
+Verified single-video labels use zero-based names such as `trial_frame_000000.txt`. The labels folder also contains a frame-label manifest, and no-detection frames are represented by empty label files. Keep the manifest with the labels when moving a run between machines.
+
+Use the Batch Processing Wizard for a folder containing multiple experimental videos. The Inference tab blocks multi-video folders when overlays, metrics, Single Animal Analysis, or advanced per-frame outputs would otherwise combine timelines or tracker state across videos.
+
+### Keep previews and long runs responsive
+
+The shipped Output Options section also includes:
+
+- controls for preview size and how often the preview refreshes
+- an option to write annotated video in the background, with a queue-size limit
+- a setting for saving every frame or every Nth annotated frame
+- controls for how often motion and label tables are written to disk
+- checks for available disk space and memory before a run begins
+
+The disk and memory checks are enabled by default. Keeping them on helps avoid
+losing a long run because the computer runs out of space or memory.
 
 ## 4. Motion metrics and overlays
 
@@ -67,6 +90,12 @@ Examples:
 - grid metrics
 - heading vector selection
 - Supervision overlays such as boxes, labels, traces, blur, pixelation, and heatmaps
+
+The Annotation Options section exposes background, blur, boxes, halo, heading
+arrows, heatmap trail, keypoint markers, labels, pixelation, skeleton edges,
+and trace overlays. Overlay presets can be saved, updated, deleted, exported,
+and reordered. Accumulating overlays such as traces and heatmaps can be reset
+without restarting the application.
 
 ## Recommended use
 
@@ -85,3 +114,4 @@ Select model
 - Use `pose` when you want later Tab 7 modeling.
 - Use `detect` when you mainly want box-based analytics and already have a suitable detection model.
 - Use `Project Folder` and `Run Name` for predictable output locations.
+- Use **Open Batch Processing** for experimental folders rather than combining several video timelines in the single-run tab.

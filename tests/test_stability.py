@@ -1,7 +1,7 @@
-"""Tests for ADP-4 Commit E — cluster stability audit.
+"""Tests for the cluster-stability audit.
 
 The stability code calls ``cluster_per_class`` internally, which calls
-UMAP + HDBSCAN — heavy deps. Like the per_class tests, we split into:
+UMAP and HDBSCAN. The test groups are:
 
   1. **Pure-logic tests** that monkeypatch ``cluster_per_class`` to
      return canned label sequences. These verify the orchestration:
@@ -10,11 +10,9 @@ UMAP + HDBSCAN — heavy deps. Like the per_class tests, we split into:
      consumes.
 
   2. **Pure ARI-helper tests** for ``_pairwise_ari_matrix`` and
-     ``_summarize_off_diagonal`` — these only need sklearn, which is a
-     light enough dep that they should run almost everywhere.
+     ``_summarize_off_diagonal``; these require only sklearn.
 
-End-to-end stability with real UMAP/HDBSCAN is left to manual testing
-in the user's env (sandbox doesn't have those reliably).
+End-to-end tests run separately when UMAP and HDBSCAN are available.
 """
 
 from __future__ import annotations

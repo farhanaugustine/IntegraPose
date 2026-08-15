@@ -131,6 +131,7 @@ def test_build_inference_command_accepts_engine(tmp_path):
 
         cmd, err = command_builder.build_inference_command(app)
         assert err is None
+        assert cmd[:2] == ["yolo", "predict"]
         assert f"model={engine_path}" in cmd
         assert f"source={video_path}" in cmd
     finally:

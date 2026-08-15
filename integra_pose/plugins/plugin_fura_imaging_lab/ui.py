@@ -310,7 +310,7 @@ class FuraImagingLabWindow(tk.Toplevel):
         ttk.Combobox(
             left,
             textvariable=self._normalization_mode_var,
-            values=("none", "divide_by_area", "delta_over_baseline", "percent_change_from_baseline", "zscore_baseline"),
+            values=("none", "delta_over_baseline", "percent_change_from_baseline", "zscore_baseline"),
             state="readonly",
             width=24,
         ).grid(row=11, column=0, sticky="w", pady=(2, 8))
@@ -411,6 +411,10 @@ class FuraImagingLabWindow(tk.Toplevel):
             self._append_log("Import mode set to paired TIFF stacks.")
 
     def _load_recording(self) -> None:
+        self._recording = None
+        self._tracking_result = None
+        self._analysis_result = None
+        self._recording_summary_var.set("No valid recording loaded.")
         try:
             mode = self._source_mode_var.get().strip()
             if mode == "AXI":
@@ -425,19 +429,23 @@ class FuraImagingLabWindow(tk.Toplevel):
                     raise ValueError("Select both 340 nm and 380 nm TIFF stacks before loading.")
                 frame_interval = float(self._frame_interval_var.get().strip())
                 recording = load_tiff_pair_recording(path_340, path_380, frame_interval)
+            aligned = self._build_minimal_aligned_recording(recording)
             self._recording = recording
             self._tracking_result = None
             self._analysis_result = None
             self._roi_seeds.clear()
             self._refresh_roi_tree()
             ref = build_reference_frame(
-                self._build_minimal_aligned_recording(recording),
+                aligned,
                 channel="340",
                 average_count=5,
             )
             self._recording_summary_var.set(
                 f"Loaded: {recording.source_label}\n"
                 f"Frames 340/380: {len(recording.channel_340)} / {len(recording.channel_380)}\n"
+                f"Timestamp-matched pairs: {len(aligned.time_s)}\n"
+                f"Maximum pair separation: "
+                f"{np.max(np.abs(aligned.time_340_s - aligned.time_380_s)):.6g} s\n"
                 f"Resolution: {recording.width}x{recording.height}\n"
                 f"Crop origin: ({recording.crop_x}, {recording.crop_y})"
             )
@@ -562,6 +570,8 @@ class FuraImagingLabWindow(tk.Toplevel):
         if self._recording is None:
             self._show_error("Load a recording before running tracking.")
             return
+        self._tracking_result = None
+        self._analysis_result = None
         try:
             config = TrackingConfig(
                 reference_channel=self._reference_channel_var.get().strip() or "340",
@@ -605,6 +615,7 @@ class FuraImagingLabWindow(tk.Toplevel):
         if self._baseline_text is None or self._stim_text is None:
             self._show_error("Analysis controls are not initialized.")
             return
+        self._analysis_result = None
         try:
             baseline_periods = parse_period_text(self._baseline_text.get("1.0", tk.END))
             stimulations = parse_period_text(self._stim_text.get("1.0", tk.END))
@@ -919,10 +930,20 @@ def _circle_points_from_box(box: tuple[int, int, int, int], *, segments: int = 4
 
 
 def _tracking_signal_names(table: pd.DataFrame) -> list[str]:
+    metadata_columns = {
+        "Time",
+        "Time_340",
+        "Time_380",
+        "Pair_Delta_s",
+        "Source_Index_340",
+        "Source_Index_380",
+    }
     return [
         col
         for col in table.columns
-        if col != "Time" and not col.startswith("Background_") and not col.endswith("_Area_px")
+        if col not in metadata_columns
+        and not col.startswith("Background_")
+        and not col.endswith("_Area_px")
     ]
 
 

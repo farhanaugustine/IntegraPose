@@ -11,6 +11,15 @@ from integra_pose.gui.controllers.inference_controller import InferenceControlle
 from integra_pose.utils.config_manager import ConfigManager
 
 
+def test_multi_video_directory_detection_is_extension_aware(tmp_path: Path) -> None:
+    (tmp_path / "trial_a.mp4").write_bytes(b"a")
+    (tmp_path / "notes.txt").write_text("not a video", encoding="utf-8")
+    assert InferenceController._is_multi_video_directory(tmp_path) is False
+
+    (tmp_path / "trial_b.MOV").write_bytes(b"b")
+    assert InferenceController._is_multi_video_directory(tmp_path) is True
+
+
 def _make_tk_root():
     try:
         root = tk.Tk()
@@ -156,6 +165,66 @@ def test_run_file_inference_routes_to_runner_for_async_save(tmp_path: Path) -> N
         controller.run_file_inference()
 
         controller.build_supervision_settings.assert_called_once()
+        controller.start_supervision_inference.assert_called_once()
+        app.process_manager.start_process.assert_not_called()
+    finally:
+        try:
+            commands = set(root.tk.call("info", "commands"))
+        except tk.TclError:
+            commands = set()
+        if "destroy" in commands:
+            root.destroy()
+        tk._default_root = previous_default_root
+
+
+def test_run_file_inference_routes_single_video_crop_output_to_verified_runner(
+    tmp_path: Path,
+) -> None:
+    previous_default_root = getattr(tk, "_default_root", None)
+    root = _make_tk_root()
+    tk._default_root = root
+    try:
+        app = MagicMock()
+        app.root = root
+        app.log_message = MagicMock()
+        app.update_status = MagicMock()
+        app._set_job_status = MagicMock()
+        app._clear_process_stop_requested = MagicMock()
+        app._set_process_activity = MagicMock()
+        app._consume_process_stop_requested = MagicMock(return_value=False)
+        app._toast = MagicMock()
+        app.set_performance_warning = MagicMock()
+        app._supervision_annotations_selected = MagicMock(return_value=False)
+        app.performance_metrics_var = tk.StringVar(master=root, value="Idle")
+        app.performance_warning_var = tk.StringVar(master=root, value="")
+        app.overlay_controller = SimpleNamespace(
+            _capture_overlay_state=MagicMock(return_value={"booleans": {}}),
+            restore_overlay_bools=MagicMock(),
+        )
+        app.process_manager = SimpleNamespace(start_process=MagicMock(), terminate_process=MagicMock())
+        app.inference_lifecycle = SimpleNamespace(active_runner=None, start=MagicMock(), stop=MagicMock())
+        app.run_inference_button = MagicMock()
+        app.stop_inference_button = MagicMock()
+        app.snapshot_button = MagicMock()
+        app.config = ConfigManager(app)
+        app.config.analytics.single_animal_analysis_var.set(False)
+        source_path = tmp_path / "trial.mp4"
+        source_path.write_bytes(b"placeholder")
+        app.config.inference.video_infer_path.set(str(source_path))
+        app.config.inference.show_infer_var.set(False)
+        app.config.inference.capture_metrics_var.set(False)
+        app.config.inference.infer_save_var.set(False)
+        app.config.inference.infer_save_txt_var.set(False)
+        app.config.inference.infer_save_crop_var.set(True)
+
+        controller = InferenceController(app)
+        controller.build_supervision_settings = MagicMock(
+            return_value=SimpleNamespace(resource_guardrails_enabled=False)
+        )
+        controller.start_supervision_inference = MagicMock(return_value=True)
+
+        controller.run_file_inference()
+
         controller.start_supervision_inference.assert_called_once()
         app.process_manager.start_process.assert_not_called()
     finally:

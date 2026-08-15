@@ -1,16 +1,26 @@
+import json
+import logging
 import os
 import re
-import numpy as np
 from collections import defaultdict
-import umap
-import hdbscan
+
+import cv2
+import numpy as np
 import pandas as pd
-import logging
+from jsonschema import Draft7Validator, ValidationError, validate
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import pdist, squareform
-import cv2
-import json
-from jsonschema import validate, ValidationError, Draft7Validator
+
+from integra_pose.utils.frame_identity import (
+    FrameIdentityError,
+    load_frame_label_manifest,
+    parse_frame_index,
+    resolve_frame_label_indices,
+)
+from integra_pose.utils.yolo_pose_labels import (
+    load_pose_label_schema,
+    parse_yolo_pose_label,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,58 +43,28 @@ def validate_names(names, expected_count, description):
     return names
 
 
-def extract_frame_number(filename: str) -> int:
-    """Extract frame numbers from a wide range of YOLO export naming conventions."""
-    stem = os.path.splitext(filename)[0]
-    match = re.search(r'_(\d+)$', stem)
-    if match:
-        return int(match.group(1))
-    # Fallback: treat base file (e.g., video.txt) as frame zero.
-    return 0
+def extract_frame_number(filename: str) -> int | None:
+    """Compatibility wrapper around the shared frame-identity parser."""
+    return parse_frame_index(filename)
+
+
+def _matches_frame_source(filename: str, source_stem: str) -> bool:
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    if stem.isdigit() or re.fullmatch(r"(?i)(?:frame|frm|image|img)[_-]?\d+", stem):
+        return True
+    source_text = str(source_stem or "").strip()
+    if not source_text:
+        return True
+    if stem.casefold() == source_text.casefold():
+        return True
+    if not stem.casefold().startswith(source_text.casefold()):
+        return False
+    return stem[len(source_text):].startswith(("_", "-", "."))
 
 
 def _is_int_like(value: float, tolerance: float = 1e-6) -> bool:
     """Return True when *value* is effectively an integer."""
     return abs(value - round(value)) < tolerance
-
-
-def _parse_pose_line(parts: list[str], n_keypoints: int):
-    """
-    Parse a YOLO pose line, supporting optional bbox confidence and track identifiers.
-
-    Returns (class_id, bbox_values_or_None, pose_values, track_id_or_None).
-    """
-    if len(parts) < 1 + 3 * n_keypoints:
-        raise ValueError(f"Pose line too short ({len(parts)} tokens).")
-
-    class_id = int(float(parts[0]))
-    remainder = parts[1:]
-
-    bbox = None
-    if len(remainder) >= 4 + 3 * n_keypoints:
-        bbox = [float(tok) for tok in remainder[:4]]
-        remainder = remainder[4:]
-
-    pose_segment = remainder[-3 * n_keypoints :]
-    pose_data = [float(tok) for tok in pose_segment]
-    prefix = remainder[:-3 * n_keypoints]
-
-    bbox_conf = None
-    track_id = None
-    if prefix:
-        candidate = float(prefix[-1])
-        if _is_int_like(candidate):
-            track_id = int(round(candidate))
-            if track_id < 0:
-                track_id = None
-            prefix = prefix[:-1]
-    if prefix:
-        try:
-            bbox_conf = float(prefix[-1])
-        except ValueError:
-            bbox_conf = None
-
-    return class_id, bbox, pose_data, track_id, bbox_conf
 
 
 def _compute_centroid(det: dict) -> tuple[np.ndarray | None, float]:
@@ -226,7 +206,7 @@ def _ensure_track_ids(detections: list[dict], max_frame_gap: int = 10) -> None:
 def read_detections(group_dirs, keypoint_names_str, behavior_names_str, use_bbox_hint=True, video_path_map=None, subject_id_map=None):
     """Reads YOLO pose exports, handling optional bbox/track metadata and frame numbering.
 
-    ``subject_id_map`` (ADP-4) is an optional ``{pose_dir: subject_id}`` map.
+    ``subject_id_map`` is an optional ``{pose_dir: subject_id}`` map.
     When supplied, every emitted row carries a ``subject_id`` column —
     that's what Tab 7's auto train/val/test split keys on. When absent or
     a directory has no entry, ``subject_id`` falls back to the directory
@@ -252,7 +232,7 @@ def read_detections(group_dirs, keypoint_names_str, behavior_names_str, use_bbox
 
             logger.info("Processing group %s, directory: %s", group, directory)
             video_source = os.path.basename(directory)
-            # ADP-4 subject identity: prefer the explicit map; fall back to
+            # Prefer the explicit subject map; fall back to
             # the directory basename. Always non-empty.
             subject_id = str(subject_id_map.get(directory) or "").strip()
             if not subject_id:
@@ -260,8 +240,8 @@ def read_detections(group_dirs, keypoint_names_str, behavior_names_str, use_bbox
 
             video_width = None
             video_height = None
+            video_path = video_path_map.get(directory) if video_path_map and directory in video_path_map else None
             if video_path_map and directory in video_path_map:
-                video_path = video_path_map.get(directory)
                 if video_path in video_dims_cache:
                     video_width, video_height = video_dims_cache[video_path]
                 elif video_path and os.path.exists(video_path):
@@ -288,13 +268,50 @@ def read_detections(group_dirs, keypoint_names_str, behavior_names_str, use_bbox
                 )
 
             per_directory = []
-            file_names = sorted(fname for fname in os.listdir(directory) if fname.endswith(".txt"))
+            pose_schema = load_pose_label_schema(
+                directory,
+                expected_keypoint_count=n_keypoints,
+            )
+            file_names = sorted(fname for fname in os.listdir(directory) if fname.lower().endswith(".txt"))
             if not file_names:
                 logger.warning("No pose files found in %s", directory)
                 continue
 
-            for filename in file_names:
-                frame_num = extract_frame_number(filename)
+            frame_manifest = load_frame_label_manifest(directory)
+            manifest_source = str(frame_manifest.get("source_stem") or "").strip()
+            video_source_hint = os.path.splitext(os.path.basename(str(video_path or "")))[0]
+            if manifest_source and video_source_hint and manifest_source.casefold() != video_source_hint.casefold():
+                raise FrameIdentityError(
+                    f"Frame-label manifest source {manifest_source!r} does not match video {video_source_hint!r}."
+                )
+            scoped_source = video_source_hint or manifest_source
+            scoped_file_names = [
+                filename for filename in file_names if _matches_frame_source(filename, scoped_source)
+            ]
+            skipped_source_files = sorted(set(file_names) - set(scoped_file_names))
+            if skipped_source_files:
+                logger.warning(
+                    "Skipping %s TXT file(s) that do not belong to source '%s' (e.g. %s).",
+                    len(skipped_source_files),
+                    scoped_source,
+                    ", ".join(skipped_source_files[:3]),
+                )
+            source_hint = video_path or manifest_source or None
+            frame_map = resolve_frame_label_indices(scoped_file_names, source=source_hint)
+            skipped_files = sorted(set(scoped_file_names) - set(frame_map))
+            if skipped_files:
+                logger.warning(
+                    "Skipping %s auxiliary/unparseable TXT file(s) in %s (e.g. %s).",
+                    len(skipped_files),
+                    directory,
+                    ", ".join(skipped_files[:3]),
+                )
+            if not frame_map:
+                logger.warning("No frame-indexed pose files found in %s", directory)
+                continue
+
+            ordered_frame_files = sorted(frame_map.items(), key=lambda item: (item[1], item[0]))
+            for filename, frame_num in ordered_frame_files:
                 file_path = os.path.join(directory, filename)
 
                 try:
@@ -304,12 +321,21 @@ def read_detections(group_dirs, keypoint_names_str, behavior_names_str, use_bbox
                             if not parts:
                                 continue
                             try:
-                                class_id, bbox_norm, pose_norm, track_id, _ = _parse_pose_line(parts, n_keypoints)
+                                parsed = parse_yolo_pose_label(
+                                    parts,
+                                    keypoint_count=n_keypoints,
+                                    schema=pose_schema,
+                                )
                             except ValueError as exc:
                                 logger.warning(
                                     "Skipping malformed line %s in %s: %s", line_num, filename, exc
                                 )
                                 continue
+
+                            class_id = parsed.class_id
+                            bbox_norm = list(parsed.bbox) if parsed.bbox is not None else None
+                            pose_norm = [value for point in parsed.keypoints_xyc() for value in point]
+                            track_id = parsed.track_id
 
                             bbox = None
                             if bbox_norm and use_bbox_hint:
@@ -349,6 +375,7 @@ def read_detections(group_dirs, keypoint_names_str, behavior_names_str, use_bbox
                                     "track_id": track_id,
                                     "keypoints": keypoints,
                                     "bbox": bbox,
+                                    "bbox_conf": parsed.bbox_confidence,
                                     "video_width": video_width,
                                     "video_height": video_height,
                                 }
@@ -660,6 +687,14 @@ def split_sequences(tracks, max_gap):
 
 def cluster_poses(detections_df, umap_neighbors=30, umap_components=5, min_cluster_size=75):
     """Clusters pose feature vectors using UMAP and HDBSCAN and assigns labels."""
+    try:
+        import hdbscan
+        import umap
+    except ImportError as exc:
+        raise ImportError(
+            "Pose clustering requires the optional 'umap-learn' and 'hdbscan' packages."
+        ) from exc
+
     logger.debug(f"Clustering {len(detections_df)} feature vectors with umap_neighbors={umap_neighbors}, "
                  f"umap_components={umap_components}, min_cluster_size={min_cluster_size}")
     

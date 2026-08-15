@@ -1,10 +1,8 @@
-"""Tests for ADP-4 Commit G — state_names.json run_id isolation.
+"""Tests for ``state_names.json`` run-ID isolation.
 
-Why this matters: clusters are unstable across runs with different
-parameters. A name like ``"forward-locomotion"`` for label ``0:1`` from
-run A may correspond to a *different* sub-behavior in run B's ``0:1``.
-We tag each run with a UUID and refuse to load names from a file with
-a different run_id.
+Cluster identifiers can change when parameters change. A name assigned to
+``0:1`` in one run must not be applied to ``0:1`` in another run. The tests
+verify that names are loaded only when run IDs match.
 
 Pure-logic tests against the module-level ``load_state_names`` helper —
 no Tk required.
@@ -61,16 +59,16 @@ class TestLoadStateNames(unittest.TestCase):
             names = load_state_names(td, "new-uuid")
             self.assertEqual(names, {})
 
-    def test_loads_v1_schema_unconditionally(self) -> None:
-        # Schema v1 (pre-run_id) — no run_id field. Loader should not
-        # punish users who saved names before this feature shipped.
+    def test_rejects_v1_schema_for_a_known_new_run(self) -> None:
+        # Schema v1 has no provenance. Applying its cluster names to a known
+        # new run could silently relabel different sub-behaviors.
         with tempfile.TemporaryDirectory() as td:
             self._write(td, {
                 "schema_version": 1,
                 "state_names": {"0:1": "rear-up"},
             })
             names = load_state_names(td, "any-uuid")
-            self.assertEqual(names, {"0:1": "rear-up"})
+            self.assertEqual(names, {})
 
     def test_loads_when_caller_has_no_run_id(self) -> None:
         # If the caller doesn't know the current run_id, loader returns
@@ -83,18 +81,15 @@ class TestLoadStateNames(unittest.TestCase):
             self.assertEqual(load_state_names(td, ""), {"1:0": "groom"})
             self.assertEqual(load_state_names(td, None), {"1:0": "groom"})
 
-    def test_loads_when_file_has_blank_run_id(self) -> None:
-        # File saved without a run_id (older save path) — we don't have
-        # a basis to reject it, so load.
+    def test_rejects_blank_file_run_id_for_a_known_new_run(self) -> None:
+        # A blank file run id is also unprovenanced and must not be applied
+        # automatically when the caller knows the current run.
         with tempfile.TemporaryDirectory() as td:
             self._write(td, {
                 "run_id": "",
                 "state_names": {"0:1": "saved-without-stamp"},
             })
-            self.assertEqual(
-                load_state_names(td, "current-uuid"),
-                {"0:1": "saved-without-stamp"},
-            )
+            self.assertEqual(load_state_names(td, "current-uuid"), {})
 
     def test_corrupt_json_returns_empty(self) -> None:
         with tempfile.TemporaryDirectory() as td:

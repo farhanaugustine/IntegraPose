@@ -8,7 +8,7 @@
 #   python tools/install_albumentations_gui.py   # optional augmentation
 #
 # Notes:
-#   * Pinning to Python 3.11; tested range is 3.9–3.11.
+#   * Pinning to Python 3.11; supported range is 3.10-3.11.
 #   * PyTorch is intentionally NOT pinned here. Install the build that
 #     matches your hardware (CPU / CUDA / ROCm) by following:
 #       https://pytorch.org/get-started/locally/

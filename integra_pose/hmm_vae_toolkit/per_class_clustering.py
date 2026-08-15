@@ -1,38 +1,11 @@
-"""ADP-4 Tab 7 — per-class sub-behavior clustering.
+"""Per-class sub-behavior clustering for Tab 7.
 
-This module is the new heart of Tab 7. Instead of pooling all detections
-into one HMM, we **filter detections to one YOLO class at a time and
-cluster within each class**. The output: per-frame sub-cluster labels
-that say "this walking frame belongs to sub-type 2 of walking" — which
-is what the user actually wants from Tab 7.
+Detections are grouped by YOLO class and clustered independently. This
+preserves the supervised class label while assigning a sub-cluster label to
+each frame. UMAP is used for optional dimensionality reduction, followed by
+HDBSCAN clustering within each class.
 
-Why per-class:
-
-- Tabs 1–6 already produce trustworthy macro labels (walking, rearing,
-  grooming) via supervised YOLO-pose. Tab 7's job isn't to second-guess
-  those — it's to dissect *within* each known class and surface
-  variations the user couldn't have annotated upfront.
-- Pooling across classes (the old HMM approach) blurs the question.
-  "State 4 contains some walking and some rearing" tells the researcher
-  nothing they can act on. "Walking has 3 sub-types" is something they
-  can name, defend, and feed back into a finer-grained classifier.
-- Each class clusters in its own feature subspace; HDBSCAN's
-  ``min_cluster_size`` and noise label naturally filter rare or
-  ambiguous frames.
-
-Why HDBSCAN (no HMM, no VAE/LSTM-AE):
-
-- HDBSCAN handles variable-density clusters without a "how many states"
-  hyperparameter. The user doesn't have to guess.
-- HMM was the wrong fit for per-class because it pools data across
-  classes by construction; running one HMM per class would multiply
-  the seeded-randomness sources and complicate the report.
-- VAE+LSTM-AE adds 200+ epochs of training for embeddings that, in
-  practice, give similar HDBSCAN clusters to the raw normalized
-  feature vectors UMAP-reduced. Skip the heavy step until a user
-  shows it makes a difference for their data.
-
-The flow is intentionally short:
+Processing flow:
 
     detections_df (with `class_id` + `feature_vector`)
         ↓  for each class_id:
@@ -44,7 +17,7 @@ The flow is intentionally short:
         ↓
     Pass to `aggregate_states_into_bouts(state_column='cluster_label')`
         ↓
-    Sub-behavior bouts ready for naming, held-out evaluation, clip export.
+    Sub-behavior bouts for naming, held-out evaluation, and clip export.
 
 Cluster IDs are namespaced per class (e.g. ``"0:1"``, ``"0:2"``,
 ``"1:1"``) so two different classes can each have their own
@@ -61,14 +34,11 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-# Default seed for UMAP reproducibility. The auto-split helper uses 42
-# (defined in splits.py) and we mirror it here. The two seeds are
-# independent — the split seed assigns subjects to partitions, this seed
-# governs UMAP's initial state during dimensionality reduction.
+# Default seed for UMAP reproducibility. This seed is independent of the
+# subject-split seed defined in splits.py.
 DEFAULT_CLUSTERING_SEED = 42
 
-# When fewer than this many frames belong to a class, we skip clustering
-# for that class entirely and surface a "skipped" entry in the result.
+# Classes with fewer frames are skipped and recorded in the result.
 # 30 is a heuristic — above it HDBSCAN with min_cluster_size=10 has
 # enough room to actually find structure; below it the result is just
 # noise. Override per-call via `min_class_size`.
@@ -177,7 +147,9 @@ def cluster_per_class(
             it.
         min_class_size: Skip any class with fewer rows. Default 30.
         min_cluster_size: HDBSCAN ``min_cluster_size``. Default 10.
-        umap_neighbors: UMAP ``n_neighbors``. Default 15.
+        umap_neighbors: UMAP ``n_neighbors``. Use 0 to skip UMAP and
+            cluster the normalized feature vectors directly. Otherwise this
+            must be at least 2. Default 15.
         umap_components: UMAP target dim. Default 5.
         seed: UMAP ``random_state``. Default 42 (matches splits.py).
         label_column: Column name to write the cluster ids into.
@@ -192,12 +164,21 @@ def cluster_per_class(
     Raises:
         ValueError: If ``detections_df`` lacks ``class_id`` or
             ``feature_vector``. Both are produced by upstream
-            ``read_detections`` + feature pipeline; if either is absent
-            we surface a clear error rather than silently fail.
+            ``read_detections`` and the feature pipeline.
     """
     # Late imports keep this module cheap to import.
     import numpy as np
-    import pandas as pd
+
+    if min_class_size < 1:
+        raise ValueError("cluster_per_class: min_class_size must be at least 1.")
+    if min_cluster_size < 2:
+        raise ValueError("cluster_per_class: min_cluster_size must be at least 2.")
+    if umap_neighbors < 0 or umap_neighbors == 1:
+        raise ValueError(
+            "cluster_per_class: umap_neighbors must be 0 (disabled) or at least 2."
+        )
+    if umap_components < 1:
+        raise ValueError("cluster_per_class: umap_components must be at least 1.")
 
     if detections_df is None or len(detections_df) == 0:
         raise ValueError("cluster_per_class: detections_df is empty.")
@@ -209,8 +190,7 @@ def cluster_per_class(
             )
 
     out_df = detections_df.copy()
-    # Initialize the column as the noise sentinel so any rows we don't
-    # explicitly assign (e.g. classes that get skipped) end up in noise.
+    # Initialize unassigned and skipped rows with the noise sentinel.
     out_df[label_column] = "-1"
 
     classes: list[PerClassClusterResult] = []
@@ -309,27 +289,29 @@ def _cluster_one_class(
     skipping UMAP entirely and feeding raw features to HDBSCAN — this
     keeps small classes (just above ``min_class_size``) from failing.
     """
-    import numpy as np
-
     n = feature_matrix.shape[0]
 
-    # If we have fewer rows than UMAP needs, skip UMAP. HDBSCAN can
-    # handle the original feature space directly.
-    if n <= umap_neighbors + 1:
+    # A zero value explicitly disables UMAP. Small classes also use the raw
+    # normalized features because UMAP cannot form a valid neighbourhood.
+    if umap_neighbors == 0 or n <= umap_neighbors + 1:
         reduced = feature_matrix
-        logger.debug(
-            "Skipping UMAP for small class (%d rows ≤ umap_neighbors+1=%d); "
-            "running HDBSCAN on raw features.",
-            n, umap_neighbors + 1,
-        )
+        if umap_neighbors == 0:
+            logger.debug("UMAP disabled; running HDBSCAN on raw features.")
+        else:
+            logger.debug(
+                "Skipping UMAP for small class (%d rows <= umap_neighbors+1=%d); "
+                "running HDBSCAN on raw features.",
+                n,
+                umap_neighbors + 1,
+            )
     else:
         try:
             import umap as _umap_lib  # late import — heavy
         except Exception as exc:
             raise ImportError(
                 "cluster_per_class: UMAP is required. "
-                "`pip install umap-learn`. (For sandboxes without UMAP, "
-                "set umap_neighbors=0 to skip dim-reduction — but for "
+                "`pip install umap-learn`. (For environments without UMAP, "
+                "set umap_neighbors=0 to skip dimension reduction, but for "
                 "real data UMAP yields better clusters.)"
             ) from exc
 

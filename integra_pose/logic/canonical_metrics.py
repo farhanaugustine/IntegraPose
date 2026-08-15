@@ -85,6 +85,8 @@ def compile_metrics_from_labels(
     motion_direction_threshold_deg: float = 15.0,
     motion_velocity_threshold_px: float = 0.0,
     heading_indices: Optional[tuple[int, int]] = None,
+    anchor_keypoint_index: Optional[int] = None,
+    keypoint_names: Optional[list[str]] = None,
     log_fn: Optional[LogFn] = None,
 ) -> CanonicalMetricsResult:
     log = log_fn or _default_log
@@ -137,63 +139,93 @@ def compile_metrics_from_labels(
     threshold = max(0.0, float(motion_direction_threshold_deg))
     velocity_floor = max(0.0, float(motion_velocity_threshold_px))
     heading_pair = None
-    if heading_indices and len(kp_prefixes) > max(heading_indices):
-        heading_pair = (int(heading_indices[0]), int(heading_indices[1]))
+    if keypoint_names and len(keypoint_names) != len(kp_prefixes):
+        raise ValueError(
+            "Canonical metrics keypoint schema mismatch: "
+            f"labels.csv contains {len(kp_prefixes)} keypoints but {len(keypoint_names)} names were supplied."
+        )
+    if heading_indices is not None:
+        if len(heading_indices) != 2:
+            raise ValueError("heading_indices must contain exactly two keypoint indices.")
+        parsed_heading = (int(heading_indices[0]), int(heading_indices[1]))
+        if min(parsed_heading) < 0 or parsed_heading[0] == parsed_heading[1] or max(parsed_heading) >= len(kp_prefixes):
+            raise ValueError(
+                f"Heading indices {parsed_heading} are invalid for {len(kp_prefixes)} keypoints."
+            )
+        heading_pair = parsed_heading
+    anchor_index = None
+    if anchor_keypoint_index is not None:
+        anchor_index = int(anchor_keypoint_index)
+        if anchor_index < 0 or anchor_index >= len(kp_prefixes):
+            raise ValueError(
+                f"Anchor keypoint index {anchor_index} is invalid for {len(kp_prefixes)} keypoints."
+            )
 
     base_rows: list[dict[str, object]] = []
-    for row in work.itertuples(index=False):
-        frame_index = int(getattr(row, "frame"))
-        det_index = int(getattr(row, "det_index"))
-        center_x = float(getattr(row, "x_center_n")) * fw
-        center_y = float(getattr(row, "y_center_n")) * fh
+    for row in work.to_dict(orient="records"):
+        frame_index = int(row["frame"])
+        det_index = int(row["det_index"])
+        center_x = float(row["x_center_n"]) * fw
+        center_y = float(row["y_center_n"]) * fh
         anchor_x = center_x
         anchor_y = center_y
-        orientation_bearing = _bearing(center_x - cx_frame, cy_frame - center_y)
+        anchor_source = "bbox_center"
+        orientation_bearing = np.nan
+        orientation_source = "unavailable"
         body_length = np.nan
         body_aspect = np.nan
 
         kp_points: list[tuple[float, float]] = []
         for x_col, y_col in zip(kp_x_cols, kp_y_cols):
-            kp_x = getattr(row, x_col, np.nan)
-            kp_y = getattr(row, y_col, np.nan)
+            kp_x = row.get(x_col, np.nan)
+            kp_y = row.get(y_col, np.nan)
             if pd.notna(kp_x) and pd.notna(kp_y):
                 kp_points.append((float(kp_x) * fw, float(kp_y) * fh))
             else:
                 kp_points.append((float("nan"), float("nan")))
+
+        if anchor_index is not None:
+            kp_anchor = kp_points[anchor_index]
+            if all(np.isfinite(value) for value in kp_anchor):
+                anchor_x = float(kp_anchor[0])
+                anchor_y = float(kp_anchor[1])
+                anchor_source = f"keypoint_{anchor_index}"
 
         if heading_pair is not None:
             try:
                 kp_root = kp_points[heading_pair[0]]
                 kp_tip = kp_points[heading_pair[1]]
                 if all(np.isfinite(value) for value in (*kp_root, *kp_tip)):
-                    anchor_x = float(kp_root[0] + kp_tip[0]) / 2.0
-                    anchor_y = float(kp_root[1] + kp_tip[1]) / 2.0
+                    if anchor_source == "bbox_center":
+                        anchor_x = float(kp_root[0] + kp_tip[0]) / 2.0
+                        anchor_y = float(kp_root[1] + kp_tip[1]) / 2.0
+                        anchor_source = "heading_midpoint"
                     vec_x = float(kp_tip[0] - kp_root[0])
                     vec_y = float(kp_tip[1] - kp_root[1])
                     orientation_bearing = _bearing(vec_x, -vec_y)
+                    orientation_source = f"keypoints_{heading_pair[0]}_to_{heading_pair[1]}"
                     body_length = float(math.hypot(vec_x, vec_y))
             except Exception:
                 pass
 
         finite_points = [(x, y) for x, y in kp_points if np.isfinite(x) and np.isfinite(y)]
-        if finite_points:
-            xs = [x for x, _ in finite_points]
-            ys = [y for _, y in finite_points]
-            width = float(max(xs) - min(xs))
-            height = float(max(ys) - min(ys))
-            minor = max(min(width, height), 1e-3)
-            if np.isfinite(body_length):
-                body_aspect = float(body_length / minor)
-            else:
-                body_aspect = float(max(width, height) / minor) if minor > 0 else np.nan
+        if len(finite_points) >= 3:
+            coords = np.asarray(finite_points, dtype=float)
+            centered = coords - coords.mean(axis=0, keepdims=True)
+            covariance = np.cov(centered, rowvar=False, ddof=1)
+            eigenvalues = np.linalg.eigvalsh(covariance)
+            major_variance = float(np.nanmax(eigenvalues))
+            minor_variance = float(np.nanmin(eigenvalues))
+            if major_variance > 0.0 and minor_variance > 1e-6:
+                body_aspect = float(math.sqrt(major_variance / minor_variance))
 
-        raw_track = getattr(row, "track_id", None) if "track_id" in work.columns else None
+        raw_track = row.get("track_id") if "track_id" in work.columns else None
         object_id = _coerce_object_id(raw_track, frame_index=frame_index, detection_index=det_index)
 
         class_id = 0
         if "class_id" in work.columns:
             try:
-                raw_class = getattr(row, "class_id")
+                raw_class = row.get("class_id")
                 if pd.notna(raw_class):
                     class_id = int(raw_class)
             except Exception:
@@ -201,7 +233,7 @@ def compile_metrics_from_labels(
 
         confidence = np.nan
         if "bbox_conf" in work.columns:
-            raw_conf = getattr(row, "bbox_conf")
+            raw_conf = row.get("bbox_conf")
             if pd.notna(raw_conf):
                 confidence = float(raw_conf)
 
@@ -213,8 +245,10 @@ def compile_metrics_from_labels(
                 "confidence": confidence,
                 "anchor_x_px": float(anchor_x),
                 "anchor_y_px": float(anchor_y),
+                "anchor_source": anchor_source,
                 "distance_from_frame_center_px": float(math.hypot(anchor_x - cx_frame, anchor_y - cy_frame)),
-                "orientation_deg": float(orientation_bearing),
+                "orientation_deg": float(orientation_bearing) if np.isfinite(orientation_bearing) else np.nan,
+                "orientation_source": orientation_source,
                 "body_length_px": body_length,
                 "body_aspect_ratio": body_aspect,
             }
@@ -273,7 +307,10 @@ def compile_metrics_from_labels(
         direction_shifts = 0
         last_velocity = None
         last_orientation = None
+        last_orientation_frame = None
+        last_frame = None
         for idx in group.index:
+            frame_value = int(metrics_df.at[idx, "frame"])
             anchor_x = float(metrics_df.at[idx, "anchor_x_px"])
             anchor_y = float(metrics_df.at[idx, "anchor_y_px"])
             orientation = float(metrics_df.at[idx, "orientation_deg"])
@@ -284,11 +321,13 @@ def compile_metrics_from_labels(
             signed_angular_velocity = np.nan
 
             if last_center is not None:
+                frame_delta = max(1, frame_value - int(last_frame)) if last_frame is not None else 1
                 dx = anchor_x - last_center[0]
                 dy = anchor_y - last_center[1]
                 step_distance = float(math.hypot(dx, dy))
-                if step_distance > 0.0 and step_distance >= velocity_floor:
-                    velocity = step_distance
+                speed = step_distance / float(frame_delta)
+                if step_distance > 0.0 and speed >= velocity_floor:
+                    velocity = speed
                     movement_bearing = float(_bearing(dx, -dy))
                     if last_movement_bearing is not None:
                         delta = _angular_delta(last_movement_bearing, movement_bearing)
@@ -297,7 +336,7 @@ def compile_metrics_from_labels(
                     last_movement_bearing = movement_bearing
                     total_distance += step_distance
                     if last_velocity is not None:
-                        acceleration = float(velocity - last_velocity)
+                        acceleration = float((velocity - last_velocity) / float(frame_delta))
                     last_velocity = velocity
                 else:
                     last_velocity = 0.0
@@ -305,11 +344,15 @@ def compile_metrics_from_labels(
                 last_movement_bearing = None
                 last_velocity = 0.0
 
-            if last_orientation is not None:
-                signed_angular_velocity = float(_signed_angular_delta(last_orientation, orientation))
+            if np.isfinite(orientation) and last_orientation is not None and last_orientation_frame is not None:
+                frame_delta = max(1, frame_value - int(last_orientation_frame))
+                signed_angular_velocity = float(_signed_angular_delta(last_orientation, orientation) / float(frame_delta))
                 angular_velocity = float(abs(signed_angular_velocity))
-            last_orientation = orientation
+            if np.isfinite(orientation):
+                last_orientation = orientation
+                last_orientation_frame = frame_value
             last_center = (anchor_x, anchor_y)
+            last_frame = frame_value
 
             metrics_df.at[idx, "movement_speed_px_per_frame"] = float(velocity)
             metrics_df.at[idx, "acceleration_px_per_frame2"] = acceleration
@@ -328,7 +371,7 @@ def compile_metrics_from_labels(
         return CanonicalMetricsResult(metrics_csv=metrics_csv, metadata_json=metadata_json)
 
     metadata = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source": "labels_csv_canonical_compiler",
         "labels_csv": str(labels_csv_path),
         "frame_width": int(frame_width or 0),
@@ -337,6 +380,10 @@ def compile_metrics_from_labels(
         "motion_direction_threshold_deg": float(motion_direction_threshold_deg),
         "motion_velocity_threshold_px": float(motion_velocity_threshold_px),
         "heading_indices": [int(idx) for idx in heading_indices] if heading_indices else None,
+        "anchor_keypoint_index": int(anchor_keypoint_index) if anchor_keypoint_index is not None else None,
+        "keypoint_names": [str(name) for name in (keypoint_names or [])],
+        "orientation_fallback": "nan_when_heading_unavailable",
+        "speed_semantics": "pixel_displacement_divided_by_frame_delta",
     }
     try:
         metadata_json.write_text(json.dumps(metadata, indent=2), encoding="utf-8")

@@ -18,6 +18,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+from integra_pose.logic.batch_design import parse_time_point_numeric
+
 MIN_FACTOR_REPLICATES = 2
 MIN_KPSS_TIMEPOINTS = 5
 MIN_REPEATED_SUBJECTS_FOR_MIXED = 2
@@ -30,7 +32,7 @@ def _coerce_numeric(series: pd.Series) -> pd.Series:
 def _epsilon_squared_kruskal(h_stat: float, n_total: int, n_groups: int) -> float:
     if n_total <= n_groups or n_groups <= 1:
         return np.nan
-    return float((h_stat - n_groups + 1) / (n_total - n_groups))
+    return float(max(0.0, (h_stat - n_groups + 1) / (n_total - n_groups)))
 
 
 def _cliffs_delta(x: Iterable[float], y: Iterable[float]) -> float:
@@ -79,10 +81,89 @@ def _apply_pvalue_correction(df: pd.DataFrame, p_col: str, method: str) -> pd.Da
     return out
 
 
+def _finalize_time_series_stats(
+    rows: list[dict],
+    *,
+    correction_method: str = "fdr_bh",
+) -> pd.DataFrame:
+    result = pd.DataFrame(rows)
+    if result.empty or "p_value" not in result.columns:
+        return result
+    result["p_adj"] = np.nan
+    result["reject_h0"] = False
+    for analysis_name in ("kpss", "mixedlm"):
+        mask = result["analysis"].eq(analysis_name) & result["p_value"].notna()
+        if analysis_name == "mixedlm" and "term" in result.columns:
+            mask &= result["term"].fillna("").ne("Intercept")
+        if not mask.any():
+            continue
+        reject, adjusted, _, _ = multipletests(
+            result.loc[mask, "p_value"].to_numpy(dtype=float),
+            method=correction_method,
+        )
+        result.loc[mask, "p_adj"] = adjusted
+        result.loc[mask, "reject_h0"] = np.asarray(reject, dtype=bool)
+    return result
+
+
 def _clean_factor_series(series: pd.Series, *, unknown_token: str = "__missing__") -> pd.Series:
     out = series.fillna(unknown_token).astype(str).str.strip()
     out = out.replace({"": unknown_token})
     return out
+
+
+def _subject_analysis_frame(
+    work: pd.DataFrame,
+    *,
+    metric: str,
+    subject_col: str,
+    group_col: str,
+) -> tuple[pd.DataFrame, str, int, int]:
+    """Collapse repeated videos to one independent unit per factor level."""
+
+    frame = work.copy()
+    frame["__metric__"] = _coerce_numeric(frame[metric])
+    frame = frame.dropna(subset=["__metric__"])
+    raw_n = int(len(frame))
+    if frame.empty:
+        return frame, "unavailable", raw_n, 0
+
+    if subject_col in frame.columns:
+        subjects = frame[subject_col].fillna("").astype(str).str.strip()
+    else:
+        subjects = pd.Series("", index=frame.index, dtype=object)
+    explicit_subject = subjects.ne("")
+
+    if "video_id" in frame.columns:
+        video_ids = frame["video_id"].fillna("").astype(str).str.strip()
+    else:
+        video_ids = pd.Series("", index=frame.index, dtype=object)
+    fallback_ids = video_ids.where(video_ids.ne(""), frame.index.map(lambda idx: f"row_{idx}"))
+    subject_keys = subjects.where(explicit_subject, "__video__:" + fallback_ids)
+
+    # Subject identifiers are commonly scoped within a treatment group. The
+    # composite key prevents identically named animals in different cohorts
+    # from being merged into one random/independent unit.
+    if group_col in frame.columns:
+        groups = _clean_factor_series(frame[group_col])
+        subject_keys = groups + "\x1f" + subject_keys
+    frame["__unit__"] = subject_keys
+
+    if explicit_subject.all():
+        analysis_unit = "subject_mean"
+    elif explicit_subject.any():
+        analysis_unit = "subject_mean_with_video_fallback"
+    else:
+        analysis_unit = "video"
+
+    collapsed = (
+        frame.groupby(["__factor__", "__unit__"], as_index=False, dropna=False)["__metric__"]
+        .mean()
+    )
+    crossing_units = int(
+        (collapsed.groupby("__unit__")["__factor__"].nunique(dropna=False) > 1).sum()
+    )
+    return collapsed, analysis_unit, raw_n, crossing_units
 
 
 def _build_factor_frames(
@@ -155,6 +236,7 @@ def compute_nonparametric_group_stats(
     """
     kruskal_failures: list[str] = []
     mannwhitney_failures: list[str] = []
+    reported_unit_fallbacks: set[str] = set()
     if video_summary_df is None or video_summary_df.empty:
         empty = pd.DataFrame()
         return empty, empty, empty
@@ -208,10 +290,29 @@ def compute_nonparametric_group_stats(
             continue
 
         for metric in numeric_metrics:
+            unit_frame, analysis_unit, raw_metric_n, crossing_units = _subject_analysis_frame(
+                work,
+                metric=metric,
+                subject_col=subject_col,
+                group_col=group_col,
+            )
+            if unit_frame.empty:
+                continue
+            if analysis_unit != "subject_mean" and factor_name not in reported_unit_fallbacks:
+                reported_unit_fallbacks.add(factor_name)
+                if log_fn is not None:
+                    log_fn(
+                        f"Group stats factor '{factor_name}' contains missing subject IDs; "
+                        f"independent video IDs are used only for those rows (analysis_unit={analysis_unit}).",
+                        "WARNING",
+                    )
             grouped_values: list[tuple[str, np.ndarray]] = []
             underpowered_levels: list[str] = []
             for lvl in levels:
-                values = _coerce_numeric(work.loc[work["__factor__"] == lvl, metric]).dropna().to_numpy(dtype=float)
+                values = unit_frame.loc[
+                    unit_frame["__factor__"] == lvl,
+                    "__metric__",
+                ].to_numpy(dtype=float)
                 if values.size > 0:
                     grouped_values.append((lvl, values))
                     if values.size < MIN_FACTOR_REPLICATES:
@@ -224,14 +325,37 @@ def compute_nonparametric_group_stats(
             analysis_scope = (
                 "group_level" if factor_name == "group" else ("global_level" if factor_name == "global_combined" else "factor_level")
             )
-            if underpowered_levels:
+            if crossing_units:
+                note = (
+                    "skipped:independent_sample_test_invalid;"
+                    f" {crossing_units}_subject_units_span_multiple_factor_levels; use_mixedlm"
+                )
                 omnibus_rows.append(
                     {
                         "analysis_scope": analysis_scope,
+                        "analysis_unit": analysis_unit,
                         "factor": factor_name,
                         "metric": metric,
                         "groups_compared": len(grouped_values),
                         "n_total": metric_n,
+                        "raw_row_n": raw_metric_n,
+                        "kruskal_h": np.nan,
+                        "p_value": np.nan,
+                        "epsilon_squared": np.nan,
+                        "note": note,
+                    }
+                )
+                continue
+            if underpowered_levels:
+                omnibus_rows.append(
+                    {
+                        "analysis_scope": analysis_scope,
+                        "analysis_unit": analysis_unit,
+                        "factor": factor_name,
+                        "metric": metric,
+                        "groups_compared": len(grouped_values),
+                        "n_total": metric_n,
+                        "raw_row_n": raw_metric_n,
                         "kruskal_h": np.nan,
                         "p_value": np.nan,
                         "epsilon_squared": np.nan,
@@ -265,10 +389,12 @@ def compute_nonparametric_group_stats(
             omnibus_rows.append(
                 {
                     "analysis_scope": analysis_scope,
+                    "analysis_unit": analysis_unit,
                     "factor": factor_name,
                     "metric": metric,
                     "groups_compared": len(grouped_values),
                     "n_total": metric_n,
+                    "raw_row_n": raw_metric_n,
                     "kruskal_h": h_stat,
                     "p_value": p_value,
                     "epsilon_squared": epsilon_sq,
@@ -279,6 +405,7 @@ def compute_nonparametric_group_stats(
                 {
                     "factor": factor_name,
                     "metric": metric,
+                    "analysis_unit": analysis_unit,
                     "effect_type": "epsilon_squared",
                     "value": epsilon_sq,
                     "context": f"{factor_name}:kruskal_omnibus",
@@ -289,12 +416,14 @@ def compute_nonparametric_group_stats(
                 pairwise_rows.append(
                     {
                         "analysis_scope": analysis_scope,
+                        "analysis_unit": analysis_unit,
                         "factor": factor_name,
                         "metric": metric,
                         "group_a": "",
                         "group_b": "",
                         "n_a": np.nan,
                         "n_b": np.nan,
+                        "raw_row_n": raw_metric_n,
                         "u_stat": np.nan,
                         "p_value": np.nan,
                         "cliffs_delta": np.nan,
@@ -329,12 +458,14 @@ def compute_nonparametric_group_stats(
                     pairwise_rows.append(
                         {
                             "analysis_scope": analysis_scope,
+                            "analysis_unit": analysis_unit,
                             "factor": factor_name,
                             "metric": metric,
                             "group_a": g1,
                             "group_b": g2,
                             "n_a": int(a.size),
                             "n_b": int(b.size),
+                            "raw_row_n": raw_metric_n,
                             "u_stat": u_stat,
                             "p_value": p_pair,
                             "cliffs_delta": delta,
@@ -345,6 +476,7 @@ def compute_nonparametric_group_stats(
                         {
                             "factor": factor_name,
                             "metric": metric,
+                            "analysis_unit": analysis_unit,
                             "effect_type": "cliffs_delta",
                             "value": delta,
                             "context": f"{factor_name}:{g1}_vs_{g2}",
@@ -385,8 +517,11 @@ def compute_kpss_and_mixed_effects(
     group_col: str = "group",
     subject_col: str = "subject_id",
     time_col: str = "time_point",
+    include_kpss: bool = True,
+    include_mixed_effects: bool = True,
+    correction_method: str = "fdr_bh",
 ) -> pd.DataFrame:
-    """Compute KPSS and optional mixed-effects trends for numeric metrics."""
+    """Compute independently enabled KPSS and mixed-effects analyses."""
     if video_summary_df is None or video_summary_df.empty:
         return pd.DataFrame()
     df = video_summary_df.copy()
@@ -412,7 +547,7 @@ def compute_kpss_and_mixed_effects(
         # Numeric KPSS is time ordered by an encoded value; textual timepoint labels are handled
         # by collapsing to numeric bins where possible.
 
-    for metric in numeric_metrics:
+    for metric in (numeric_metrics if include_kpss else []):
         analysis_group = "all"
         if has_group:
             iterable = df.groupby(group_col, dropna=False)
@@ -435,7 +570,7 @@ def compute_kpss_and_mixed_effects(
                     }
                 )
                 continue
-            time_numeric = _coerce_numeric(group_df[time_col])
+            time_numeric = group_df[time_col].map(parse_time_point_numeric)
             timed = pd.DataFrame(
                 {
                     "metric_value": group_metric,
@@ -502,8 +637,11 @@ def compute_kpss_and_mixed_effects(
                     }
                 )
 
-    if not has_subject:
-        return pd.DataFrame(rows)
+    if not include_mixed_effects or not has_subject:
+        return _finalize_time_series_stats(
+            rows,
+            correction_method=correction_method,
+        )
 
     for metric in numeric_metrics:
         mixed_parts = [metric, subject_col]
@@ -530,6 +668,24 @@ def compute_kpss_and_mixed_effects(
             mixed_df = mixed_df[mixed_df["time_factor"] != ""]
 
         mixed_df = mixed_df.dropna(subset=["metric_value"])
+        raw_mixed_n = int(len(mixed_df))
+        if has_group and not mixed_df.empty:
+            mixed_df["subject"] = mixed_df["group"] + "\x1f" + mixed_df["subject"]
+
+        # Multiple videos from one subject at one time point are technical or
+        # session replicates, not additional independent longitudinal units.
+        # Average them before fitting so subjects with more videos do not get
+        # disproportionate weight.
+        aggregation_keys = ["subject"]
+        if has_group:
+            aggregation_keys.append("group")
+        if has_time:
+            aggregation_keys.append("time_factor")
+        if not mixed_df.empty:
+            mixed_df = (
+                mixed_df.groupby(aggregation_keys, as_index=False, dropna=False)["metric_value"]
+                .mean()
+            )
         if mixed_df["metric_value"].empty:
             rows.append(
                 {
@@ -539,6 +695,9 @@ def compute_kpss_and_mixed_effects(
                     "kpss_stat": np.nan,
                     "p_value": np.nan,
                     "n": int(len(mixed_df)),
+                    "raw_row_n": raw_mixed_n,
+                    "n_subjects": 0,
+                    "analysis_unit": "subject_time_mean",
                     "note": "mixedlm_skipped:no_valid_rows",
                 }
             )
@@ -553,6 +712,9 @@ def compute_kpss_and_mixed_effects(
                     "kpss_stat": np.nan,
                     "p_value": np.nan,
                     "n": int(len(mixed_df)),
+                    "raw_row_n": raw_mixed_n,
+                    "n_subjects": int(mixed_df["subject"].nunique()),
+                    "analysis_unit": "subject_time_mean",
                     "note": "mixedlm_skipped:requires>=2_subjects",
                 }
             )
@@ -569,6 +731,9 @@ def compute_kpss_and_mixed_effects(
                     "kpss_stat": np.nan,
                     "p_value": np.nan,
                     "n": int(len(mixed_df)),
+                    "raw_row_n": raw_mixed_n,
+                    "n_subjects": int(mixed_df["subject"].nunique()),
+                    "analysis_unit": "subject_time_mean",
                     "note": (
                         "mixedlm_skipped:"
                         f"requires>={MIN_REPEATED_SUBJECTS_FOR_MIXED}_subjects_with_repeated_observations"
@@ -586,6 +751,9 @@ def compute_kpss_and_mixed_effects(
                     "kpss_stat": np.nan,
                     "p_value": np.nan,
                     "n": int(len(mixed_df)),
+                    "raw_row_n": raw_mixed_n,
+                    "n_subjects": int(mixed_df["subject"].nunique()),
+                    "analysis_unit": "subject_time_mean",
                     "note": "mixedlm_skipped:requires_group_or_time",
                 }
             )
@@ -605,6 +773,9 @@ def compute_kpss_and_mixed_effects(
                         "kpss_stat": np.nan,
                         "p_value": np.nan,
                         "n": int(len(mixed_df)),
+                        "raw_row_n": raw_mixed_n,
+                        "n_subjects": int(mixed_df["subject"].nunique()),
+                        "analysis_unit": "subject_time_mean",
                         "note": (
                             "mixedlm_skipped:"
                             f"requires>={MIN_REPEATED_SUBJECTS_FOR_MIXED}_subjects_spanning_multiple_timepoints"
@@ -629,6 +800,9 @@ def compute_kpss_and_mixed_effects(
                     "kpss_stat": np.nan,
                     "p_value": np.nan,
                     "n": int(len(mixed_df)),
+                    "raw_row_n": raw_mixed_n,
+                    "n_subjects": int(mixed_df["subject"].nunique()),
+                    "analysis_unit": "subject_time_mean",
                     "note": "mixedlm_skipped:insufficient_group_and_time_variation",
                 }
             )
@@ -637,19 +811,52 @@ def compute_kpss_and_mixed_effects(
         try:
             model = smf.mixedlm(formula, data=mixed_df, groups=mixed_df["subject"])
             fit = model.fit(reml=False)
-            rows.append(
-                {
-                    "metric": metric,
-                    "group": "all",
-                    "analysis": "mixedlm",
-                    "kpss_stat": np.nan,
-                    "p_value": np.nan,
-                    "n": int(len(mixed_df)),
-                    "note": f"ok ({formula})",
-                    "model_aic": float(getattr(fit, "aic", np.nan)),
-                    "model_bic": float(getattr(fit, "bic", np.nan)),
-                }
-            )
+            fixed_effects = pd.Series(getattr(fit, "fe_params", {}), dtype=float)
+            if fixed_effects.empty:
+                raise ValueError("mixed model returned no fixed-effect estimates")
+            bse_raw = getattr(fit, "bse_fe", None)
+            if bse_raw is None:
+                bse_raw = getattr(fit, "bse", {})
+            bse = pd.Series(bse_raw, index=fixed_effects.index, dtype=float)
+            pvalues = pd.Series(getattr(fit, "pvalues", {}), dtype=float)
+            try:
+                confidence = fit.conf_int()
+            except Exception:
+                confidence = pd.DataFrame(index=fixed_effects.index, columns=[0, 1], dtype=float)
+
+            for term, estimate in fixed_effects.items():
+                std_error = float(bse.get(term, np.nan))
+                statistic = float(estimate / std_error) if np.isfinite(std_error) and std_error > 0 else np.nan
+                try:
+                    ci_lower = float(confidence.loc[term].iloc[0])
+                    ci_upper = float(confidence.loc[term].iloc[1])
+                except Exception:
+                    ci_lower = np.nan
+                    ci_upper = np.nan
+                rows.append(
+                    {
+                        "metric": metric,
+                        "group": "all",
+                        "analysis": "mixedlm",
+                        "analysis_unit": "subject_time_mean",
+                        "term": str(term),
+                        "estimate": float(estimate),
+                        "std_error": std_error,
+                        "test_stat": statistic,
+                        "ci_lower": ci_lower,
+                        "ci_upper": ci_upper,
+                        "kpss_stat": np.nan,
+                        "p_value": float(pvalues.get(term, np.nan)),
+                        "n": int(len(mixed_df)),
+                        "raw_row_n": raw_mixed_n,
+                        "n_subjects": int(mixed_df["subject"].nunique()),
+                        "formula": formula,
+                        "note": "ok",
+                        "model_converged": bool(getattr(fit, "converged", True)),
+                        "model_aic": float(getattr(fit, "aic", np.nan)),
+                        "model_bic": float(getattr(fit, "bic", np.nan)),
+                    }
+                )
         except Exception as exc:
             rows.append(
                 {
@@ -659,11 +866,18 @@ def compute_kpss_and_mixed_effects(
                     "kpss_stat": np.nan,
                     "p_value": np.nan,
                     "n": int(len(mixed_df)),
+                    "raw_row_n": raw_mixed_n,
+                    "n_subjects": int(mixed_df["subject"].nunique()),
+                    "analysis_unit": "subject_time_mean",
+                    "formula": formula,
                     "note": f"mixedlm_failed:{exc}",
                 }
             )
 
-    return pd.DataFrame(rows)
+    return _finalize_time_series_stats(
+        rows,
+        correction_method=correction_method,
+    )
 
 
 @dataclass(slots=True)
@@ -742,6 +956,7 @@ def export_group_stats_bundle(
     output_dir: str | Path,
     correction_method: str = "fdr_bh",
     include_kpss: bool = True,
+    include_mixed_effects: bool = True,
     categorical_factors: list[str] | None = None,
     render_plots: bool = True,
     log_fn: Callable[[str, str], None] | None = None,
@@ -758,7 +973,17 @@ def export_group_stats_bundle(
         categorical_factors=categorical_factors,
         log_fn=log_fn,
     )
-    kpss_df = compute_kpss_and_mixed_effects(video_summary_df, group_col="group") if include_kpss else pd.DataFrame()
+    kpss_df = (
+        compute_kpss_and_mixed_effects(
+            video_summary_df,
+            group_col="group",
+            include_kpss=bool(include_kpss),
+            include_mixed_effects=bool(include_mixed_effects),
+            correction_method=correction_method,
+        )
+        if include_kpss or include_mixed_effects
+        else pd.DataFrame()
+    )
 
     overview_csv = output_root / "group_stats_overview.csv"
     pairwise_csv = output_root / "group_pairwise_tests.csv"

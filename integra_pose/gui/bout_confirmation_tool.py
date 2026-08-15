@@ -8,6 +8,18 @@ import logging
 from typing import Callable, Optional
 
 from integra_pose.gui.windowing import apply_adaptive_window_geometry
+from integra_pose.utils.bout_review import (
+    BoutReviewPaths,
+    append_review_decision,
+    build_review_workspace,
+    decisions_from_workspace,
+    ethogram_window,
+    load_review_decisions,
+    migrate_legacy_review_workspace,
+    normalize_detected_bouts,
+    save_review_bundle,
+)
+from integra_pose.utils.operation_result import OperationResult, OperationStatus
 from integra_pose.utils.review_keybinds import DEFAULT_KEYBINDS, validate_keybinds
 
 REVIEW_EXPORT_COLUMNS = [
@@ -22,24 +34,13 @@ REVIEW_EXPORT_COLUMNS = [
 def normalize_bout_confirmation_dataframe(raw_df: pd.DataFrame | None) -> pd.DataFrame:
     if raw_df is None:
         return pd.DataFrame()
-    work = raw_df.copy()
-    if work.empty:
-        return work
-    if 'status' not in work.columns:
-        work['status'] = 'unreviewed'
-    work['status'] = work['status'].astype(str).str.strip().replace('', 'unreviewed')
-    work.loc[~work['status'].isin(['unreviewed', 'confirmed', 'rejected', 'corrected']), 'status'] = 'unreviewed'
-    if 'Original Behavior' not in work.columns:
-        work['Original Behavior'] = work['Behavior'] if 'Behavior' in work.columns else ''
-    if 'Corrected Behavior' not in work.columns:
-        work['Corrected Behavior'] = work['Behavior'] if 'Behavior' in work.columns else ''
-    if 'Corrected Manually' not in work.columns:
-        work['Corrected Manually'] = False
-    work['Corrected Manually'] = work['Corrected Manually'].astype(bool)
-    if 'Review Status' not in work.columns:
-        work['Review Status'] = work['status']
-    work['Review Status'] = work['Review Status'].astype(str).str.strip().replace('', 'unreviewed')
-    return work
+    if raw_df.empty:
+        return raw_df.copy()
+    raw = normalize_detected_bouts(raw_df)
+    legacy_workspace = raw_df.copy(deep=True).reset_index(drop=True)
+    legacy_workspace["Bout ID"] = raw["Bout ID"].tolist()
+    decisions = decisions_from_workspace(legacy_workspace)
+    return build_review_workspace(raw, decisions)
 
 
 class BoutConfirmationTool(tk.Toplevel):
@@ -53,6 +54,7 @@ class BoutConfirmationTool(tk.Toplevel):
         keybinds: Optional[dict[str, str]] = None,
         autosave_path: str | None = None,
         on_review_saved: Optional[Callable[[pd.DataFrame], None]] = None,
+        on_save_result: Optional[Callable[[OperationResult], None]] = None,
         context_label: str = "",
     ):
         super().__init__(master)
@@ -69,6 +71,7 @@ class BoutConfirmationTool(tk.Toplevel):
         self.logger = logging.getLogger(__name__)
         self.logger.info("Initializing BoutConfirmationTool")
 
+        self._detected_bouts_input = detected_bouts_df.copy(deep=True)
         self.original_bouts_df = normalize_bout_confirmation_dataframe(detected_bouts_df)
         self.behavior_map = behavior_map
         self.behavior_names = sorted(str(name).strip() for name in dict(behavior_map or {}).keys() if str(name).strip())
@@ -80,6 +83,8 @@ class BoutConfirmationTool(tk.Toplevel):
         self.photo = None
         self.autosave_path = str(autosave_path or "").strip()
         self.on_review_saved = on_review_saved
+        self.on_save_result = on_save_result
+        self.last_save_result = OperationResult.cancel("Review has not been saved yet.")
         self.context_label = str(context_label or "").strip()
         self.keybinds, keybind_warnings = validate_keybinds(keybinds or DEFAULT_KEYBINDS)
 
@@ -98,11 +103,37 @@ class BoutConfirmationTool(tk.Toplevel):
             self.destroy()
             return
         
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        probed_fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        analysis_fps = pd.to_numeric(
+            self._detected_bouts_input.get("Analysis FPS", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna()
+        analysis_fps_values = sorted({float(value) for value in analysis_fps if float(value) > 0})
+        if len(analysis_fps_values) > 1:
+            messagebox.showerror(
+                "FPS Error",
+                "Detected bouts contain multiple Analysis FPS values. Review cannot continue with ambiguous timing provenance.",
+                parent=self,
+            )
+            self.cap.release()
+            self.destroy()
+            return
+        self.fps = analysis_fps_values[0] if analysis_fps_values else probed_fps
         if self.fps <= 0:
-            self.fps = 30
-            messagebox.showwarning("FPS Warning", "Could not determine video FPS. Using default 30 FPS.", parent=self)
-            self.logger.warning("FPS not detected, defaulting to 30")
+            messagebox.showerror(
+                "FPS Error",
+                "Could not resolve a positive FPS from the analysis output or source video. Bout review cannot safely calculate durations.",
+                parent=self,
+            )
+            self.cap.release()
+            self.destroy()
+            return
+        if probed_fps > 0 and analysis_fps_values and abs(probed_fps - self.fps) > 1e-3:
+            self.logger.warning(
+                "Analysis FPS (%s) differs from video metadata FPS (%s); preserving the analysis calibration.",
+                self.fps,
+                probed_fps,
+            )
         
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if self.total_frames <= 0:
@@ -112,6 +143,41 @@ class BoutConfirmationTool(tk.Toplevel):
                 messagebox.showwarning("Video Warning", "Could not determine frame count. Some features may not work.", parent=self)
                 self.total_frames = 10000  # Arbitrary fallback
         self.logger.info(f"Video loaded: FPS={self.fps}, Total Frames={self.total_frames}")
+
+        self.raw_detected_bouts_df = normalize_detected_bouts(
+            self._detected_bouts_input,
+            source_video=self.video_path,
+            fps=self.fps,
+        )
+        legacy_workspace = normalize_bout_confirmation_dataframe(self._detected_bouts_input)
+        if len(legacy_workspace) == len(self.raw_detected_bouts_df):
+            legacy_workspace["Bout ID"] = self.raw_detected_bouts_df["Bout ID"].tolist()
+        if self.autosave_path:
+            review_paths = BoutReviewPaths.from_authoritative(self.autosave_path)
+            if (
+                not review_paths.decisions.is_file()
+                and not review_paths.workspace.is_file()
+                and review_paths.authoritative.is_file()
+            ):
+                try:
+                    legacy_workspace = migrate_legacy_review_workspace(
+                        self.raw_detected_bouts_df,
+                        pd.read_csv(review_paths.authoritative),
+                        source_video=self.video_path,
+                        fps=self.fps,
+                    )
+                except Exception as exc:
+                    self.logger.warning("Legacy bout review was not migrated: %s", exc)
+        self.review_decisions_df = (
+            load_review_decisions(self.autosave_path, legacy_workspace=legacy_workspace)
+            if self.autosave_path
+            else decisions_from_workspace(legacy_workspace)
+        )
+        self.original_bouts_df = build_review_workspace(
+            self.raw_detected_bouts_df,
+            self.review_decisions_df,
+            fps=self.fps,
+        )
 
         self._create_widgets()
         self._populate_filter_options()
@@ -173,8 +239,10 @@ class BoutConfirmationTool(tk.Toplevel):
         stats_frame.grid(row=3, column=0, sticky='ew', pady=(0, 10))
         self._setup_stats_display(stats_frame)
         
-        export_btn = ttk.Button(left_panel, text="Export Reviewed Bouts Report...", command=self._export_to_csv)
-        export_btn.grid(row=4, column=0, sticky='ew')
+        save_btn = ttk.Button(left_panel, text="Save Review Progress", command=self._save_review_state)
+        save_btn.grid(row=4, column=0, sticky='ew')
+        export_btn = ttk.Button(left_panel, text="Export Decision Report...", command=self._export_to_csv)
+        export_btn.grid(row=5, column=0, sticky='ew', pady=(5, 0))
 
         right_panel = ttk.Frame(main_frame)
         right_panel.grid(row=0, column=1, sticky='nsew')
@@ -184,11 +252,26 @@ class BoutConfirmationTool(tk.Toplevel):
         self.video_label = ttk.Label(right_panel, background="black")
         self.video_label.grid(row=0, column=0, sticky='nsew')
 
+        timeline_frame = ttk.LabelFrame(right_panel, text="Ethogram Context")
+        timeline_frame.grid(row=1, column=0, sticky="ew", pady=(8, 2))
+        timeline_frame.columnconfigure(0, weight=1)
+        self.ethogram_canvas = tk.Canvas(
+            timeline_frame,
+            height=170,
+            background="#ffffff",
+            highlightthickness=0,
+        )
+        self.ethogram_canvas.grid(row=0, column=0, sticky="ew")
+        timeline_scroll = ttk.Scrollbar(timeline_frame, orient="vertical", command=self.ethogram_canvas.yview)
+        timeline_scroll.grid(row=0, column=1, sticky="ns")
+        self.ethogram_canvas.configure(yscrollcommand=timeline_scroll.set)
+        self.ethogram_canvas.bind("<Configure>", lambda _event: self._draw_ethogram())
+
         video_controls = self._create_video_controls(right_panel)
-        video_controls.grid(row=1, column=0, sticky='ew', pady=5)
+        video_controls.grid(row=2, column=0, sticky='ew', pady=5)
         
         confirmation_controls = self._create_confirmation_controls_v2(right_panel)
-        confirmation_controls.grid(row=2, column=0, sticky='ew', pady=10)
+        confirmation_controls.grid(row=3, column=0, sticky='ew', pady=10)
 
         self.keybind_hint_var = tk.StringVar(value=self._format_keybind_hint())
         ttk.Label(
@@ -196,7 +279,7 @@ class BoutConfirmationTool(tk.Toplevel):
             textvariable=self.keybind_hint_var,
             justify=tk.LEFT,
             wraplength=760,
-        ).grid(row=3, column=0, sticky='w', pady=(2, 0))
+        ).grid(row=4, column=0, sticky='w', pady=(2, 0))
 
     def _setup_filter_controls(self, parent):
         parent.columnconfigure(1, weight=1)
@@ -321,10 +404,20 @@ class BoutConfirmationTool(tk.Toplevel):
         )
         self.corrected_behavior_combo.pack(side=tk.LEFT, padx=(6, 6))
         ttk.Button(correction_row, text="Apply Correction", command=self._correct_bout_label).pack(side=tk.LEFT)
+        metadata_row = ttk.Frame(frame)
+        metadata_row.grid(row=2, column=0, columnspan=3, sticky='ew', padx=5, pady=(8, 0))
+        metadata_row.columnconfigure(3, weight=1)
+        ttk.Label(metadata_row, text="Reviewer:").grid(row=0, column=0, sticky="w")
+        self.reviewer_var = tk.StringVar(value="")
+        ttk.Entry(metadata_row, textvariable=self.reviewer_var, width=16).grid(row=0, column=1, sticky="w", padx=(6, 12))
+        ttk.Label(metadata_row, text="Notes:").grid(row=0, column=2, sticky="w")
+        self.review_notes_var = tk.StringVar(value="")
+        ttk.Entry(metadata_row, textvariable=self.review_notes_var).grid(row=0, column=3, sticky="ew", padx=(6, 0))
         return frame
 
     def _populate_filter_options(self):
-        if self.original_bouts_df.empty: return
+        if self.original_bouts_df.empty:
+            return
         track_ids = sorted(self.original_bouts_df[self.id_column_name].unique().tolist())
         self.track_id_filter_combo['values'] = ["All"] + [str(tid) for tid in track_ids]
         behaviors = sorted(self.original_bouts_df['Behavior'].unique().tolist())
@@ -332,7 +425,8 @@ class BoutConfirmationTool(tk.Toplevel):
 
     def _update_bout_list_display(self, event=None):
         self._stop_playback()
-        for item in self.tree.get_children(): self.tree.delete(item)
+        for item in self.tree.get_children():
+            self.tree.delete(item)
         
         filtered_df = self.original_bouts_df.copy()
         selected_id = self.track_id_filter_var.get()
@@ -349,7 +443,7 @@ class BoutConfirmationTool(tk.Toplevel):
             
         for index, row in filtered_df.iterrows():
             values = (row[self.id_column_name], row['Behavior'], row['Start Frame'], row['End Frame'], row['status'])
-            self.tree.insert('', 'end', iid=index, values=values, tags=(row['status'],))
+            self.tree.insert('', 'end', iid=str(row['Bout ID']), values=values, tags=(row['status'],))
         
         children = self.tree.get_children()
         if children:
@@ -358,22 +452,134 @@ class BoutConfirmationTool(tk.Toplevel):
 
     def _get_current_bout_info(self):
         selected_items = self.tree.selection()
-        if not selected_items: return None
-        item_id = int(selected_items[0])
-        return self.original_bouts_df.loc[item_id]
+        if not selected_items:
+            return None
+        item_id = str(selected_items[0])
+        matches = self.original_bouts_df[self.original_bouts_df['Bout ID'].astype(str) == item_id]
+        if matches.empty:
+            return None
+        return matches.iloc[0]
 
     def _on_bout_select(self, event=None):
         self._stop_playback()
         bout_info = self._get_current_bout_info()
-        if bout_info is None: return
+        if bout_info is None:
+            return
         try:
             corrected_value = str(bout_info.get('Corrected Behavior', bout_info.get('Behavior', '')) or '').strip()
             if corrected_value:
                 self.corrected_behavior_var.set(corrected_value)
+            reviewer_value = str(bout_info.get('Reviewer', '') or '').strip()
+            if reviewer_value:
+                self.reviewer_var.set(reviewer_value)
+            self.review_notes_var.set(str(bout_info.get('Reviewer Notes', '') or '').strip())
         except Exception:
             pass
         start_frame = int(bout_info['Start Frame'])
         self._seek_to_frame(start_frame)
+        self._draw_ethogram()
+
+    def _select_bout_id(self, bout_id: str) -> None:
+        iid = str(bout_id)
+        if iid not in self.tree.get_children():
+            self.track_id_filter_var.set("All")
+            self.behavior_filter_var.set("All")
+            self.status_filter_var.set("All")
+            self._update_bout_list_display()
+        if iid in self.tree.get_children():
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            self.tree.see(iid)
+            self._on_bout_select()
+
+    def _draw_ethogram(self) -> None:
+        canvas = getattr(self, "ethogram_canvas", None)
+        if canvas is None:
+            return
+        canvas.delete("all")
+        bout_info = self._get_current_bout_info()
+        if bout_info is None or self.original_bouts_df.empty:
+            canvas.create_text(12, 12, text="Select a bout to view ethogram context.", anchor="nw", fill="#444444")
+            return
+        focus_id = str(bout_info["Bout ID"])
+        duration = int(bout_info["End Frame"]) - int(bout_info["Start Frame"]) + 1
+        context_frames = max(int(round(self.fps * 5.0)), duration * 2)
+        try:
+            window_start, window_end, visible = ethogram_window(
+                self.original_bouts_df,
+                focus_bout_id=focus_id,
+                context_frames=context_frames,
+                total_frames=self.total_frames,
+            )
+        except Exception as exc:
+            self.logger.warning("Failed to render ethogram context: %s", exc)
+            return
+
+        label_width = 138
+        plot_left = label_width + 8
+        plot_right = max(plot_left + 100, canvas.winfo_width() - 12)
+        top = 28
+        lane_height = 25
+        lane_keys = list(
+            dict.fromkeys(
+                (str(row["Track ID"]), str(row["Behavior"]))
+                for _, row in visible.iterrows()
+            )
+        )
+        canvas_height = max(170, top + lane_height * max(1, len(lane_keys)) + 22)
+        canvas.configure(scrollregion=(0, 0, plot_right, canvas_height))
+        span = max(1, window_end - window_start + 1)
+
+        def _x(frame: int) -> float:
+            return plot_left + ((int(frame) - window_start) / span) * (plot_right - plot_left)
+
+        canvas.create_line(plot_left, top - 7, plot_right, top - 7, fill="#555555")
+        for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+            frame = min(window_end, window_start + int(round((span - 1) * fraction)))
+            x = _x(frame)
+            canvas.create_line(x, top - 11, x, top - 3, fill="#555555")
+            canvas.create_text(x, 4, text=f"F {frame} | {frame / self.fps:.2f}s", anchor="n", fill="#333333")
+
+        colors = {
+            "unreviewed": "#78A6C8",
+            "confirmed": "#66A061",
+            "rejected": "#9A9A9A",
+            "corrected": "#D49B45",
+        }
+        lane_lookup = {key: index for index, key in enumerate(lane_keys)}
+        for lane_key, lane_index in lane_lookup.items():
+            y0 = top + lane_index * lane_height
+            canvas.create_text(
+                label_width,
+                y0 + lane_height / 2,
+                text=f"T{lane_key[0]}  {lane_key[1]}",
+                anchor="e",
+                fill="#222222",
+            )
+            canvas.create_line(plot_left, y0 + lane_height, plot_right, y0 + lane_height, fill="#E1E1E1")
+        for _, row in visible.iterrows():
+            lane_index = lane_lookup[(str(row["Track ID"]), str(row["Behavior"]))]
+            y0 = top + lane_index * lane_height + 4
+            y1 = y0 + lane_height - 8
+            x0 = max(plot_left, _x(int(row["Start Frame"])))
+            x1 = min(plot_right, _x(int(row["End Frame"]) + 1))
+            bout_id = str(row["Bout ID"])
+            status = str(row.get("status", "unreviewed"))
+            tag = f"bout::{bout_id}"
+            canvas.create_rectangle(
+                x0,
+                y0,
+                max(x0 + 2, x1),
+                y1,
+                fill=colors.get(status, colors["unreviewed"]),
+                outline="#B22222" if bout_id == focus_id else "#333333",
+                width=3 if bout_id == focus_id else 1,
+                tags=(tag,),
+            )
+            canvas.tag_bind(tag, "<Button-1>", lambda _event, selected=bout_id: self._select_bout_id(selected))
+
+        playhead_x = _x(max(window_start, min(self.current_frame, window_end)))
+        canvas.create_line(playhead_x, top - 3, playhead_x, canvas_height - 8, fill="#B22222", width=2, tags=("playhead",))
 
     def _format_keybind_hint(self) -> str:
         kb = self.keybinds
@@ -450,13 +656,16 @@ class BoutConfirmationTool(tk.Toplevel):
             self._seek_to_frame(start_frame)
 
     def _playback_loop(self):
-        if not self.is_playing: return
+        if not self.is_playing:
+            return
 
         bout_info = self._get_current_bout_info()
-        if bout_info is None: self._stop_playback(); return
+        if bout_info is None:
+            self._stop_playback()
+            return
         end_frame = int(bout_info['End Frame'])
 
-        if self.current_frame >= end_frame:
+        if self.current_frame > end_frame:
             self._stop_playback()
             return
 
@@ -474,9 +683,14 @@ class BoutConfirmationTool(tk.Toplevel):
             self.logger.error(f"Failed to read frame {self.current_frame} in playback")
             return
             
-        self.current_frame += 1
+        displayed_frame = self.current_frame
         self._update_video_display(frame)
-        self.current_frame_var.set(f"Frame: {self.current_frame}")
+        self.current_frame_var.set(f"Frame: {displayed_frame}")
+        self._draw_ethogram()
+        if displayed_frame >= end_frame:
+            self._stop_playback()
+            return
+        self.current_frame = displayed_frame + 1
         
         delay = int(1000 / (self.fps * self.playback_speed))
         self.after_id = self.after(delay, self._playback_loop)
@@ -551,18 +765,21 @@ class BoutConfirmationTool(tk.Toplevel):
         self.current_frame = frame_num
         self._update_video_display(frame)
         self.current_frame_var.set(f"Frame: {self.current_frame}")
+        self._draw_ethogram()
         self.logger.debug(f"Successfully sought and displayed frame {frame_num}")
 
     def _update_video_display(self, frame):
         try:
             self.update_idletasks()
             l_w, l_h = self.video_label.winfo_width(), self.video_label.winfo_height()
-            if l_w <= 1 or l_h <= 1: return
+            if l_w <= 1 or l_h <= 1:
+                return
 
             f_h, f_w, _ = frame.shape
             scale = min(l_w / f_w, l_h / f_h)
             new_w, new_h = int(f_w * scale), int(f_h * scale)
-            if new_w <= 0 or new_h <= 0: return
+            if new_w <= 0 or new_h <= 0:
+                return
             resized_frame = cv2.resize(frame, (new_w, new_h))
             img = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
             self.photo = ImageTk.PhotoImage(image=Image.fromarray(img))
@@ -579,16 +796,25 @@ class BoutConfirmationTool(tk.Toplevel):
         if not selected_items:
             messagebox.showwarning("No Selection", "Please select a bout from the list.", parent=self)
             return
-        for item_id_str in selected_items:
-            item_id = int(item_id_str)
-            self.original_bouts_df.loc[item_id, 'status'] = status
-            self.original_bouts_df.loc[item_id, 'Review Status'] = status
-            if status == 'confirmed':
-                self.original_bouts_df.loc[item_id, 'Corrected Behavior'] = self.original_bouts_df.loc[item_id, 'Behavior']
-                self.original_bouts_df.loc[item_id, 'Corrected Manually'] = False
-            current_values = list(self.tree.item(item_id, 'values'))
-            current_values[-1] = status
-            self.tree.item(item_id, values=tuple(current_values), tags=(status,))
+        for bout_id in selected_items:
+            raw_match = self.raw_detected_bouts_df[
+                self.raw_detected_bouts_df['Bout ID'].astype(str) == str(bout_id)
+            ]
+            if raw_match.empty:
+                continue
+            self.review_decisions_df = append_review_decision(
+                self.review_decisions_df,
+                raw_match.iloc[0],
+                status,
+                reviewer_notes=self.review_notes_var.get(),
+                reviewer=self.reviewer_var.get(),
+            )
+        self.original_bouts_df = build_review_workspace(
+            self.raw_detected_bouts_df,
+            self.review_decisions_df,
+            fps=self.fps,
+        )
+        self._update_bout_list_display()
         self._update_stats_display()
         self._save_review_state(silent=True)
         self._select_next_unreviewed(selected_items[-1])
@@ -608,7 +834,8 @@ class BoutConfirmationTool(tk.Toplevel):
 
     def _next_bout(self):
         selection = self.tree.selection()
-        if not selection: return
+        if not selection:
+            return
         next_item = self.tree.next(selection[0])
         if next_item:
             self.tree.selection_set(next_item)
@@ -616,7 +843,8 @@ class BoutConfirmationTool(tk.Toplevel):
 
     def _prev_bout(self):
         selection = self.tree.selection()
-        if not selection: return
+        if not selection:
+            return
         prev_item = self.tree.prev(selection[0])
         if prev_item:
             self.tree.selection_set(prev_item)
@@ -638,35 +866,45 @@ class BoutConfirmationTool(tk.Toplevel):
             messagebox.showwarning("Missing Label", "Select a corrected behavior label first.", parent=self)
             return
         for item_id_str in selected_items:
-            item_id = int(item_id_str)
-            original_behavior = str(self.original_bouts_df.loc[item_id, 'Original Behavior'] or '').strip()
-            if not original_behavior:
-                original_behavior = str(self.original_bouts_df.loc[item_id, 'Behavior'] or '').strip()
-                self.original_bouts_df.loc[item_id, 'Original Behavior'] = original_behavior
-            self.original_bouts_df.loc[item_id, 'Behavior'] = corrected_behavior
-            self.original_bouts_df.loc[item_id, 'Corrected Behavior'] = corrected_behavior
-            self.original_bouts_df.loc[item_id, 'Corrected Manually'] = corrected_behavior != original_behavior
-            self.original_bouts_df.loc[item_id, 'Review Status'] = 'corrected'
-            self.original_bouts_df.loc[item_id, 'status'] = 'corrected'
-            current_values = list(self.tree.item(item_id, 'values'))
-            current_values[1] = corrected_behavior
-            current_values[-1] = 'corrected'
-            self.tree.item(item_id, values=tuple(current_values), tags=('corrected',))
+            raw_match = self.raw_detected_bouts_df[
+                self.raw_detected_bouts_df['Bout ID'].astype(str) == str(item_id_str)
+            ]
+            if raw_match.empty:
+                continue
+            self.review_decisions_df = append_review_decision(
+                self.review_decisions_df,
+                raw_match.iloc[0],
+                'corrected',
+                corrected_behavior=corrected_behavior,
+                reviewer_notes=self.review_notes_var.get(),
+                reviewer=self.reviewer_var.get(),
+            )
+        self.original_bouts_df = build_review_workspace(
+            self.raw_detected_bouts_df,
+            self.review_decisions_df,
+            fps=self.fps,
+        )
+        self._update_bout_list_display()
         self._update_stats_display()
         self._save_review_state(silent=True)
         self._select_next_unreviewed(selected_items[-1])
 
     def _select_next_unreviewed(self, current_item_id_str):
-        next_item_id = self.tree.next(current_item_id_str)
-        if next_item_id:
-            self.tree.selection_set(next_item_id)
-            self.tree.see(next_item_id)
-        else:
-            for item in self.tree.get_children():
-                if self.original_bouts_df.loc[int(item), 'status'] == 'unreviewed':
-                    self.tree.selection_set(item)
-                    self.tree.see(item)
-                    break
+        items = list(self.tree.get_children())
+        if not items:
+            return
+        try:
+            start_index = items.index(str(current_item_id_str)) + 1
+        except ValueError:
+            start_index = 0
+        ordered = items[start_index:] + items[:start_index]
+        for item in ordered:
+            match = self.original_bouts_df[self.original_bouts_df['Bout ID'].astype(str) == str(item)]
+            if not match.empty and match.iloc[0]['status'] == 'unreviewed':
+                self.tree.selection_set(item)
+                self.tree.see(item)
+                self._on_bout_select()
+                break
 
     def _jump_to_next_unreviewed(self):
         selection = self.tree.selection()
@@ -675,7 +913,8 @@ class BoutConfirmationTool(tk.Toplevel):
             self._select_next_unreviewed(start)
             return
         for item in self.tree.get_children():
-            if self.original_bouts_df.loc[int(item), 'status'] == 'unreviewed':
+            match = self.original_bouts_df[self.original_bouts_df['Bout ID'].astype(str) == str(item)]
+            if not match.empty and match.iloc[0]['status'] == 'unreviewed':
                 self.tree.selection_set(item)
                 self.tree.see(item)
                 break
@@ -693,7 +932,8 @@ class BoutConfirmationTool(tk.Toplevel):
         else:
             idx = len(items)
         for item in reversed(items[:idx]):
-            if self.original_bouts_df.loc[int(item), 'status'] == 'unreviewed':
+            match = self.original_bouts_df[self.original_bouts_df['Bout ID'].astype(str) == str(item)]
+            if not match.empty and match.iloc[0]['status'] == 'unreviewed':
                 self.tree.selection_set(item)
                 self.tree.see(item)
                 break
@@ -702,7 +942,7 @@ class BoutConfirmationTool(tk.Toplevel):
         reviewed_df = self.original_bouts_df[self.original_bouts_df['status'] != 'unreviewed'].copy()
         if reviewed_df.empty:
             messagebox.showinfo("No Data", "No bouts have been reviewed yet.", parent=self)
-            return
+            return OperationResult.cancel("No reviewed bouts are available to export.")
         total_reviewed = len(reviewed_df)
         total_confirmed = len(reviewed_df[reviewed_df['status'] == 'confirmed'])
         total_rejected = len(reviewed_df[reviewed_df['status'] == 'rejected'])
@@ -716,40 +956,80 @@ class BoutConfirmationTool(tk.Toplevel):
             f"Do you want to save this report?"
         )
         if not messagebox.askyesno("Export Reviewed Bouts", summary_message, parent=self):
-            return
+            return OperationResult.cancel("Decision report export cancelled.")
         save_path = filedialog.asksaveasfilename(
             defaultextension=".csv",
             filetypes=[("CSV Files", "*.csv")],
             title="Save Reviewed Bouts Report",
             initialfile=f"reviewed_bouts_report_{os.path.basename(self.video_path)}.csv"
         )
-        if save_path:
-            try:
-                reviewed_df.to_csv(save_path, index=False)
-                messagebox.showinfo("Success", f"Reviewed bouts report saved to:\n{save_path}", parent=self)
-            except Exception as e:
-                messagebox.showerror("Export Error", f"An error occurred while saving the file:\n{e}", parent=self)
+        if not save_path:
+            return OperationResult.cancel("Decision report export cancelled.")
+        try:
+            reviewed_df.to_csv(save_path, index=False)
+            messagebox.showinfo("Success", f"Reviewed bouts report saved to:\n{save_path}", parent=self)
+            return OperationResult.success("Decision report exported.", report_path=save_path)
+        except Exception as e:
+            messagebox.showerror("Export Error", f"An error occurred while saving the file:\n{e}", parent=self)
+            return OperationResult.failure("Decision report export failed.", error=str(e))
 
     def _save_review_state(self, silent: bool = False):
         if not self.autosave_path:
-            return
-        try:
-            save_path = os.path.abspath(self.autosave_path)
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            self.original_bouts_df.to_csv(save_path, index=False)
+            result = OperationResult.cancel("No review output path was configured.")
+            self.last_save_result = result
+            if callable(self.on_save_result):
+                try:
+                    self.on_save_result(result)
+                except Exception as exc:
+                    self.logger.warning("Bout review outcome callback failed: %s", exc)
+            return result
+        result = save_review_bundle(
+            self.raw_detected_bouts_df,
+            self.review_decisions_df,
+            authoritative_path=self.autosave_path,
+            fps=self.fps,
+        )
+        self.last_save_result = result
+        if result.status in {OperationStatus.SUCCESS, OperationStatus.PARTIAL}:
             if callable(self.on_review_saved):
-                self.on_review_saved(self.original_bouts_df.copy())
+                try:
+                    self.on_review_saved(self.original_bouts_df.copy())
+                except Exception as exc:
+                    self.logger.warning("Bout review saved, but the UI refresh callback failed: %s", exc)
             if not silent:
-                messagebox.showinfo("Review Saved", f"Saved review state to:\n{save_path}", parent=self)
-        except Exception as exc:
-            self.logger.error("Failed to autosave review state: %s", exc)
-            if not silent:
-                messagebox.showerror("Save Error", f"Failed to save review state:\n{exc}", parent=self)
+                paths = BoutReviewPaths.from_authoritative(self.autosave_path)
+                if result.succeeded:
+                    messagebox.showinfo(
+                        "Review Saved",
+                        f"Review complete. Authoritative bouts saved to:\n{paths.authoritative}",
+                        parent=self,
+                    )
+                else:
+                    messagebox.showinfo(
+                        "Progress Saved",
+                        f"Review progress saved to:\n{paths.workspace}",
+                        parent=self,
+                    )
+        else:
+            self.logger.error("Failed to save bout review: %s", result.error or result.message)
+            messagebox.showerror(
+                "Save Error",
+                f"{result.message}\n{result.error}".strip(),
+                parent=self,
+            )
+        if callable(self.on_save_result):
+            try:
+                self.on_save_result(result)
+            except Exception as exc:
+                self.logger.warning("Bout review outcome callback failed: %s", exc)
+        return result
 
     def _on_closing(self):
         self._stop_playback()
+        result = self._save_review_state(silent=True)
+        if result.failed:
+            return
         if self.cap and self.cap.isOpened():
             self.cap.release()
-        self._save_review_state(silent=True)
         self.destroy()
         self.logger.info("BoutConfirmationTool closed")

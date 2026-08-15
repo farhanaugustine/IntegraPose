@@ -79,6 +79,22 @@ This populates:
 - `labels/train`
 - `labels/val`
 
+The shipped split controls are:
+
+| Control | Meaning |
+| --- | --- |
+| Validation split (%) | Percentage of images assigned to validation |
+| Seed | Makes the split reproducible |
+| Move files (don't copy) | Moves source images and labels instead of preserving them; off by default |
+| Include unlabeled images | Includes unmatched images with empty label files when intentional negatives are required |
+| `auto` strategy | Preserves source-style filename groups when recognizable, otherwise falls back safely |
+| `random` strategy | Splits individual images without source-prefix grouping |
+| `prefix` strategy | Always groups files by the text before the selected delimiter |
+
+Use `auto` or `prefix` for frames flattened by Tab 1 when neighboring frames
+from one source must not be divided between training and validation. A
+successful split writes `split_manifest.json` in the dataset root.
+
 ## 5. Generate `dataset.yaml`
 
 Use `Generate dataset.yaml` after the split exists, or point Setup to an existing Ultralytics-style dataset layout.
@@ -93,9 +109,19 @@ Use Dataset QA before training to catch:
 - malformed labels
 - mismatched image/label pairs
 - dataset structure problems
+- class or keypoint schema problems
+- normalized boxes below the configured tiny-area threshold
+
+The QA panel shows each check, severity, count, and details. Use **Export QA
+Report...** to preserve the result. **Ignore Selected Check (Project)** records
+an intentional project-level waiver; use it only after confirming that the
+finding is expected. Changing dataset paths or schema marks the previous QA
+result stale.
 
 ## Practical tips
 
 - Keep keypoint order stable once training starts.
 - Save the project after major setup changes.
+- Use **Apply Keypoints / Refresh** after changing the comma-separated keypoint list so skeleton controls stay synchronized.
+- The split and YAML buttons remain unavailable until the required paths are ready; use the Dataset readiness message and **Refresh** to see what is missing.
 - If you are using a detection-only model workflow, Setup may still be useful for project organization, but the built-in Training tab remains pose-oriented.

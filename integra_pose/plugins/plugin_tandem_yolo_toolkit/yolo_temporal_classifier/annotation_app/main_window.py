@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QProgressDialog,
     QSlider,
     QScrollArea,
     QSplitter,
@@ -47,6 +48,7 @@ from PySide6.QtWidgets import (
 )
 
 from .extractor import export_full_video_annotations
+from .playback_source import resolve_playback_source
 from .models import (
     AnnotationRecord,
     AnnotationStatus,
@@ -503,6 +505,8 @@ class BehaviorButton(QPushButton):
 
 
 class AnnotationMainWindow(QMainWindow):
+    WORKFLOW_SETTINGS_KEY = "workflow_panel_state_v1"
+
     def __init__(self, store: AnnotationStore, project: ProjectRecord):
         super().__init__()
         self.store = store
@@ -537,6 +541,13 @@ class AnnotationMainWindow(QMainWindow):
         self.position_persist_timer.setInterval(1500)
         self.position_persist_timer.timeout.connect(self._persist_resume_state)
         self.position_persist_timer.start()
+
+        self.workflow_settings_timer = QTimer(self)
+        self.workflow_settings_timer.setSingleShot(True)
+        self.workflow_settings_timer.setInterval(600)
+        self.workflow_settings_timer.timeout.connect(self._autosave_workflow_inputs)
+        self._workflow_panels: dict[str, object] = {}
+        self._workflow_default_states: dict[str, dict[str, object]] = {}
 
         self.setWindowTitle(f"TandemYTC - Tandem YOLO + Temporal Classifier - {self.project.name}")
         self.setAttribute(Qt.WA_DeleteOnClose, True)
@@ -577,7 +588,12 @@ class AnnotationMainWindow(QMainWindow):
     def closeEvent(self, event):  # pragma: no cover - UI event
         self.position_persist_timer.stop()
         self.playback_sync_timer.stop()
+        self.workflow_settings_timer.stop()
         if not self._store_closed:
+            try:
+                self._persist_workflow_inputs()
+            except Exception:
+                pass
             self._persist_resume_state()
             self.player.stop()
             if self.review_cache_process is not None and self.review_cache_process.state() != QProcess.NotRunning:
@@ -667,6 +683,11 @@ class AnnotationMainWindow(QMainWindow):
         new_store = AnnotationStore(db_path)
         new_project = new_store.get_or_create_default_project()
 
+        self.workflow_settings_timer.stop()
+        try:
+            self._persist_workflow_inputs()
+        except Exception:
+            pass
         self._persist_resume_state()
         self.playback_sync_timer.stop()
         self.player.stop()
@@ -690,6 +711,7 @@ class AnnotationMainWindow(QMainWindow):
         self.annotations = []
         self.session = AnnotationSessionState()
         self.setWindowTitle(f"TandemYTC - Tandem YOLO + Temporal Classifier - {self.project.name}")
+        self._restore_workflow_inputs()
         self._reload_all()
         self._restore_resume_state()
         self.statusBar().showMessage(f"Opened project: {db_path}", 4000)
@@ -734,6 +756,8 @@ class AnnotationMainWindow(QMainWindow):
 
     def _save_project_now(self) -> None:
         try:
+            self.workflow_settings_timer.stop()
+            self._persist_workflow_inputs()
             self._persist_resume_state()
             self.store.conn.commit()
         except Exception as exc:
@@ -942,6 +966,25 @@ class AnnotationMainWindow(QMainWindow):
         self.review_cache_btn.clicked.connect(self._build_review_cache_for_current_video)
         self.review_cache_btn.setToolTip("Run YOLO-pose on the selected TandemYTC video and cache skeletons for review overlays.")
         controls_layout.addWidget(self.review_cache_btn)
+        controls_layout.addWidget(QLabel("Tracker"))
+        self.review_tracker_combo = QComboBox()
+        self.review_tracker_combo.setEditable(True)
+        self.review_tracker_combo.addItems(["bytetrack.yaml", "botsort.yaml"])
+        saved_review_tracker = self.store.get_setting(
+            self.project.id, "review_yolo_tracker", "bytetrack.yaml"
+        ) or "bytetrack.yaml"
+        self.review_tracker_combo.setCurrentText(saved_review_tracker)
+        self.review_tracker_combo.setMinimumWidth(145)
+        self.review_tracker_combo.setToolTip(
+            "Select ByteTrack or BoT-SORT, type an Ultralytics tracker YAML name, "
+            "or browse to a custom tracker YAML."
+        )
+        controls_layout.addWidget(self.review_tracker_combo)
+        self.review_tracker_browse_btn = QPushButton("...")
+        self.review_tracker_browse_btn.setMaximumWidth(32)
+        self.review_tracker_browse_btn.setToolTip("Browse for a custom Ultralytics tracker YAML")
+        self.review_tracker_browse_btn.clicked.connect(self._browse_review_tracker_yaml)
+        controls_layout.addWidget(self.review_tracker_browse_btn)
         self.timeline_zoom_label = QLabel("Timeline zoom 1.0x")
         controls_layout.addWidget(self.timeline_zoom_label)
         self.timeline_zoom_slider = QSlider(Qt.Horizontal)
@@ -1219,6 +1262,113 @@ class AnnotationMainWindow(QMainWindow):
         self.workflow_tabs.addTab(self.train_panel, "Train")
         self.workflow_tabs.addTab(self.inference_panel, "Inference")
         self.workflow_tabs.addTab(self.batch_panel, "Batch")
+        self._workflow_panels = {
+            "prepare_full_video": self.prepare_full_video_panel,
+            "train": self.train_panel,
+            "inference": self.inference_panel,
+            "batch": self.batch_panel,
+        }
+        self._workflow_default_states = {
+            name: panel.settings_state()
+            for name, panel in self._workflow_panels.items()
+        }
+        for panel in self._workflow_panels.values():
+            panel.state_changed.connect(self._schedule_workflow_inputs_persist)
+        self.workflow_tabs.currentChanged.connect(self._schedule_workflow_inputs_persist)
+        self.review_tracker_combo.currentTextChanged.connect(
+            self._schedule_workflow_inputs_persist
+        )
+        self._restore_workflow_inputs()
+
+    def _schedule_workflow_inputs_persist(self, *_args) -> None:
+        if not self._store_closed:
+            self.workflow_settings_timer.start()
+
+    def _autosave_workflow_inputs(self) -> None:
+        try:
+            self._persist_workflow_inputs()
+        except Exception as exc:
+            self.statusBar().showMessage(
+                f"Could not autosave workflow fields: {exc}",
+                5000,
+            )
+
+    def _persist_workflow_inputs(self) -> None:
+        if self._store_closed or not self._workflow_panels:
+            return
+        payload = {
+            "version": 1,
+            "panels": {
+                name: panel.settings_state()
+                for name, panel in self._workflow_panels.items()
+            },
+            "current_tab": int(self.workflow_tabs.currentIndex()),
+            "review_tracker": self.review_tracker_combo.currentText().strip()
+            or "bytetrack.yaml",
+        }
+        self.store.set_setting(
+            self.project.id,
+            self.WORKFLOW_SETTINGS_KEY,
+            json.dumps(payload, ensure_ascii=False),
+        )
+        self.store.set_setting(
+            self.project.id,
+            "review_yolo_tracker",
+            str(payload["review_tracker"]),
+        )
+
+    def _restore_workflow_inputs(self) -> None:
+        if not self._workflow_panels:
+            return
+        self.workflow_settings_timer.stop()
+        for name, panel in self._workflow_panels.items():
+            panel.restore_settings_state(self._workflow_default_states.get(name, {}))
+
+        payload: dict[str, object] = {}
+        raw = self.store.get_setting(
+            self.project.id,
+            self.WORKFLOW_SETTINGS_KEY,
+            "",
+        )
+        if raw:
+            try:
+                loaded = json.loads(raw)
+                if isinstance(loaded, dict):
+                    payload = loaded
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+
+        panel_states = payload.get("panels", {})
+        if isinstance(panel_states, dict):
+            for name, panel in self._workflow_panels.items():
+                panel.restore_settings_state(panel_states.get(name, {}))
+
+        review_tracker = payload.get("review_tracker")
+        if not isinstance(review_tracker, str) or not review_tracker.strip():
+            review_tracker = self.store.get_setting(
+                self.project.id,
+                "review_yolo_tracker",
+                "bytetrack.yaml",
+            )
+        was_blocked = self.review_tracker_combo.blockSignals(True)
+        try:
+            self.review_tracker_combo.setCurrentText(
+                str(review_tracker or "bytetrack.yaml")
+            )
+        finally:
+            self.review_tracker_combo.blockSignals(was_blocked)
+
+        tab_index = payload.get("current_tab", 0)
+        try:
+            tab_index = int(tab_index)
+        except (TypeError, ValueError):
+            tab_index = 0
+        tab_index = max(0, min(tab_index, self.workflow_tabs.count() - 1))
+        tabs_blocked = self.workflow_tabs.blockSignals(True)
+        try:
+            self.workflow_tabs.setCurrentIndex(tab_index)
+        finally:
+            self.workflow_tabs.blockSignals(tabs_blocked)
 
     def _cmd_arg(self, command: list[str], flag: str) -> str | None:
         try:
@@ -1750,6 +1900,62 @@ class AnnotationMainWindow(QMainWindow):
             behavior.definition.strip() or "No shared definition has been added for this behavior yet."
         )
 
+    def _resolve_playback_source(self, video: VideoRecord) -> str:
+        """Return a player-friendly path for ``video``.
+
+        NorPix ``.seq`` files have no frame-rate metadata, so QMediaPlayer
+        decodes them at a default 25 fps though the true rate is 30 fps. That
+        makes the video run 1.2x slow and behavior spans look time-shifted
+        (a mount at 66 s appears at 66*30/25 = 79 s). Resolve such videos to a
+        real 30 fps MP4 -- a frame-aligned sibling export when present,
+        otherwise a cached one-time transcode -- so the video and the timeline
+        share one clock. Any failure falls back to the original path.
+        """
+        try:
+            path, _note = resolve_playback_source(
+                video.path,
+                fps=float(video.fps),
+                total_frames=int(video.total_frames),
+                allow_transcode=False,
+            )
+            if Path(str(path)).suffix.lower() != ".seq":
+                return path
+            # No sibling/cached proxy yet: build one once, with progress.
+            dialog = QProgressDialog(
+                f"Preparing a playable copy of {video.filename}.\n"
+                "This one-time conversion keeps behavior spans aligned with the video.",
+                None,
+                0,
+                100,
+                self,
+            )
+            dialog.setWindowTitle("Preparing video")
+            dialog.setWindowModality(Qt.ApplicationModal)
+            dialog.setCancelButton(None)
+            dialog.setMinimumDuration(0)
+            dialog.setValue(0)
+            dialog.show()
+            QApplication.processEvents()
+
+            def _progress(done: int, total: int) -> None:
+                dialog.setValue(min(99, int(done * 100 / max(1, total))))
+                QApplication.processEvents()
+
+            path, note = resolve_playback_source(
+                video.path,
+                fps=float(video.fps),
+                total_frames=int(video.total_frames),
+                allow_transcode=True,
+                progress=_progress,
+            )
+            dialog.setValue(100)
+            dialog.close()
+            if note:
+                QMessageBox.warning(self, "Video playback", note)
+            return path
+        except Exception:
+            return video.path
+
     def _set_current_video(self, video_id: int, position_ms: int = 0) -> None:
         video = next((item for item in self.videos if item.id == video_id), None)
         if video is None:
@@ -1769,7 +1975,7 @@ class AnnotationMainWindow(QMainWindow):
         self.session.playhead_ms = max(0, min(int(position_ms), video.duration_ms))
         self._last_playhead_ui_ms = None
         self.player.stop()
-        self.player.setSource(QUrl.fromLocalFile(video.path))
+        self.player.setSource(QUrl.fromLocalFile(self._resolve_playback_source(video)))
         self._pending_seek_ms = max(0, min(position_ms, video.duration_ms))
         self.annotations = self.store.list_annotations(video.id)
         self.selected_annotation = None
@@ -1861,6 +2067,18 @@ class AnnotationMainWindow(QMainWindow):
         self.review_overlay.set_cache(self.review_cache, self.current_video.fps)
         self.review_overlay.set_position(self._current_playhead_ms())
 
+    def _browse_review_tracker_yaml(self) -> None:
+        current = self.review_tracker_combo.currentText().strip()
+        start_path = current if current and Path(current).exists() else str(Path.cwd())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Ultralytics tracker YAML",
+            start_path,
+            "YAML (*.yaml *.yml);;All files (*.*)",
+        )
+        if path:
+            self.review_tracker_combo.setEditText(str(Path(path)))
+
     def _build_review_cache_for_current_video(self) -> None:
         if self.current_video is None:
             QMessageBox.information(self, "No video selected", "Select a video before building skeleton overlays.")
@@ -1874,13 +2092,16 @@ class AnnotationMainWindow(QMainWindow):
                 self,
                 "Select YOLO-pose weights for skeleton review",
                 str(Path.cwd()),
-                "PyTorch (*.pt);;All files (*.*)",
+                "YOLO models (*.pt *.pth *.onnx *.engine *.xml);;All files (*.*)",
             )
             if not weights:
                 return
             self.store.set_setting(self.project.id, "review_yolo_weights", weights)
         output = self._review_cache_path(self.current_video)
         script = Path(__file__).resolve().parents[1] / "build_review_cache_y.py"
+        review_device = self.store.get_setting(self.project.id, "review_yolo_device", "cpu") or "cpu"
+        review_tracker = self.review_tracker_combo.currentText().strip() or "bytetrack.yaml"
+        self.store.set_setting(self.project.id, "review_yolo_tracker", review_tracker)
         cmd = [
             sys.executable,
             "-u",
@@ -1896,9 +2117,13 @@ class AnnotationMainWindow(QMainWindow):
             "--fps",
             str(max(self.current_video.fps, 1e-6)),
             "--device",
-            self.store.get_setting(self.project.id, "review_yolo_device", "cpu") or "cpu",
+            review_device,
+            "--tracker",
+            review_tracker,
             "--keep_last_box",
         ]
+        if str(review_device).strip().lower().startswith("cuda"):
+            cmd.append("--half")
         process = QProcess(self)
         process.setWorkingDirectory(str(Path(__file__).resolve().parents[5]))
         process.setProcessChannelMode(QProcess.MergedChannels)
@@ -2245,11 +2470,14 @@ class AnnotationMainWindow(QMainWindow):
         )
         if not paths:
             return
-        count = self.store.import_videos(self.project.id, [Path(path) for path in paths])
+        warnings_out: list[dict] = []
+        count = self.store.import_videos(
+            self.project.id, [Path(path) for path in paths], warnings_out=warnings_out
+        )
         self._reload_all()
         if self.current_video is None and self.videos:
             self._set_current_video(self.videos[0].id, 0)
-        QMessageBox.information(self, "Import complete", f"Imported {count} new videos.")
+        self._report_import(count, warnings_out)
 
     def _import_video_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Import folder", str(Path.cwd()))
@@ -2257,11 +2485,95 @@ class AnnotationMainWindow(QMainWindow):
             return
         root = Path(folder)
         paths = [path for path in root.rglob("*") if path.suffix.lower() in {".mp4", ".avi", ".mov", ".mkv"}]
-        count = self.store.import_videos(self.project.id, paths)
+        warnings_out: list[dict] = []
+        count = self.store.import_videos(self.project.id, paths, warnings_out=warnings_out)
         self._reload_all()
         if self.current_video is None and self.videos:
             self._set_current_video(self.videos[0].id, 0)
-        QMessageBox.information(self, "Import complete", f"Imported {count} new videos.")
+        self._report_import(count, warnings_out)
+
+    def _report_import(self, count: int, warnings_out: list[dict]) -> None:
+        """Tell the user about imported videos whose timing needs attention.
+
+        A constant-frame-rate MP4 imports silently. A variable-frame-rate or
+        unreadable-fps file gets a plain-language explanation (and, when FFmpeg
+        is present, a one-click offer to normalize to a constant frame rate) so
+        the timeline never silently disagrees with the video.
+        """
+        if not warnings_out:
+            QMessageBox.information(self, "Import complete", f"Imported {count} new video(s).")
+            return
+        lines = [f"Imported {count} new video(s). Some may need attention:", ""]
+        vfr_files: list[str] = []
+        for entry in warnings_out:
+            lines.append(f"- {entry['filename']}")
+            for message in entry.get("warnings", []):
+                lines.append(f"    - {message}")
+            if entry.get("variable_frame_rate"):
+                vfr_files.append(entry["filename"])
+        detail = "\n".join(lines)
+
+        from .video_probe import ffmpeg_available
+
+        if vfr_files and ffmpeg_available():
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Import complete - check timing")
+            box.setText(f"Imported {count} new video(s).")
+            box.setInformativeText(
+                detail
+                + "\n\nNormalize the variable-frame-rate video(s) to a constant frame rate now? "
+                "This writes a re-encoded copy and adds it to the project so frame numbers are exact."
+            )
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            box.setDefaultButton(QMessageBox.Yes)
+            if box.exec() == QMessageBox.Yes:
+                self._normalize_videos_to_cfr(vfr_files)
+        else:
+            QMessageBox.warning(self, "Import complete - check timing", detail)
+
+    def _normalize_videos_to_cfr(self, filenames: list[str]) -> None:
+        from .video_probe import normalize_to_cfr
+
+        targets = [video for video in self.videos if video.filename in set(filenames)]
+        if not targets:
+            return
+        out_dir = Path.home() / ".integrapose" / "tandemytc" / "cfr_normalized"
+        dialog = QProgressDialog(
+            "Normalizing videos to a constant frame rate.", None, 0, len(targets), self
+        )
+        dialog.setWindowTitle("Normalizing")
+        dialog.setWindowModality(Qt.ApplicationModal)
+        dialog.setCancelButton(None)
+        dialog.setMinimumDuration(0)
+        dialog.setValue(0)
+        dialog.show()
+        QApplication.processEvents()
+
+        new_paths: list[Path] = []
+        for index, video in enumerate(targets):
+            dialog.setLabelText(f"Normalizing {video.filename}.")
+            QApplication.processEvents()
+            out_path = out_dir / f"{Path(video.filename).stem}.cfr.mp4"
+            try:
+                ok = normalize_to_cfr(video.path, out_path, fps=float(video.fps))
+            except Exception:
+                ok = False
+            if ok:
+                new_paths.append(out_path)
+            dialog.setValue(index + 1)
+            QApplication.processEvents()
+        dialog.close()
+
+        if new_paths:
+            self.store.import_videos(self.project.id, new_paths)
+            self._reload_all()
+        QMessageBox.information(
+            self,
+            "Normalization complete",
+            f"Normalized {len(new_paths)} of {len(targets)} video(s) to a constant frame rate "
+            "and added them to the project. Annotate the .cfr copies for frame-accurate work.",
+        )
 
     def _import_behavior_yaml(self) -> None:
         path, _ = QFileDialog.getOpenFileName(

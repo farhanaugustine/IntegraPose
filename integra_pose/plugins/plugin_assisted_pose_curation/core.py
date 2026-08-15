@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import math
+import os
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -49,6 +51,7 @@ ACTIVE_LEARNING_CONTEXT_SCALE = 2.0
 ACTIVE_LEARNING_WEIGHT_UNCERTAINTY = 0.45
 ACTIVE_LEARNING_WEIGHT_TRANSITION = 0.25
 ACTIVE_LEARNING_WEIGHT_DIVERSITY = 0.30
+ACTIVE_LEARNING_SCORING_MAX_DET = 1
 PROVENANCE_PENDING_REVIEW = "pending_review"
 PROVENANCE_MANUAL = "manual"
 PROVENANCE_ASSIST_ACCEPTED = "assist_accepted"
@@ -80,6 +83,7 @@ class ActiveLearningCandidate:
     frame_index: int
     image_name: str = ""
     source_video_path: str = ""
+    source_video_id: str = ""
     bbox_xyxy: tuple[int, int, int, int] | None = None
     context_bbox_xyxy: tuple[int, int, int, int] | None = None
     detection_conf: float = 0.0
@@ -100,6 +104,45 @@ class ActiveLearningCandidate:
 
 def _clip01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
+
+
+def source_video_identity(video_path: str | Path) -> str:
+    """Return a stable, collision-resistant identity for one source file.
+
+    The canonical path distinguishes same-stem videos in different folders;
+    size and modification time distinguish a file that was replaced in place.
+    """
+    source = Path(video_path).expanduser().resolve(strict=False)
+    normalized_path = os.path.normcase(str(source))
+    try:
+        stat = source.stat()
+        size = int(stat.st_size)
+        modified_ns = int(stat.st_mtime_ns)
+    except OSError:
+        size = -1
+        modified_ns = -1
+    payload = f"{normalized_path}\0{size}\0{modified_ns}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def active_learning_frame_filename(
+    frame_index: int,
+    *,
+    video_path: str | Path,
+    source_id: str | None = None,
+    ext: str = ".jpg",
+) -> str:
+    """Name an extracted audit frame without colliding across source videos."""
+    index = int(frame_index)
+    if index < 0:
+        raise ValueError("frame_index must be zero or positive.")
+    stem = Path(video_path).stem.strip() or "video"
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-") or "video"
+    identity = str(source_id or source_video_identity(video_path)).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{16}", identity):
+        raise ValueError("source_id must be a 16-character hexadecimal source identity.")
+    suffix = str(ext) if str(ext).startswith(".") else f".{ext}"
+    return f"{stem}__src_{identity}__frame_{index:06d}{suffix}"
 
 
 def parse_keypoint_names(raw_names: str | Sequence[str] | None) -> list[str]:
@@ -740,9 +783,11 @@ def write_active_learning_candidates_csv(
         "min_frame_gap",
         "context_crop_scale",
         "assist_conf_threshold",
+        "scoring_max_det",
         "reviewed_reference_count",
         "source_video_path",
         "source_video_name",
+        "source_video_id",
         "frame_index",
         "image_name",
         "selected",
@@ -805,9 +850,11 @@ def write_active_learning_candidates_csv(
                     str(meta.get("min_frame_gap") or ""),
                     str(meta.get("context_crop_scale") or ""),
                     str(meta.get("assist_conf_threshold") or ""),
+                    str(meta.get("scoring_max_det") or ""),
                     str(meta.get("reviewed_reference_count") or ""),
                     source_video_path,
                     source_video_name,
+                    str(candidate.source_video_id or ""),
                     int(candidate.frame_index),
                     candidate.image_name,
                     int(bool(candidate.selected)),
@@ -875,13 +922,26 @@ def decode_pose_label_line(
     img_w: int,
     img_h: int,
 ) -> tuple[int, list[PosePoint], tuple[int, int, int, int]]:
+    if img_w <= 0 or img_h <= 0:
+        raise ValueError("Image dimensions must be positive.")
     tokens = [token for token in str(line).strip().split() if token]
     expected = 5 + (len(keypoint_names) * 3)
-    if len(tokens) < expected:
-        raise ValueError(f"Expected at least {expected} tokens, got {len(tokens)}.")
-    values = [float(token) for token in tokens]
-    class_id = int(values[0])
+    if len(tokens) != expected:
+        raise ValueError(f"Expected exactly {expected} tokens, got {len(tokens)}.")
+    try:
+        values = [float(token) for token in tokens]
+    except ValueError as exc:
+        raise ValueError("Annotation rows must contain only numeric tokens.") from exc
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Annotation rows must contain only finite values.")
+    if values[0] < 0 or abs(values[0] - round(values[0])) > 1e-6:
+        raise ValueError(f"Class ID must be a non-negative integer, got {values[0]!r}.")
+    class_id = int(round(values[0]))
     norm_cx, norm_cy, norm_w, norm_h = values[1:5]
+    if not (0.0 <= norm_cx <= 1.0 and 0.0 <= norm_cy <= 1.0):
+        raise ValueError("Bounding-box center coordinates must be normalized to [0, 1].")
+    if not (0.0 < norm_w <= 1.0 and 0.0 < norm_h <= 1.0):
+        raise ValueError("Bounding-box width and height must be normalized and positive.")
     box_w = norm_w * float(img_w)
     box_h = norm_h * float(img_h)
     x1 = int(round((norm_cx * float(img_w)) - (box_w / 2.0)))
@@ -895,10 +955,27 @@ def decode_pose_label_line(
         offset = start + (idx * 3)
         norm_x = values[offset]
         norm_y = values[offset + 1]
-        visibility = int(round(values[offset + 2]))
+        raw_visibility = values[offset + 2]
+        if abs(raw_visibility - round(raw_visibility)) > 1e-6:
+            raise ValueError(
+                f"Keypoint {name!r} visibility must be 0, 1, or 2, got {raw_visibility!r}."
+            )
+        visibility = int(round(raw_visibility))
+        if visibility not in {VISIBILITY_MISSING, VISIBILITY_OCCLUDED, VISIBILITY_VISIBLE}:
+            raise ValueError(
+                f"Keypoint {name!r} visibility must be 0, 1, or 2, got {visibility!r}."
+            )
         if visibility == VISIBILITY_MISSING:
+            if abs(norm_x) > 1e-9 or abs(norm_y) > 1e-9:
+                raise ValueError(
+                    f"Missing keypoint {name!r} must use the 0,0 coordinate sentinel."
+                )
             points[idx] = PosePoint(name=str(name))
             continue
+        if not (0.0 <= norm_x <= 1.0 and 0.0 <= norm_y <= 1.0):
+            raise ValueError(
+                f"Keypoint {name!r} coordinates must be normalized to [0, 1]."
+            )
         points[idx] = PosePoint(
             name=str(name),
             x=float(norm_x) * float(img_w),
@@ -1084,6 +1161,7 @@ def write_dataset_yaml(
 __all__ = [
     "ACTIVE_LEARNING_CONTEXT_SCALE",
     "ACTIVE_LEARNING_CSV_FILENAME",
+    "ACTIVE_LEARNING_SCORING_MAX_DET",
     "ACTIVE_LEARNING_WEIGHT_DIVERSITY",
     "ACTIVE_LEARNING_WEIGHT_TRANSITION",
     "ACTIVE_LEARNING_WEIGHT_UNCERTAINTY",
@@ -1103,6 +1181,7 @@ __all__ = [
     "VISIBILITY_MISSING",
     "VISIBILITY_OCCLUDED",
     "VISIBILITY_VISIBLE",
+    "active_learning_frame_filename",
     "clone_pose",
     "blend_memory_pose_into_assist_pose",
     "compute_bbox_transition_score",
@@ -1125,6 +1204,7 @@ __all__ = [
     "sanitize_skeleton_edges",
     "summarize_pose_uncertainty",
     "summarize_curation_manifest_records",
+    "source_video_identity",
     "write_active_learning_candidates_csv",
     "write_dataset_yaml",
 ]

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from integra_pose.logic.analytics_metric_catalog import collect_enabled_metric_keys, expand_metrics_to_modules
 from integra_pose.utils import bout_analyzer
+from integra_pose.utils.frame_identity import load_frame_label_class_metadata
 
 
 def _event_records_to_df(events: dict, *, name_key: str) -> pd.DataFrame:
@@ -128,6 +129,12 @@ class Analytics:
             parsed = float(max_value)
         return parsed
 
+    def _fps_request(self, params) -> tuple[object, str]:
+        """Resolve the workflow-owned FPS input without crossing GUI contexts."""
+        if "user_video_fps_override" in params:
+            return params.get("user_video_fps_override"), "the calling workflow's Video FPS field"
+        return self.app.config.get_setting('analytics.video_fps_var'), "the Bout Analytics tab"
+
     @staticmethod
     def _normalize_roi_polygon_override(raw_payload):
         if raw_payload is None:
@@ -136,10 +143,14 @@ class Analytics:
             return {}
         out = {}
         for name, entry in dict(raw_payload).items():
-            if not isinstance(entry, dict):
-                continue
+            if isinstance(entry, dict):
+                if not bool(entry.get("enabled", True)):
+                    continue
+                polygons_payload = entry.get("polygons", [])
+            else:
+                polygons_payload = entry
             polygons = []
-            for poly in entry.get("polygons", []) or []:
+            for poly in polygons_payload or []:
                 poly_np = np.asarray(poly, dtype=np.int32)
                 if poly_np.ndim != 2 or poly_np.shape[0] < 3 or poly_np.shape[1] != 2:
                     continue
@@ -172,7 +183,13 @@ class Analytics:
         return None
 
     def _resolve_behavior_name_map(self, params):
-        raw_override = params.get("behavior_names_override")
+        label_metadata = load_frame_label_class_metadata(params.get("yolo_folder") or "")
+        saved_names = list(label_metadata.get("class_names") or [])
+        if saved_names:
+            raw_override = saved_names
+            params["behavior_names_source"] = "inference label metadata"
+        else:
+            raw_override = params.get("behavior_names_override")
         if raw_override in (None, ""):
             try:
                 raw_override = self.app.config.get_setting("setup.behaviors_list")
@@ -224,12 +241,14 @@ class Analytics:
                 params['yolo_folder'],
                 single_animal_mode=True,
                 class_names=behavior_name_map or None,
+                source_video=params['video_file'],
             )
         else:
             per_frame_df, roi_polygons, class_names = bout_analyzer.load_and_preprocess_data(
                 yaml_path,
                 params['yolo_folder'],
                 class_names=behavior_name_map or None,
+                source_video=params['video_file'],
             )
 
         if single_animal_mode:
@@ -243,13 +262,9 @@ class Analytics:
 
         from integra_pose.utils.fps_resolver import resolve_fps, FpsUnavailableError
 
-        fps_override = params.get("user_video_fps_override")
-        if fps_override not in (None, "", 0, 0.0):
-            user_fps_input = fps_override
-            fps_workflow_label = "the calling workflow's Video FPS field"
-        else:
-            user_fps_input = self.app.config.get_setting('analytics.video_fps_var')
-            fps_workflow_label = "the Bout Analytics tab"
+        # Batch explicitly supplies 0/blank to mean "probe each video".  Do
+        # not fall through to the unrelated value currently visible in Tab 6.
+        user_fps_input, fps_workflow_label = self._fps_request(params)
 
         try:
             fps_value, fps_source = resolve_fps(
@@ -318,7 +333,11 @@ class Analytics:
         roi_event_mode = str(params.get("roi_event_mode", "tab6_hybrid") or "tab6_hybrid").strip() or "tab6_hybrid"
         keypoint_entry_index = int(params.get("keypoint_entry_index", 0) or 0)
         keypoint_entry_indices = [int(idx) for idx in (params.get("keypoint_entry_indices") or [])]
-        keypoint_entry_ratio_threshold = float(params.get("keypoint_entry_ratio_threshold", 0.5) or 0.5)
+        raw_keypoint_ratio_threshold = params.get("keypoint_entry_ratio_threshold", 0.5)
+        keypoint_entry_ratio_threshold = float(
+            0.5 if raw_keypoint_ratio_threshold is None else raw_keypoint_ratio_threshold
+        )
+        keypoint_entry_ratio_threshold = max(0.0, min(1.0, keypoint_entry_ratio_threshold))
         roi_event_gap_frames = max(0, int(params.get("roi_max_gap_frames", 0) or 0))
         roi_event_min_dwell_frames = max(1, int(params.get("roi_min_dwell_frames", 1) or 1))
         if use_rois:
@@ -373,34 +392,17 @@ class Analytics:
         object_roi_shape = str(params.get("object_roi_shape", "circle") or "circle").strip().lower() or "circle"
         object_keypoint_index = max(0, int(params.get("object_interaction_keypoint_index", 0) or 0))
         object_distance_px = max(0.0, float(params.get("object_interaction_distance_px", 0.0) or 0.0))
-        object_event_gap_frames = max(0, int(params.get("object_max_gap_frames", 0) or 0))
-        object_event_min_dwell_frames = max(1, int(params.get("object_min_dwell_frames", 1) or 1))
+        object_event_gap_frames = max(
+            0,
+            int(params.get("object_max_gap_frames", roi_event_gap_frames) or 0),
+        )
+        object_event_min_dwell_frames = max(
+            1,
+            int(params.get("object_min_dwell_frames", roi_event_min_dwell_frames) or 1),
+        )
         object_events = {'entries': [], 'exits': []}
         object_metrics = None
         object_metric_files = {}
-
-        def _coerce_object_polygon_map(raw_payload):
-            if raw_payload is None:
-                return {}
-            if not isinstance(raw_payload, dict):
-                return {}
-            out = {}
-            for name, entry in dict(raw_payload).items():
-                if isinstance(entry, dict):
-                    polygons_payload = entry.get("polygons", [])
-                else:
-                    polygons_payload = entry
-                polygons = []
-                if not isinstance(polygons_payload, (list, tuple)):
-                    continue
-                for poly in polygons_payload:
-                    poly_np = np.asarray(poly, dtype=np.int32)
-                    if poly_np.ndim != 2 or poly_np.shape[0] < 3 or poly_np.shape[1] != 2:
-                        continue
-                    polygons.append(poly_np)
-                if polygons:
-                    out[str(name)] = polygons
-            return out
 
         if object_interaction_enabled:
             self._raise_if_cancelled(params, "ROI assignment")
@@ -411,7 +413,9 @@ class Analytics:
                 self.app.log_message('Video dimensions unavailable; skipping object interaction analytics.', 'WARNING')
                 object_interaction_enabled = False
             else:
-                object_polygon_map = _coerce_object_polygon_map(params.get("object_roi_polygon_map_override"))
+                object_polygon_map = self._normalize_roi_polygon_override(
+                    params.get("object_roi_polygon_map_override")
+                )
                 if object_count > 0 and object_polygon_map and len(object_polygon_map) != object_count:
                     self.app.log_message(
                         (
@@ -488,6 +492,10 @@ class Analytics:
             roi_max_gap_frames=roi_event_gap_frames,
             roi_min_dwell_frames=roi_event_min_dwell_frames,
             stop_check=lambda: self._is_stop_requested(params),
+            bout_class_mode=str(
+                params.get("behavior_bout_class_mode")
+                or "mutually_exclusive"
+            ),
         )
         if roi_metrics is not None:
             roi_metrics.setdefault('events', roi_events)
@@ -520,6 +528,8 @@ class Analytics:
                         "frame",
                         "Object Interaction ROI",
                         "Object Interaction Memberships",
+                        "Qualified Object Interaction ROI",
+                        "Qualified Object Interaction Memberships",
                         "Object Contact ROI",
                         "Object Contact Memberships",
                         "Object Proximity ROI",
@@ -694,19 +704,36 @@ class Analytics:
                     return [str(v) for v in value if str(v).strip()]
                 return []
 
+            def _safe_polygon_map(value):
+                normalized = self._normalize_roi_polygon_override(value)
+                out = {}
+                for name, polygons in normalized.items():
+                    clean_polygons = []
+                    for polygon in polygons:
+                        try:
+                            points = [[int(point[0]), int(point[1])] for point in polygon]
+                        except (TypeError, ValueError, IndexError):
+                            continue
+                        if len(points) >= 3:
+                            clean_polygons.append(points)
+                    if clean_polygons:
+                        out[str(name)] = clean_polygons
+                return out
+
             integra_version = None
             try:
                 from integra_pose import __version__ as integra_version  # type: ignore
             except Exception:
                 integra_version = None
 
-            keypoint_names = []
-            try:
-                raw_kps = self.app.config.get_setting("setup.keypoint_names_str")
-                if isinstance(raw_kps, str):
-                    keypoint_names = [p.strip() for p in raw_kps.split(",") if p.strip()]
-            except Exception:
-                keypoint_names = []
+            keypoint_names = _safe_list(params.get("keypoint_names_override"))
+            if not keypoint_names:
+                try:
+                    raw_kps = self.app.config.get_setting("setup.keypoint_names_str")
+                    if isinstance(raw_kps, str):
+                        keypoint_names = [p.strip() for p in raw_kps.split(",") if p.strip()]
+                except Exception:
+                    keypoint_names = []
 
             behavior_names = _safe_list(class_names)
 
@@ -742,7 +769,7 @@ class Analytics:
             else:
                 single_animal_mode_manifest = bool(single_animal_override)
 
-            # Schema v2 (ADP-4): optional `provenance` block carries subject_id
+            # Schema v2: optional `provenance` block carries subject_id
             # and friends from the batch pipeline, so Tab 7 can do auto
             # train/val/test splits keyed by subject. v1 readers ignore
             # unknown keys; v2 readers handle absent provenance gracefully.
@@ -756,7 +783,7 @@ class Analytics:
             }
 
             manifest = {
-                "schema_version": 2,
+                "schema_version": 4,
                 "run_id": str(run_id),
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "integra_pose_version": integra_version,
@@ -765,14 +792,43 @@ class Analytics:
                     "yolo_folder": params.get("yolo_folder"),
                     "yaml_file": params.get("yaml_file"),
                     "keypoint_names": keypoint_names,
+                    "keypoint_names_source": str(params.get("keypoint_names_source") or "unresolved"),
+                    "keypoint_schema_path": str(params.get("keypoint_schema_path") or ""),
                     "behavior_names": behavior_names,
+                    "behavior_names_source": str(
+                        params.get("behavior_names_source") or "unresolved"
+                    ),
+                    "roi_polygons": _safe_polygon_map(params.get("roi_polygon_map_override")),
+                    "object_roi_polygons": _safe_polygon_map(params.get("object_roi_polygon_map_override")),
                 },
                 "provenance": provenance,
                 "parameters": {
                     "max_gap_frames": params.get("max_gap_frames"),
                     "min_bout_frames": params.get("min_bout_frames"),
+                    "temporal_threshold_unit": str(
+                        params.get("temporal_threshold_unit") or "frames"
+                    ),
+                    "configured_min_bout_seconds": float(
+                        params.get("configured_min_bout_seconds") or 0.0
+                    ),
+                    "configured_max_gap_seconds": float(
+                        params.get("configured_max_gap_seconds") or 0.0
+                    ),
+                    "configured_roi_min_dwell_seconds": float(
+                        params.get("configured_roi_min_dwell_seconds") or 0.0
+                    ),
+                    "configured_roi_max_gap_seconds": float(
+                        params.get("configured_roi_max_gap_seconds") or 0.0
+                    ),
+                    "temporal_threshold_fps": float(
+                        params.get("temporal_threshold_fps") or 0.0
+                    ),
                     "fps": fps,
                     "single_animal_mode": single_animal_mode_manifest,
+                    "behavior_bout_class_mode": str(
+                        params.get("behavior_bout_class_mode")
+                        or "mutually_exclusive"
+                    ),
                     "use_existing_labels": bool(params.get("use_existing_labels", False)),
                     "existing_labels_root": str(params.get("existing_labels_root", "") or ""),
                     "use_rois": bool(use_rois),
@@ -780,6 +836,8 @@ class Analytics:
                     "roi_entry_threshold": float(roi_entry_threshold),
                     "roi_exit_threshold": float(roi_exit_threshold),
                     "roi_event_mode": roi_event_mode,
+                    "roi_interval_semantics": "inclusive_start_and_end_frames",
+                    "roi_overlap_semantics": "concurrent_memberships_plus_exclusive_primary_exports",
                     "roi_max_gap_frames": int(roi_max_gap_frames),
                     "roi_min_dwell_frames": int(roi_min_dwell_frames),
                     "keypoint_entry_index": int(keypoint_entry_index),
@@ -791,6 +849,7 @@ class Analytics:
                     "object_roi_shape": str(object_roi_shape),
                     "object_interaction_keypoint_index": int(object_interaction_keypoint_index),
                     "object_interaction_distance_px": float(object_interaction_distance_px),
+                    "object_interval_semantics": "inclusive_start_and_end_frames",
                     "object_max_gap_frames": int(object_max_gap_frames),
                     "object_min_dwell_frames": int(object_min_dwell_frames),
                     "assay_preset": str(assay_preset or "custom"),

@@ -129,7 +129,7 @@ def create_training_tab(app):
 
     device_label = ttk.Label(adv_hp_frame, text="Device:"); device_label.grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
     device_entry = ttk.Entry(adv_hp_frame, textvariable=app.config.training.device_var, width=8); device_entry.grid(row=2, column=1, sticky=tk.EW, pady=5)
-    CreateToolTip(device_entry, "Device to run on, e.g., 'cpu', '0', or '0,1,2,3'.")
+    CreateToolTip(device_entry, "-1 selects an available accelerator automatically; use cpu, 0, or 0,1 for an explicit override.")
 
     augmentation_section = CollapsibleSection(
         content,

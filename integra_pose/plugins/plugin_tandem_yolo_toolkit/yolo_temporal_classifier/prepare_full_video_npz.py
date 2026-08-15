@@ -37,9 +37,10 @@ import re
 import sys
 import threading
 import time
+import uuid
 import warnings
 import zipfile
-from collections import Counter, defaultdict, deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from numpy.lib import format as np_format
 from pathlib import Path
@@ -52,6 +53,8 @@ warnings.filterwarnings(
 import cv2
 import numpy as np
 from PIL import Image
+
+from integra_pose.utils.safe_io import safe_write_json
 
 # ---------------------------------------------------------------------------
 # Local package imports — same modules as v4
@@ -73,6 +76,91 @@ else:  # pragma: no cover
 # Dataset discovery helpers
 # ---------------------------------------------------------------------------
 DEFAULT_CLASSES = ["attack", "investigation", "mount", "other"]
+CONVERSION_CACHE_SCHEMA = "integrapose-seq-mp4-cache-v1"
+_FILE_FINGERPRINT_CACHE: dict[tuple[str, int, int], dict[str, object]] = {}
+
+
+def _invalidate_file_fingerprint(path: Path) -> None:
+    resolved = str(Path(path).expanduser().resolve(strict=False))
+    for key in [key for key in _FILE_FINGERPRINT_CACHE if key[0] == resolved]:
+        _FILE_FINGERPRINT_CACHE.pop(key, None)
+
+
+def _file_fingerprint(path: Path | str) -> dict[str, object]:
+    """Return a stable content fingerprint suitable for resume provenance."""
+    resolved = Path(path).expanduser().resolve(strict=True)
+    before = resolved.stat()
+    cache_key = (str(resolved), int(before.st_size), int(before.st_mtime_ns))
+    cached = _FILE_FINGERPRINT_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
+    digest = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    after = resolved.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise RuntimeError(f"File changed while it was being fingerprinted: {resolved}")
+
+    fingerprint: dict[str, object] = {
+        "path": str(resolved),
+        "size_bytes": int(after.st_size),
+        "mtime_ns": int(after.st_mtime_ns),
+        "sha256": digest.hexdigest(),
+    }
+    _FILE_FINGERPRINT_CACHE[cache_key] = dict(fingerprint)
+    return fingerprint
+
+
+def _conversion_cache_path(mp4_path: Path) -> Path:
+    return Path(mp4_path).with_suffix(Path(mp4_path).suffix + ".integrapose-cache.json")
+
+
+def _probe_video_file(path: Path) -> dict[str, int]:
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            return {"frames": 0, "width": 0, "height": 0}
+        return {
+            "frames": int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0),
+            "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0),
+            "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0),
+        }
+    finally:
+        cap.release()
+
+
+def _load_valid_conversion_cache(seq_path: Path, mp4_path: Path, *, fps: float) -> dict | None:
+    metadata_path = _conversion_cache_path(mp4_path)
+    if not mp4_path.is_file() or not metadata_path.is_file():
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("schema_version") != CONVERSION_CACHE_SCHEMA:
+            return None
+        if abs(float(metadata.get("fps")) - float(fps)) > 1e-9:
+            return None
+        if metadata.get("source_fingerprint") != _file_fingerprint(seq_path):
+            return None
+        if metadata.get("converted_fingerprint") != _file_fingerprint(mp4_path):
+            return None
+        probe = _probe_video_file(mp4_path)
+        if any(int(probe[key]) <= 0 for key in ("frames", "width", "height")):
+            return None
+        for key in ("frames", "width", "height"):
+            if int(metadata.get(key, 0)) != int(probe[key]):
+                return None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    return {
+        "converted": False,
+        "mp4_path": str(mp4_path),
+        **probe,
+        "source_fingerprint": metadata["source_fingerprint"],
+        "converted_fingerprint": metadata["converted_fingerprint"],
+        "cache_metadata_path": str(metadata_path),
+    }
 
 
 def find_seq(video_dir: Path) -> Path | None:
@@ -119,54 +207,80 @@ def convert_seq_to_mp4(
     overwrite: bool,
 ) -> dict:
     """Convert a NorPix .seq file to MP4 using the local SeqReader."""
-    if mp4_path.is_file() and not overwrite:
-        cap = cv2.VideoCapture(str(mp4_path))
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        cap.release()
-        return {
-            "converted": False,
-            "mp4_path": str(mp4_path),
-            "frames": frame_count,
-            "width": width,
-            "height": height,
-        }
+    seq_path = Path(seq_path).expanduser().resolve(strict=True)
+    mp4_path = Path(mp4_path).expanduser().resolve(strict=False)
+    if not overwrite:
+        cached = _load_valid_conversion_cache(seq_path, mp4_path, fps=fps)
+        if cached is not None:
+            return cached
 
     from utils.seq_reader import SeqReader
 
     mp4_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = mp4_path.with_name(
+        f".{mp4_path.stem}.{uuid.uuid4().hex}.tmp{mp4_path.suffix}"
+    )
     t0 = time.time()
-    with SeqReader(seq_path) as reader:
-        reader.build_seek_table(str(seek_mat_path) if seek_mat_path else None)
-        n_frames = len(reader.seek_table or [])
-        if n_frames <= 0:
-            n_frames = int(reader.num_frames)
-        width = int(reader.width)
-        height = int(reader.height)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(mp4_path), fourcc, float(fps), (width, height))
-        if not writer.isOpened():
-            raise RuntimeError(f"Could not open VideoWriter for {mp4_path}")
-        try:
-            for idx in range(n_frames):
-                frame = reader.read_frame(idx)
-                if frame.ndim == 2:
-                    bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-                else:
-                    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                writer.write(bgr)
-                if idx and idx % 5000 == 0:
-                    print(f"[convert] {seq_path.name}: {idx}/{n_frames} frames", flush=True)
-        finally:
-            writer.release()
+    try:
+        with SeqReader(seq_path) as reader:
+            reader.build_seek_table(str(seek_mat_path) if seek_mat_path else None)
+            n_frames = len(reader.seek_table or [])
+            if n_frames <= 0:
+                n_frames = int(reader.num_frames)
+            width = int(reader.width)
+            height = int(reader.height)
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(temp_path), fourcc, float(fps), (width, height))
+            if not writer.isOpened():
+                raise RuntimeError(f"Could not open VideoWriter for temporary output {temp_path}")
+            try:
+                for idx in range(n_frames):
+                    frame = reader.read_frame(idx)
+                    if frame.ndim == 2:
+                        bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                    else:
+                        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    writer.write(bgr)
+                    if idx and idx % 5000 == 0:
+                        print(f"[convert] {seq_path.name}: {idx}/{n_frames} frames", flush=True)
+            finally:
+                writer.release()
+
+        probe = _probe_video_file(temp_path)
+        expected = {"frames": int(n_frames), "width": int(width), "height": int(height)}
+        if probe != expected:
+            raise RuntimeError(
+                f"Converted video validation failed for {seq_path}: expected {expected}, got {probe}."
+            )
+
+        temp_path.replace(mp4_path)
+        _invalidate_file_fingerprint(mp4_path)
+        source_fingerprint = _file_fingerprint(seq_path)
+        converted_fingerprint = _file_fingerprint(mp4_path)
+        metadata_path = _conversion_cache_path(mp4_path)
+        safe_write_json(
+            metadata_path,
+            {
+                "schema_version": CONVERSION_CACHE_SCHEMA,
+                "fps": float(fps),
+                **expected,
+                "source_fingerprint": source_fingerprint,
+                "converted_fingerprint": converted_fingerprint,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    finally:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
 
     return {
         "converted": True,
         "mp4_path": str(mp4_path),
-        "frames": n_frames,
-        "width": width,
-        "height": height,
+        **expected,
+        "source_fingerprint": source_fingerprint,
+        "converted_fingerprint": converted_fingerprint,
+        "cache_metadata_path": str(metadata_path),
         "elapsed_s": round(time.time() - t0, 3),
     }
 
@@ -483,6 +597,68 @@ class VideoSource:
     mp4_path: Optional[Path] = None  # set after conversion
 
 
+def _safe_stem(text: str, max_len: int = 200) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(text)).strip("._")
+    return clean[:max_len] or "video"
+
+
+def _validate_source_identity_contract(
+    sources: Sequence[VideoSource],
+    *,
+    context: str,
+) -> None:
+    """Reject source identities that would alias scientific output artifacts."""
+    seen_sources: dict[str, str] = {}
+    seen_video_ids: dict[str, str] = {}
+    seen_artifact_keys: dict[str, str] = {}
+    issues: list[str] = []
+
+    for source in sources:
+        video_id = str(source.video_id or "").strip()
+        source_path = source.source_path or source.seq_path
+        description = f"{source.split}/{video_id or '<blank>'}"
+
+        if not video_id:
+            issues.append(f"{description} has a blank video_id")
+        else:
+            previous = seen_video_ids.get(video_id)
+            if previous is not None:
+                issues.append(f"duplicate video_id {video_id!r}: {previous} and {description}")
+            else:
+                seen_video_ids[video_id] = description
+
+            artifact_key = _safe_stem(video_id)
+            artifact_lookup = artifact_key.casefold()
+            previous = seen_artifact_keys.get(artifact_lookup)
+            if previous is not None:
+                issues.append(
+                    f"artifact key {artifact_key!r} is shared by {previous} and {description}"
+                )
+            else:
+                seen_artifact_keys[artifact_lookup] = description
+
+        if source_path is None:
+            issues.append(f"{description} has no source_path or seq_path")
+            continue
+
+        resolved = Path(source_path).expanduser().resolve(strict=False)
+        source_lookup = resolved.as_posix().casefold()
+        previous = seen_sources.get(source_lookup)
+        if previous is not None:
+            issues.append(
+                f"resolved source {str(resolved)!r} is shared by {previous} and {description}"
+            )
+        else:
+            seen_sources[source_lookup] = description
+
+    if issues:
+        detail = "\n  - ".join(issues)
+        raise SystemExit(
+            f"[{context}] FATAL: source identities are not unique; processing would overwrite or "
+            f"duplicate video artifacts:\n  - {detail}"
+        )
+
+
 def discover_sources(
     data_root: Path,
     train_splits: Sequence[str],
@@ -539,19 +715,7 @@ def discover_sources(
         if excl_dir.is_dir():
             excluded_seen += sum(1 for _ in excl_dir.iterdir() if _.is_dir())
 
-    # Strict source-grouping check: no source video should appear in both train
-    # and val splits. (Possible if user passes overlapping
-    # split lists like --train_splits train --val_splits train.)
-    by_id = defaultdict(set)
-    for s in sources:
-        by_id[s.video_id].add(s.split)
-    overlap = [vid for vid, splits in by_id.items() if len(splits) > 1]
-    if overlap:
-        raise SystemExit(
-            f"[discover] FATAL: {len(overlap)} source videos appear in BOTH "
-            f"train and val splits. Use disjoint --train_splits / --val_splits. "
-            f"Examples: {overlap[:5]}"
-        )
+    _validate_source_identity_contract(sources, context="discover")
 
     n_train = sum(1 for s in sources if s.split == "train")
     n_val = sum(1 for s in sources if s.split == "val")
@@ -627,15 +791,7 @@ def discover_sources_from_manifest(
                 )
             )
 
-    by_id = defaultdict(set)
-    for s in sources:
-        by_id[s.video_id].add(s.split)
-    overlap = [vid for vid, splits in by_id.items() if len(splits) > 1]
-    if overlap:
-        raise SystemExit(
-            f"[manifest] FATAL: {len(overlap)} source videos appear in BOTH train and val. "
-            f"Examples: {overlap[:5]}"
-        )
+    _validate_source_identity_contract(sources, context="manifest")
     logger.info(
         f"[manifest] loaded user-video sources from {manifest_csv}: "
         f"train={sum(1 for s in sources if s.split == 'train')} "
@@ -686,11 +842,6 @@ def window_label(
 # ---------------------------------------------------------------------------
 # Per-video processing
 # ---------------------------------------------------------------------------
-def _safe_stem(text: str, max_len: int = 200) -> str:
-    clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(text)).strip("._")
-    return (clean[:max_len] or "video")
-
-
 def _build_payload(frames: List[NCropDetection], args) -> dict:
     """Stack a list of per-frame detections into the NPZ payload dict."""
     animal_keypoints = np.stack([e.keypoints_crop_norm for e in frames], axis=0)
@@ -759,10 +910,18 @@ def _done_marker_path(output_root: Path, safe_stem: str) -> Path:
 
 def _video_build_signature(src: VideoSource, args, class_names: Sequence[str]) -> dict:
     source_path = src.source_path or src.seq_path
+    model_fingerprint = getattr(args, "yolo_weights_fingerprint", None)
+    if not isinstance(model_fingerprint, dict):
+        model_fingerprint = _file_fingerprint(args.yolo_weights)
     return {
         "video_id": src.video_id,
         "source_path": str(Path(source_path).resolve()) if source_path else "",
+        "source_fingerprint": _file_fingerprint(source_path) if source_path else None,
         "annot_path": str(Path(src.annot_path).resolve()),
+        "annotation_fingerprint": _file_fingerprint(src.annot_path),
+        "converted_source_fingerprint": (
+            _file_fingerprint(src.mp4_path) if src.mp4_path is not None else None
+        ),
         "window_size": int(args.window_size),
         "window_stride": int(args.window_stride),
         "label_min_dominance": float(args.label_min_dominance),
@@ -776,9 +935,12 @@ def _video_build_signature(src: VideoSource, args, class_names: Sequence[str]) -
         "group_scale_factor": float(args.group_scale_factor),
         "body_length_px": None if args.body_length_px is None else float(args.body_length_px),
         "yolo_weights": str(Path(args.yolo_weights).resolve()),
+        "yolo_weights_fingerprint": model_fingerprint,
         "yolo_conf": float(args.yolo_conf),
         "yolo_iou": float(args.yolo_iou),
         "yolo_imgsz": int(args.yolo_imgsz),
+        "yolo_half": bool(getattr(args, "yolo_half", False)),
+        "yolo_tracker": str(getattr(args, "yolo_tracker", "bytetrack.yaml")),
         "source_mode": str(args.source_mode),
         "pose_conf_threshold": float(args.pose_conf_threshold),
         "keep_last_box": bool(args.keep_last_box),
@@ -820,6 +982,23 @@ def _load_done_marker(
             f"First missing: {missing[0]}"
         )
         return None
+    recorded_artifacts = marker.get("artifact_fingerprints")
+    if not isinstance(recorded_artifacts, dict):
+        logger.info(f"[{src.video_id}] done marker predates artifact fingerprints; rebuilding")
+        return None
+    artifact_paths = {
+        str(sample.get("sequence_h5") or sample.get("sequence_npz") or "")
+        for sample in samples
+    }
+    for rel in sorted(artifact_paths):
+        try:
+            current = _file_fingerprint(base / rel)
+        except OSError as exc:
+            logger.warning(f"[{src.video_id}] could not fingerprint cached result {rel}: {exc}")
+            return None
+        if recorded_artifacts.get(rel) != current:
+            logger.warning(f"[{src.video_id}] cached result changed at {rel}; rebuilding")
+            return None
     cls_counts = Counter(s.get("class_name", "") for s in samples)
     cls_counts.pop("", None)
     return samples, cls_counts
@@ -836,15 +1015,26 @@ def _write_done_marker(
 ) -> None:
     marker_path = _done_marker_path(output_root, safe_stem)
     marker_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_paths = {
+        str(sample.get("sequence_h5") or sample.get("sequence_npz") or "")
+        for sample in samples
+    }
+    if "" in artifact_paths:
+        raise ValueError(f"Cannot write a done marker for {src.video_id}: sample store path is missing.")
+    artifact_fingerprints = {
+        rel: _file_fingerprint(Path(output_root) / rel)
+        for rel in sorted(artifact_paths)
+    }
     payload = {
-        "version": "behaviorscope-y-full-video-build-v1",
+        "version": "integrapose-tandemytc-full-video-build-v2",
         "completed_at_unix": time.time(),
         "signature": _video_build_signature(src, args, class_names),
+        "artifact_fingerprints": artifact_fingerprints,
         "n_samples": len(samples),
         "class_counts": dict(cls_counts),
         "samples": samples,
     }
-    marker_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    safe_write_json(marker_path, payload, indent=2, sort_keys=True)
 
 
 def _delete_existing_video_npzs(seq_dir: Path, safe_stem: str) -> int:
@@ -922,26 +1112,6 @@ def process_video(
     if storage_mode == "npz":
         seq_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Resume support: skip a video whose windows already exist on disk ----
-    if args.skip_existing:
-        existing = _load_done_marker(output_root, safe_stem, src, args, class_names, logger)
-        if existing is not None:
-            samples, cls_counts = existing
-            logger.info(
-                f"[{src.video_id}] skip_existing: completed marker found; "
-                f"reusing {len(samples)} manifest entries"
-            )
-            return samples, cls_counts
-
-    if storage_mode == "npz":
-        n_existing = _video_already_done(seq_dir, safe_stem)
-        if n_existing and args.clean_incomplete_existing:
-            deleted = _delete_existing_video_npzs(seq_dir, safe_stem)
-            logger.warning(
-                f"[{src.video_id}] removed {deleted} stale NPZ files without a matching "
-                "completed-video marker before rebuilding"
-            )
-
     # ---- 1. ensure .mp4 exists ----
     if src.source_path is not None:
         src.mp4_path = src.source_path
@@ -1009,6 +1179,26 @@ def process_video(
         logger.warning(f"[{src.video_id}] no readable frames; skipping")
         return [], Counter()
 
+    # Validate source/conversion fingerprints before accepting cached results.
+    if args.skip_existing:
+        existing = _load_done_marker(output_root, safe_stem, src, args, class_names, logger)
+        if existing is not None:
+            samples, cls_counts = existing
+            logger.info(
+                f"[{src.video_id}] skip_existing: completed marker found; "
+                f"reusing {len(samples)} manifest entries"
+            )
+            return samples, cls_counts
+
+    if storage_mode == "npz":
+        n_existing = _video_already_done(seq_dir, safe_stem)
+        if n_existing and args.clean_incomplete_existing:
+            deleted = _delete_existing_video_npzs(seq_dir, safe_stem)
+            logger.warning(
+                f"[{src.video_id}] removed {deleted} stale NPZ files without a matching "
+                "completed-video marker before rebuilding"
+            )
+
     # ---- 2. parse .annot -> per-frame label vector ----
     header, bouts, unknown_labels = parse_annot_for_classes(src.annot_path, class_to_idx)
     if unknown_labels:
@@ -1044,6 +1234,8 @@ def process_video(
         pose_conf_threshold=float(args.pose_conf_threshold),
         fps=fps,
         batch_size=int(args.yolo_batch),
+        half=bool(getattr(args, "yolo_half", False)),
+        tracker=str(getattr(args, "yolo_tracker", "bytetrack.yaml")),
     )
 
     # Buffer holds (frame_idx, NCropDetection) for the most recent
@@ -1248,6 +1440,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--yolo_iou", type=float, default=0.45)
     p.add_argument("--yolo_imgsz", type=int, default=640)
     p.add_argument("--yolo_batch", type=int, default=64)
+    p.add_argument("--yolo_half", action=argparse.BooleanOptionalAction, default=False,
+                   help="Use FP16 for YOLO on CUDA; ignored on CPU.")
+    p.add_argument("--yolo_tracker", default="bytetrack.yaml",
+                   help="Ultralytics tracker config (fast default: bytetrack.yaml).")
     p.add_argument("--yolo_task", default=None)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--keep_last_box", action="store_true", default=True)
@@ -1415,6 +1611,8 @@ def main() -> int:
         "hdf5_compresslevel": int(args.hdf5_compresslevel),
         "yolo_weights": str(args.yolo_weights),
         "yolo_imgsz": int(args.yolo_imgsz),
+        "yolo_half": bool(getattr(args, "yolo_half", False)),
+        "yolo_tracker": str(getattr(args, "yolo_tracker", "bytetrack.yaml")),
         "data_root": str(args.data_root) if args.data_root else None,
         "source_manifest_csv": str(args.source_manifest_csv) if args.source_manifest_csv else None,
         "train_splits": list(args.train_splits),

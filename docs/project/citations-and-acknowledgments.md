@@ -23,7 +23,7 @@ IntegraPose depends on a broader open-source ecosystem. The project benefits dir
 | Project | Why it matters here |
 | --- | --- |
 | PyTorch | Supports deep-learning execution and GPU-backed model workflows |
-| Ultralytics YOLO | Provides the backbone for core detection and pose training and inference flows |
+| Ultralytics YOLO | Provides the backbone for GUI pose training and pose/detection inference flows |
 | OpenCV | Handles important video IO, image processing, and overlay operations |
 | NumPy | Powers array-based numerical computation throughout the pipeline |
 | SciPy | Supports scientific and signal-processing style analysis utilities |

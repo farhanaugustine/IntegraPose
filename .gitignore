@@ -19,6 +19,12 @@ site/
 
 # Runtime logs
 *.log
+*.tmp
+*.bak
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
 
 # Common output folders
 runs/
@@ -42,5 +48,3 @@ env/
 *.ckpt
 *.weights
 models/
-*.log
-*.pyc

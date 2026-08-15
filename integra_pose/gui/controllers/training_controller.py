@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import messagebox
 
 from integra_pose.utils import command_builder, model_registry
+from integra_pose.utils.operation_result import OperationResult
 
 
 class TrainingController:
@@ -26,7 +27,7 @@ class TrainingController:
         app._clear_process_stop_requested("training")
         app._set_process_activity("training", "running", "starting")
 
-        def on_finish():
+        def on_finish(result: OperationResult):
             stopped = app._consume_process_stop_requested("training")
             if hasattr(app, 'train_button'):
                 app.train_button.config(state=tk.NORMAL)
@@ -36,40 +37,54 @@ class TrainingController:
                 app.log_message("Disabled Stop Training button.", "INFO")
             app.update_status("Training finished or stopped.")
             app._set_job_status("No active jobs")
-            try:
-                project_root = Path(app.config.training.model_save_dir.get() or "runs/pose/train")
-                run_name = (app.config.training.run_name_var.get() or "").strip()
-                candidate = project_root / run_name / "weights" / "best.pt"
-                results_csv_path = project_root / run_name / "results.csv"
-                if candidate.exists():
-                    app.config.training.export_model_path.set(str(candidate))
-                    app.log_message(f"Detected new weights at {candidate}; pre-filling export panel.", "INFO")
-                    metrics = model_registry.parse_results_metrics(results_csv_path)
-                    summary = model_registry.summarize_core_metrics(metrics)
-                    if summary:
-                        app.log_message("--- Training Validation Summary ---", "INFO")
-                        for label, value in summary:
-                            app.log_message(f"{label:14s}: {value:.4f}", "INFO")
-                        app.log_message("-----------------------------------", "INFO")
-                    record = model_registry.register_training_run(
-                        app,
-                        model_path=candidate,
-                        results_csv_path=results_csv_path,
-                    )
-                    if record is not None:
-                        app.log_message("Registered training run in Model Registry.", "INFO")
-                    refresh_registry = getattr(app, "_refresh_model_registry_views", None)
-                    if callable(refresh_registry):
-                        refresh_registry()
-            except Exception:
-                pass
+            if result.succeeded and not stopped:
+                try:
+                    project_root = Path(app.config.training.model_save_dir.get() or "runs/pose/train")
+                    run_name = (app.config.training.run_name_var.get() or "").strip()
+                    candidate = project_root / run_name / "weights" / "best.pt"
+                    results_csv_path = project_root / run_name / "results.csv"
+                    if candidate.exists():
+                        app.config.training.export_model_path.set(str(candidate))
+                        app.log_message(f"Detected new weights at {candidate}; pre-filling export panel.", "INFO")
+                        metrics = model_registry.parse_results_metrics(results_csv_path)
+                        summary = model_registry.summarize_core_metrics(metrics)
+                        if summary:
+                            app.log_message("--- Training Validation Summary ---", "INFO")
+                            for label, value in summary:
+                                app.log_message(f"{label:14s}: {value:.4f}", "INFO")
+                            app.log_message("-----------------------------------", "INFO")
+                        record = model_registry.register_training_run(
+                            app,
+                            model_path=candidate,
+                            results_csv_path=results_csv_path,
+                        )
+                        if record is not None:
+                            app.log_message("Registered training run in Model Registry.", "INFO")
+                        refresh_registry = getattr(app, "_refresh_model_registry_views", None)
+                        if callable(refresh_registry):
+                            refresh_registry()
+                except Exception as exc:
+                    app.log_message(f"Training artifacts could not be registered: {exc}", "WARNING")
+
             if stopped:
                 app._set_process_activity("training", "idle")
+            elif result.failed:
+                detail = result.error or result.message
+                app._set_process_activity("training", "error", detail)
+                app.update_status("Training failed.")
+                app.log_message(detail, "ERROR")
+                app._toast("Training failed. Open the Log tab for details.", level="error", duration_ms=6000)
             else:
                 app._set_process_activity("training", "completed")
                 app._toast("Training finished.", level="info", duration_ms=6000)
 
-        app.process_manager.start_process(command_builder.build_training_command, 'training_process', on_finish_callback=on_finish)
+        started = app.process_manager.start_process(
+            command_builder.build_training_command,
+            'training_process',
+            on_finish_callback=on_finish,
+        )
+        if not started:
+            return
         process = getattr(app, 'training_process', None)
         if not process or process.poll() is not None:
             if hasattr(app, 'train_button'):
@@ -100,13 +115,23 @@ class TrainingController:
                 "WARNING",
             )
 
-        def on_finish():
+        def on_finish(result: OperationResult):
             if hasattr(app, 'export_button'):
-                app.export_button.config(state=app.tk.NORMAL if hasattr(app, "tk") else app.tk.NORMAL)
+                app.export_button.config(state=tk.NORMAL)
             app.log_message("Enabled Export / Quantize button.", "INFO")
-            app.update_status("Export finished or stopped.")
+            if result.succeeded:
+                app.update_status("Export finished.")
+            else:
+                app.update_status("Export failed.")
+                app.log_message(result.error or result.message, "ERROR")
 
-        app.process_manager.start_process(lambda _app, c=cmd: (c, None), 'export_process', on_finish_callback=on_finish)
+        started = app.process_manager.start_process(
+            lambda _app, c=cmd: (c, None),
+            'export_process',
+            on_finish_callback=on_finish,
+        )
+        if not started:
+            return
 
         process = getattr(app, 'export_process', None)
         if not process or process.poll() is not None:

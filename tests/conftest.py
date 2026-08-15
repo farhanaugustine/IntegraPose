@@ -5,6 +5,10 @@ from uuid import uuid4
 
 import pytest
 
+# Match application startup order. Some Windows CUDA PyTorch builds cannot
+# initialize c10.dll after scikit-learn's native runtime has already loaded.
+import torch  # noqa: F401, E402
+
 
 @pytest.fixture
 def tmp_path(request) -> Path:

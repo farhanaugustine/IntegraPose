@@ -1,9 +1,11 @@
 from pathlib import Path
 from types import SimpleNamespace
+import json
 import threading
 
 from integra_pose.logic.batch_pipeline import BatchPipeline
 from integra_pose.utils.bout_analyzer import BoutAnalysisCancelledError
+from integra_pose.utils.frame_identity import write_frame_label_manifest
 
 
 class _Var:
@@ -15,7 +17,11 @@ class _Var:
 
 
 class _FakeAnalytics:
+    def __init__(self):
+        self.params = None
+
     def run_analysis(self, params):
+        self.params = dict(params)
         raise BoutAnalysisCancelledError("cancelled")
 
 
@@ -35,7 +41,10 @@ class _FakeApp:
 
 
 def test_run_video_analytics_marks_item_cancelled_on_cooperative_stop(tmp_path):
-    pipeline = BatchPipeline(_FakeApp())
+    app = _FakeApp()
+    del app.config.analytics.min_bout_duration_var
+    del app.config.analytics.max_frame_gap_var
+    pipeline = BatchPipeline(app)
     session = SimpleNamespace(
         roi_strategy="per_video",
         shared_rois={},
@@ -58,7 +67,12 @@ def test_run_video_analytics_marks_item_cancelled_on_cooperative_stop(tmp_path):
         analytics_enabled_metrics=[],
         analytics_enabled_modules=[],
         review_policy="after_all",
-        model_capabilities=SimpleNamespace(class_names=[]),
+        model_capabilities=SimpleNamespace(class_names=["WrongCurrentModelName"]),
+        min_bout_frames=9,
+        max_gap_frames=9,
+        roi_min_dwell_frames=9,
+        roi_max_gap_frames=9,
+        temporal_threshold_unit="frames",
     )
     item = SimpleNamespace(
         video_id="video-1",
@@ -71,6 +85,15 @@ def test_run_video_analytics_marks_item_cancelled_on_cooperative_stop(tmp_path):
         time_point="",
         analytics_status="pending",
         status_message="",
+    )
+
+    write_frame_label_manifest(
+        tmp_path,
+        source="video.mp4",
+        max_det=1,
+        class_names={0: "Sniffing", 1: "Wall-Rearing", 2: "Ambulatory"},
+        class_names_source="model.names",
+        model_task="detect",
     )
 
     result = pipeline._run_video_analytics(
@@ -92,6 +115,18 @@ def test_run_video_analytics_marks_item_cancelled_on_cooperative_stop(tmp_path):
     assert result is None
     assert item.analytics_status == "cancelled"
     assert item.status_message == "Analytics cancelled."
+    assert app.analytics.params["min_bout_frames"] == 9
+    assert app.analytics.params["max_gap_frames"] == 9
+    assert app.analytics.params["roi_min_dwell_frames"] == 9
+    assert app.analytics.params["roi_max_gap_frames"] == 9
+    assert app.analytics.params["object_min_dwell_frames"] == 9
+    assert app.analytics.params["object_max_gap_frames"] == 9
+    assert app.analytics.params["behavior_names_override"] == [
+        "Sniffing",
+        "Wall-Rearing",
+        "Ambulatory",
+    ]
+    assert app.analytics.params["behavior_names_source"] == "inference label metadata"
 
 
 def test_resolve_tracker_config_preserves_aliases_and_resolves_paths(tmp_path):
@@ -102,3 +137,32 @@ def test_resolve_tracker_config_preserves_aliases_and_resolves_paths(tmp_path):
 
     assert str(alias) == "bytetrack.yaml"
     assert resolved == custom_yaml.resolve()
+
+
+def test_second_based_thresholds_resolve_separately_for_each_video_fps(tmp_path):
+    pipeline = BatchPipeline(_FakeApp())
+    session = SimpleNamespace(
+        video_fps=0.0,
+        min_bout_seconds=0.10,
+        max_gap_seconds=0.17,
+        roi_min_dwell_seconds=0.20,
+        roi_max_gap_seconds=0.05,
+    )
+    item = SimpleNamespace(video_name="video.mp4", video_path=str(tmp_path / "video.mp4"))
+    run_30 = tmp_path / "run_30"
+    run_60 = tmp_path / "run_60"
+    run_30.mkdir()
+    run_60.mkdir()
+    (run_30 / "inference_metadata.json").write_text(
+        json.dumps({"fps": 30.0}), encoding="utf-8"
+    )
+    (run_60 / "inference_metadata.json").write_text(
+        json.dumps({"fps": 60.0}), encoding="utf-8"
+    )
+
+    assert pipeline._time_threshold_frames(
+        session=session, item=item, run_dir=run_30
+    ) == (3, 5, 6, 1, 30.0)
+    assert pipeline._time_threshold_frames(
+        session=session, item=item, run_dir=run_60
+    ) == (6, 10, 12, 3, 60.0)

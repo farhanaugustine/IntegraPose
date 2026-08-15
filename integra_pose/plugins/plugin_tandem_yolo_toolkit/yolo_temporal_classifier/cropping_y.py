@@ -7,6 +7,13 @@ from typing import Generator, Optional, Tuple
 
 import numpy as np
 
+try:  # pragma: no cover - torch is optional until YOLO inference is requested
+    import torch
+except ImportError:  # pragma: no cover
+    torch = None
+
+from integra_pose.utils.detection_contract import enforce_ultralytics_max_det
+
 try:  # pragma: no cover - package/script dual use
     from utils.pose_features_y import extract_relational_features
 except Exception:  # pragma: no cover
@@ -41,8 +48,8 @@ class NCropDetection:
     yolo_status: str
     # Optional raw BGR source frame (full-resolution). Only populated when
     # `iterate_yolo_n_crops(..., yield_orig_frame=True)`. Used by the
-    # annotated-video exporter in infer_n.py — kept off by default to avoid
-    # the per-frame memcpy cost in the preprocessing pipeline.
+    # annotated-video exporter in infer_y.py. The array is passed through by
+    # reference; consumers that draw on it must make their own copy.
     orig_frame_bgr: Optional[np.ndarray] = None
 
 
@@ -56,24 +63,16 @@ def _check_ultralytics():
 
 def normalize_device(device: str | int | None) -> str:
     """Normalize GUI/CLI device values for torch and Ultralytics."""
-    if device is None:
-        return "cpu"
-    raw = str(device).strip()
-    if not raw:
-        return "cpu"
-    lowered = raw.lower()
-    if lowered in {"cpu", "mps"} or lowered.startswith("cuda"):
-        return raw
-    if lowered.isdigit():
-        try:
-            import torch
+    try:
+        from integra_pose.utils.torch_backend import normalize_ultralytics_device
+    except Exception:
+        normalize_ultralytics_device = None
 
-            if torch.cuda.is_available():
-                return f"cuda:{int(lowered)}"
-        except Exception:
-            pass
-        return "cpu"
-    return raw
+    if normalize_ultralytics_device is not None:
+        return normalize_ultralytics_device(device, preserve_auto=False)
+
+    raw = str(device or "").strip()
+    return raw or "cpu"
 
 
 def load_yolo_model(weights_path: Path | str, device: str = "cpu", task: str | None = None):
@@ -171,34 +170,107 @@ def _extract_result_arrays(result, n_animals: int, frame_shape) -> tuple[np.ndar
             np.zeros((0, 0, 2), dtype=np.float32),
             np.zeros((0, 0), dtype=np.float32),
         )
-    xyxy = boxes.xyxy.detach().cpu().numpy().astype(np.float32)
-    conf = boxes.conf.detach().cpu().numpy().astype(np.float32) if boxes.conf is not None else np.ones((xyxy.shape[0],), dtype=np.float32)
     ids_attr = getattr(boxes, "id", None)
-    if ids_attr is not None:
-        ids = ids_attr.detach().cpu().numpy().astype(np.int32)
+    keypoints = getattr(result, "keypoints", None)
+    xy_obj = getattr(keypoints, "xy", None) if keypoints is not None else None
+    conf_obj = getattr(keypoints, "conf", None) if keypoints is not None else None
+    xyxy_obj = boxes.xyxy
+
+    # Ultralytics leaves result tensors on the inference device. Copying boxes,
+    # scores, IDs, keypoints, and keypoint scores independently forces several
+    # tiny CUDA synchronizations per frame. Pack them on-device and cross the
+    # device boundary once. CPU results keep the zero-copy NumPy fast path.
+    is_device_tensor = bool(
+        torch is not None
+        and isinstance(xyxy_obj, torch.Tensor)
+        and xyxy_obj.device.type != "cpu"
+        and (xy_obj is None or isinstance(xy_obj, torch.Tensor))
+    )
+    if is_device_tensor:
+        count = int(xyxy_obj.shape[0])
+        # Keep the transfer buffer in float32 even when YOLO itself uses FP16.
+        # Float16 cannot exactly represent tracker IDs above 2048.
+        dtype = torch.float32
+        device = xyxy_obj.device
+        conf_tensor = (
+            boxes.conf.reshape(count, 1).to(device=device, dtype=dtype)
+            if boxes.conf is not None
+            else torch.ones((count, 1), device=device, dtype=dtype)
+        )
+        ids_tensor = (
+            ids_attr.reshape(count, 1).to(device=device, dtype=dtype)
+            if ids_attr is not None
+            else torch.arange(count, device=device, dtype=dtype).reshape(count, 1)
+        )
+        parts = [xyxy_obj.reshape(count, 4).to(device=device, dtype=dtype), conf_tensor, ids_tensor]
+        num_keypoints = 0
+        if xy_obj is not None:
+            num_keypoints = int(xy_obj.shape[1])
+            parts.append(xy_obj.reshape(count, num_keypoints * 2).to(device=device, dtype=dtype))
+            parts.append(
+                conf_obj.reshape(count, num_keypoints).to(device=device, dtype=dtype)
+                if conf_obj is not None
+                else torch.ones((count, num_keypoints), device=device, dtype=dtype)
+            )
+        packed = torch.cat(parts, dim=1).detach().to(device="cpu", dtype=torch.float32).numpy()
+        cursor = 0
+        xyxy = packed[:, cursor:cursor + 4]
+        cursor += 4
+        conf = packed[:, cursor]
+        cursor += 1
+        ids = np.rint(packed[:, cursor]).astype(np.int32, copy=False)
+        cursor += 1
+        if num_keypoints:
+            kxy = packed[:, cursor:cursor + num_keypoints * 2].reshape(count, num_keypoints, 2)
+            cursor += num_keypoints * 2
+            kconf = packed[:, cursor:cursor + num_keypoints]
+        else:
+            kxy = np.zeros((count, 0, 2), dtype=np.float32)
+            kconf = np.zeros((count, 0), dtype=np.float32)
     else:
-        ids = np.arange(xyxy.shape[0], dtype=np.int32)
+        xyxy = (
+            xyxy_obj.detach().cpu().numpy().astype(np.float32, copy=False)
+            if hasattr(xyxy_obj, "detach")
+            else np.asarray(xyxy_obj, dtype=np.float32)
+        )
+        conf = (
+            boxes.conf.detach().cpu().numpy().astype(np.float32, copy=False)
+            if boxes.conf is not None and hasattr(boxes.conf, "detach")
+            else np.asarray(boxes.conf, dtype=np.float32)
+            if boxes.conf is not None
+            else np.ones((xyxy.shape[0],), dtype=np.float32)
+        )
+        ids = (
+            ids_attr.detach().cpu().numpy().astype(np.int32, copy=False)
+            if ids_attr is not None and hasattr(ids_attr, "detach")
+            else np.asarray(ids_attr, dtype=np.int32)
+            if ids_attr is not None
+            else np.arange(xyxy.shape[0], dtype=np.int32)
+        )
+        if xy_obj is not None:
+            kxy = (
+                xy_obj.detach().cpu().numpy().astype(np.float32, copy=False)
+                if hasattr(xy_obj, "detach")
+                else np.asarray(xy_obj, dtype=np.float32)
+            )
+            kconf = (
+                conf_obj.detach().cpu().numpy().astype(np.float32, copy=False)
+                if conf_obj is not None and hasattr(conf_obj, "detach")
+                else np.asarray(conf_obj, dtype=np.float32)
+                if conf_obj is not None
+                else np.ones(kxy.shape[:2], dtype=np.float32)
+            )
+        else:
+            kxy = np.zeros((xyxy.shape[0], 0, 2), dtype=np.float32)
+            kconf = np.zeros((xyxy.shape[0], 0), dtype=np.float32)
 
     h_img, w_img = frame_shape[:2]
     if xyxy.size and float(np.nanmax(xyxy)) <= 1.0:
         xyxy[:, [0, 2]] *= float(w_img)
         xyxy[:, [1, 3]] *= float(h_img)
-
-    kxy = np.zeros((xyxy.shape[0], 0, 2), dtype=np.float32)
-    kconf = np.zeros((xyxy.shape[0], 0), dtype=np.float32)
-    keypoints = getattr(result, "keypoints", None)
-    if keypoints is not None and getattr(keypoints, "xy", None) is not None:
-        xy_obj = keypoints.xy
-        xy_np = xy_obj.detach().cpu().numpy().astype(np.float32) if hasattr(xy_obj, "detach") else np.asarray(xy_obj, dtype=np.float32)
-        if xy_np.size and float(np.nanmax(xy_np)) <= 1.0:
-            xy_np[..., 0] *= float(w_img)
-            xy_np[..., 1] *= float(h_img)
-        kxy = xy_np
-        conf_obj = getattr(keypoints, "conf", None)
-        if conf_obj is not None:
-            kconf = conf_obj.detach().cpu().numpy().astype(np.float32) if hasattr(conf_obj, "detach") else np.asarray(conf_obj, dtype=np.float32)
-        else:
-            kconf = np.ones(kxy.shape[:2], dtype=np.float32)
+    if kxy.size and float(np.nanmax(kxy)) <= 1.0:
+        kxy[..., 0] *= float(w_img)
+        kxy[..., 1] *= float(h_img)
 
     order = np.argsort(-conf)[: int(n_animals)]
     return xyxy[order], conf[order], ids[order], kxy[order], kconf[order]
@@ -274,6 +346,9 @@ def iterate_yolo_n_crops(
     batch_size: int = 25,
     timing: dict[str, float] | None = None,
     yield_orig_frame: bool = False,
+    half: bool = False,
+    stream_buffer: bool = False,
+    tracker: str = "bytetrack.yaml",
 ) -> Generator[NCropDetection, None, None]:
     _check_ultralytics()
     device = normalize_device(device)
@@ -282,35 +357,43 @@ def iterate_yolo_n_crops(
         raise ValueError("n_animals must be >= 1")
     source = str(video_path) if isinstance(video_path, Path) else video_path
     crop_strategy = str(crop_strategy or "fixed_scale").lower()
+    batch_size = max(1, int(batch_size))
+    device_lower = str(device).strip().lower()
+    use_half = bool(half) and (device_lower.startswith("cuda") or device_lower.isdigit())
+    predict_kwargs = {
+        "source": source,
+        "stream": True,
+        "device": device,
+        "conf": conf_threshold,
+        "iou": iou_threshold,
+        "imgsz": imgsz,
+        "max_det": n_animals,
+        "batch": batch_size,
+        "half": use_half,
+        "stream_buffer": bool(stream_buffer),
+        "verbose": False,
+    }
 
     if n_animals == 1 and crop_strategy == "bbox":
         raise ValueError("Use legacy iterate_yolo_crops for n_animals=1 + crop_strategy=bbox.")
 
     if hasattr(model, "track"):
         results = model.track(
-            source=source,
-            stream=True,
-            persist=True,
-            device=device,
-            conf=conf_threshold,
-            iou=iou_threshold,
-            imgsz=imgsz,
-            max_det=n_animals,
-            batch=int(batch_size),
-            verbose=False,
+            # Ultralytics otherwise defaults to BoT-SORT. Its global-motion
+            # compensation is useful for moving cameras, but is needlessly
+            # expensive for the fixed-camera, two-animal videos TandemYTC is
+            # designed for. ByteTrack retains stable IDs here without that
+            # hidden per-frame cost. Callers can still request botsort.yaml.
+            tracker=str(tracker or "bytetrack.yaml"),
+            # A complete video is supplied as the source. Ultralytics retains
+            # tracker continuity within that source and resets when the path
+            # changes when persist=False. persist=True would leak tracker state
+            # into the next video when this model instance is reused.
+            persist=False,
+            **predict_kwargs,
         )
     else:
-        results = model.predict(
-            source=source,
-            stream=True,
-            device=device,
-            conf=conf_threshold,
-            iou=iou_threshold,
-            imgsz=imgsz,
-            max_det=n_animals,
-            batch=int(batch_size),
-            verbose=False,
-        )
+        results = model.predict(**predict_kwargs)
 
     slot_track_ids = np.full((n_animals,), -1, dtype=np.int32)
     track_first_seen: dict[int, int] = {}
@@ -326,6 +409,7 @@ def iterate_yolo_n_crops(
     for frame_idx, result in enumerate(results):
         if timing is not None:
             timing["yolo_frames"] = timing.get("yolo_frames", 0.0) + 1.0
+        result = enforce_ultralytics_max_det(result, n_animals).result
         frame_bgr = result.orig_img
         detections = _extract_result_arrays(result, n_animals, frame_bgr.shape)
         boxes, conf, track_ids, kxy, kconf, present = _assign_slots(detections, n_animals, slot_track_ids)
@@ -354,7 +438,7 @@ def iterate_yolo_n_crops(
             last_conf = conf.copy()
 
         crop_started = time.perf_counter()
-        centers = np.array([(bb[0] + bb[2], bb[1] + bb[3]) for bb in boxes], dtype=np.float32) * 0.5
+        centers = (boxes[:, :2] + boxes[:, 2:4]) * np.float32(0.5)
         valid_centers = centers[crop_present]
         if valid_centers.size:
             group_center = valid_centers.mean(axis=0)
@@ -411,17 +495,16 @@ def iterate_yolo_n_crops(
 
         keypoints_crop_norm = np.zeros((n_animals, kxy.shape[1], 3), dtype=np.float32) if kxy.ndim == 3 else np.zeros((n_animals, 0, 3), dtype=np.float32)
         if kxy.ndim == 3 and kxy.shape[1] > 0:
-            for i in range(n_animals):
-                x1, y1, x2, y2 = [float(v) for v in animal_xyxys[i]]
-                cw = max(x2 - x1, 1.0)
-                ch = max(y2 - y1, 1.0)
-                keypoints_crop_norm[i, :, 0] = (kxy[i, :, 0] - x1) / cw
-                keypoints_crop_norm[i, :, 1] = (kxy[i, :, 1] - y1) / ch
-                # kconf shape is [n_animals, K] when YOLO returns per-keypoint
-                # confidence (the expected case for YOLOv8/v11-pose).  Guard on
-                # ndim==2 so a scalar per-animal confidence from an unusual YOLO
-                # version cannot silently broadcast to all K keypoint slots.
-                keypoints_crop_norm[i, :, 2] = kconf[i] if kconf.ndim == 2 else 0.0
+            x1 = animal_xyxys[:, 0:1].astype(np.float32, copy=False)
+            y1 = animal_xyxys[:, 1:2].astype(np.float32, copy=False)
+            cw = np.maximum(animal_xyxys[:, 2:3] - animal_xyxys[:, 0:1], 1).astype(np.float32)
+            ch = np.maximum(animal_xyxys[:, 3:4] - animal_xyxys[:, 1:2], 1).astype(np.float32)
+            keypoints_crop_norm[..., 0] = (kxy[..., 0] - x1) / cw
+            keypoints_crop_norm[..., 1] = (kxy[..., 1] - y1) / ch
+            # Guard on ndim==2 so an unusual scalar per-animal confidence
+            # cannot silently broadcast to all K keypoint slots.
+            if kconf.ndim == 2:
+                keypoints_crop_norm[..., 2] = kconf
 
         rel, rel_pose_mask, rel_present = extract_relational_features(
             kxy,
@@ -462,5 +545,5 @@ def iterate_yolo_n_crops(
             keypoints_conf_raw=kconf.astype(np.float32),
             keypoints_crop_norm=keypoints_crop_norm.astype(np.float32),
             yolo_status=status,
-            orig_frame_bgr=(frame_bgr.copy() if yield_orig_frame else None),
+            orig_frame_bgr=(frame_bgr if yield_orig_frame else None),
         )

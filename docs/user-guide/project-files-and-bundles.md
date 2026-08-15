@@ -12,7 +12,7 @@ They are related, but they are not the same thing.
 | Tool | File type | Best for | Typical use |
 | --- | --- | --- | --- |
 | `Save Project` | `.json` | Day-to-day work | Save the current GUI state so you can reopen and continue later |
-| `Export Reproducibility Bundle` | `.zip` | Sharing, archiving, traceability | Package the project configuration plus reproducibility context for another machine, collaborator, lab archive, or manuscript record |
+| `Export Reproducibility Bundle` | `.zip` | Sharing and archiving | Package the project settings with supporting information for another computer, collaborator, lab archive, or manuscript record |
 
 ## Use `Save Project` for normal work
 
@@ -34,29 +34,32 @@ This is the right choice when you want to:
 ### What a project `.json` is not
 
 - not a full archive of the environment
-- not a packaged copy of model artifacts by itself
+- not a packaged copy of model files by itself
 - not a substitute for saving your output folders, source videos, or datasets
 
 ## Use `Export Reproducibility Bundle` for sharing and archiving
 
-`Export Reproducibility Bundle...` creates a `.zip` file that includes the saved project configuration plus additional traceability material.
+`Export Reproducibility Bundle...` creates a `.zip` file that includes the
+saved project settings plus information that helps another person understand
+and recreate the setup.
 
 This is the right choice when you want to:
 
 - send a workflow setup to another user
 - archive a run for a paper, supplement, or lab record
-- preserve the configuration together with model and environment context
-- reconstruct a project setup later with better provenance than a plain `.json`
+- preserve the settings together with model and software-environment details
+- reconstruct a project setup later with a clearer record than a plain `.json`
 
 ### What the bundle usually contains
 
-- the full saved project configuration as `project_config.json`
-- project context metadata
-- selected model artifacts when available
-- model registry snapshot
-- plugin snapshot
-- environment traceability files
-- manifest and checksum information for the bundle contents
+- the scientific settings from the saved project as `project_config.json`
+- basic information about the project
+- selected model files when available
+- a record of registered models and enabled plugins
+- information about the Python environment
+- a contents list and file-integrity checks
+
+Machine-local paths and source URLs are cleared from the bundled configuration. This keeps usernames, credentials, and workstation folder layouts out of shared archives. After importing on another machine, select the local dataset, source-video, and output paths for that workstation.
 
 ### What the bundle does not replace
 
@@ -100,7 +103,8 @@ Use:
 
 - `Export Reproducibility Bundle`
 
-You may still also save the plain project `.json` for convenience, but the `.zip` is the better archival artifact.
+You may still save the plain project `.json` for convenience, but the `.zip`
+is the better archival record.
 
 ## Importing a bundle
 
@@ -108,11 +112,47 @@ To reuse a previously exported bundle:
 
 1. Open `File -> Import Reproducibility Bundle...`
 2. Select the `.zip`
-3. IntegraPose will apply the saved project configuration to the current GUI session
-4. When bundled model artifacts are available, IntegraPose will restore them where possible
+3. IntegraPose checks the bundle for damaged files and unsafe paths before loading it
+4. When bundled model files are available, IntegraPose restores them into a new import folder without overwriting existing project files
+5. Re-select machine-local dataset, source, and output paths
+
+Only import bundles from a trusted source. PyTorch model files can contain code
+that runs when the model is loaded.
+
+## Preserve bout-review work with the analysis
+
+Bout-review decisions belong to the completed analytics run. They are not
+stored inside the day-to-day project JSON, and the reproducibility bundle does
+not replace archiving the generated analysis folder.
+
+For every reviewed run, preserve:
+
+```text
+run_manifest.json
+bout_review_workspace/
+bout_review_exports/
+```
+
+Also retain either the annotated analytics video or the original source video.
+
+The review workspace stores decisions and reviewer identities so the work can
+be resumed. The dated exports contain the tables, figures, agreement measures,
+and review history used for reporting.
+
+IntegraPose records where the original files came from and also stores paths
+within the analysis folder. When moving work to another computer or external
+drive, copy the complete analytics folder rather than selected CSV files.
+
+YOLO frame-level text files remain important when analytics must be repeated.
+They are not required simply to reopen an existing review when the analytics
+tables, manifest, and review video remain available.
+
+See [Bout Review Workspace](bout-confirmation.md#keep-reviewed-results-together)
+for the complete review portability workflow.
 
 ## Recommended practice
 
 - use `.json` files during iterative work
 - export a `.zip` bundle at major milestones
+- archive reviewed analytics folders with their review workspaces and exports
 - archive the bundle together with raw data locations and final output folders when reproducibility matters

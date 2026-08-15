@@ -123,6 +123,9 @@ def _launch_gui_threaded(*, debug: bool = False) -> None:
 
     progress_queue: "queue.Queue[_ProgressEvent]" = queue.Queue()
     preload_steps: Sequence[tuple[str, str]] = (
+        # On Windows, importing scikit-learn's native runtime before the CUDA
+        # PyTorch build can make c10.dll initialization fail later.
+        ("torch", "Loading PyTorch..."),
         ("numpy", "Loading NumPy..."),
         ("pandas", "Loading pandas..."),
         ("PIL.Image", "Loading Pillow..."),
@@ -163,7 +166,7 @@ def _launch_gui_threaded(*, debug: bool = False) -> None:
             from integra_pose import main_gui_app
 
             main_gui_app.configure_terminal_logging(debug=debug)
-            app = main_gui_app.YoloApp(root)
+            main_gui_app.YoloApp(root)
         except Exception as exc:
             _fail(exc, traceback.format_exc())
             return
@@ -211,6 +214,8 @@ def launch_gui(*, debug: bool = False) -> None:
     gif_path = str(gif_candidate) if gif_candidate.is_file() else None
 
     preload_steps: Sequence[tuple[str, str]] = (
+        # Keep the Windows native-runtime order identical to threaded startup.
+        ("torch", "Loading PyTorch..."),
         ("numpy", "Loading NumPy..."),
         ("pandas", "Loading pandas..."),
         ("PIL.Image", "Loading Pillow..."),

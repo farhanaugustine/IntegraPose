@@ -89,7 +89,7 @@ def create_inference_tab(app):
     task_combo.grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
     CreateToolTip(
         task_combo,
-        "Choose YOLO task mode. 'auto' defaults to pose, and switches to detect when the model name suggests detection (e.g., contains 'detect' or 'bbox').",
+        "Choose YOLO task mode. 'auto' lets Ultralytics infer detect versus pose directly from the selected model checkpoint.",
     )
 
     tracker_label = ttk.Label(paths_frame, text="Tracker Config (optional):")
@@ -142,7 +142,7 @@ def create_inference_tab(app):
     device_label.grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
     device_entry = ttk.Entry(params_frame, textvariable=app.config.inference.infer_device_var, width=10)
     device_entry.grid(row=1, column=1, sticky=tk.EW, padx=5, pady=5)
-    CreateToolTip(device_entry, "Device to run on, e.g., 'cpu', '0'.")
+    CreateToolTip(device_entry, "-1 selects an available accelerator automatically; use cpu, 0, or cuda:1 for an explicit override.")
 
     max_det_label = ttk.Label(params_frame, text="Max Detections:")
     max_det_label.grid(row=1, column=2, sticky=tk.W, padx=5, pady=5)
@@ -618,4 +618,3 @@ def create_inference_tab(app):
     app.batch_processing_button.grid(row=0, column=3, sticky='ew', padx=5)
 
     add_workflow_footer(app, content_frame)
-

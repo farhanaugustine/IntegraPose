@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 import tkinter as tk
 
+import integra_pose.main_gui_app as main_gui_app
 from integra_pose.main_gui_app import YoloApp
 from integra_pose.utils.config_manager import ConfigManager
 
@@ -66,3 +67,37 @@ def test_tab7_warning_requires_real_imported_groups_not_default_keypoints():
         assert statuses["pose_clustering"][0] == "warning"
     finally:
         root.destroy()
+
+
+def test_reviewer_launch_waits_for_active_analytics_render(monkeypatch):
+    warnings = []
+    logs = []
+    launched = []
+    fake = SimpleNamespace(
+        analytics_service=SimpleNamespace(
+            analytics_thread=SimpleNamespace(is_alive=lambda: True)
+        ),
+        root=object(),
+        log_message=lambda message, level="INFO": logs.append((level, message)),
+    )
+    monkeypatch.setattr(
+        main_gui_app.messagebox,
+        "showwarning",
+        lambda title, message, **kwargs: warnings.append((title, message, kwargs)),
+    )
+    monkeypatch.setattr(
+        main_gui_app,
+        "launch_reviewer",
+        lambda *args, **kwargs: launched.append((args, kwargs)),
+    )
+
+    handled = YoloApp._launch_integrated_review_workspace(
+        fake,
+        mode="behavior",
+        event_kind="behavior",
+    )
+
+    assert handled is True
+    assert not launched
+    assert warnings and "still running" in warnings[0][1]
+    assert logs and logs[0][0] == "WARNING"

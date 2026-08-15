@@ -1,9 +1,7 @@
-"""Tests for ADP-4 Commit C — auto train/val/test split.
+"""Tests for automatic train/validation/test splitting.
 
-The split rule is the load-bearing contract for the held-out report. If
-this misbehaves silently — e.g., a subject ends up in both train and
-test, or two groups' subjects collide — every defensibility metric the
-panel renders is a lie. So these tests are paranoid:
+The tests cover subject leakage, group collisions, and deterministic
+partition assignment:
 
   * Subject atomicity (no leakage of one subject across partitions).
   * Composite (group, subject_id) keying (basename collisions across
@@ -167,9 +165,9 @@ class TestReproducibility(_Base):
     def test_does_not_pollute_global_rng(self) -> None:
         """The split must use a local Generator only.
 
-        np.random.seed(42) would set the global state; if Commit C makes
-        that mistake, downstream HMM/UMAP/torch consumers all get
-        contaminated. Verify by snapshotting np.random.random() before
+        np.random.seed(42) would set the global state; that would affect
+        downstream HMM, UMAP, and torch consumers. Verify the behavior
+        by snapshotting np.random.random() before
         and after a split and confirming the global stream advances
         independently.
         """

@@ -26,6 +26,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from integra_pose.utils.overlay_presets import sanitize_order
+from integra_pose.utils.torch_backend import normalize_ultralytics_device
+from integra_pose.utils.detection_contract import enforce_ultralytics_max_det
+from integra_pose.utils.frame_identity import (
+    extract_model_class_metadata,
+    frame_artifact_stem,
+    frame_label_filename,
+    write_frame_label_manifest,
+)
+from integra_pose.utils.keypoint_schema import safe_keypoint_token
+from integra_pose.utils.yolo_pose_labels import (
+    YoloPoseLabelSchema,
+    format_yolo_pose_label,
+    write_pose_label_schema,
+)
 
 LogFn = Callable[[str, str], None]
 TRACK_ID_DATA_FIELD = "integra_pose_track_id"
@@ -136,6 +150,10 @@ class InferenceSettings:
     inference_batch_size: int = 25
     single_animal_mode: bool = False
     user_video_fps: float = 0.0  # 0.0 = unset; resolver will probe the source video
+    keypoint_names_source: str = "unresolved"
+    anchor_keypoint_index: int | None = None
+    anchor_keypoint_name: str | None = None
+    heading_source: str = "unavailable"
 
 
 @dataclass(slots=True)
@@ -147,6 +165,7 @@ class TrackedObjectState:
     last_frame: int
     last_velocity: float | None = None
     last_orientation: float | None = None
+    last_orientation_frame: int | None = None
 
 
 class TrackingMetricsRecorder:
@@ -160,6 +179,8 @@ class TrackingMetricsRecorder:
         velocity_threshold_px: float = 0.0,
         heading_indices: Optional[tuple[int, int]] = None,
         heading_names: Optional[tuple[str, str]] = None,
+        anchor_keypoint_index: int | None = None,
+        anchor_keypoint_name: str | None = None,
         flush_interval_frames: int = 60,
     ) -> None:
         self._path = target_path
@@ -174,6 +195,8 @@ class TrackingMetricsRecorder:
         self._warned_tracker_missing = False
         self._heading_indices = heading_indices
         self._heading_names = heading_names
+        self._anchor_keypoint_index = anchor_keypoint_index
+        self._anchor_keypoint_name = anchor_keypoint_name
         self._flush_interval_frames = max(1, int(flush_interval_frames or 1))
         self._frames_since_flush = 0
 
@@ -208,8 +231,10 @@ class TrackingMetricsRecorder:
             "confidence",
             "anchor_x_px",
             "anchor_y_px",
+            "anchor_source",
             "distance_from_frame_center_px",
             heading_label,
+            "orientation_source",
             "angular_velocity_deg_per_frame",
             "signed_angular_velocity_deg_per_frame",
             "movement_speed_px_per_frame",
@@ -309,7 +334,27 @@ class TrackingMetricsRecorder:
 
             anchor_x = center_x
             anchor_y = center_y
-            orientation_bearing = self._bearing(center_x - cx_frame, cy_frame - center_y)
+            anchor_source = "bbox_center"
+            orientation_bearing = None
+            orientation_source = "unavailable"
+            if (
+                self._anchor_keypoint_index is not None
+                and keypoints is not None
+                and keypoints.shape[0] > idx
+                and keypoints.shape[1] > self._anchor_keypoint_index
+            ):
+                try:
+                    kp_anchor = keypoints[idx, self._anchor_keypoint_index, :]
+                    if np.isfinite(kp_anchor).all():
+                        anchor_x = float(kp_anchor[0])
+                        anchor_y = float(kp_anchor[1])
+                        anchor_source = (
+                            f"keypoint_{self._anchor_keypoint_name}"
+                            if self._anchor_keypoint_name
+                            else f"keypoint_{self._anchor_keypoint_index}"
+                        )
+                except Exception:
+                    pass
             if (
                 self._heading_indices
                 and keypoints is not None
@@ -320,11 +365,16 @@ class TrackingMetricsRecorder:
                     kp_root = keypoints[idx, self._heading_indices[0], :]
                     kp_tip = keypoints[idx, self._heading_indices[1], :]
                     if np.isfinite(kp_root).all() and np.isfinite(kp_tip).all():
-                        anchor_x = float(kp_root[0] + kp_tip[0]) / 2.0
-                        anchor_y = float(kp_root[1] + kp_tip[1]) / 2.0
+                        if anchor_source == "bbox_center":
+                            anchor_x = float(kp_root[0] + kp_tip[0]) / 2.0
+                            anchor_y = float(kp_root[1] + kp_tip[1]) / 2.0
+                            anchor_source = "heading_midpoint"
                         vec_x = float(kp_tip[0] - kp_root[0])
                         vec_y = float(kp_tip[1] - kp_root[1])
                         orientation_bearing = self._bearing(vec_x, -vec_y)
+                        orientation_source = (
+                            f"keypoints_{self._heading_indices[0]}_to_{self._heading_indices[1]}"
+                        )
                 except Exception:
                     pass
 
@@ -336,7 +386,9 @@ class TrackingMetricsRecorder:
                     "object_id": object_id,
                     "center": (center_x, center_y),
                     "anchor": (anchor_x, anchor_y),
+                    "anchor_source": anchor_source,
                     "orientation_bearing": orientation_bearing,
+                    "orientation_source": orientation_source,
                     "class_id": class_id,
                     "confidence": confidence,
                 }
@@ -365,12 +417,13 @@ class TrackingMetricsRecorder:
                     last_frame=frame_index,
                 )
                 self._state[object_id] = state
-            if state is not None:
-                state.last_frame = frame_index
+            previous_frame = state.last_frame if state is not None else None
 
             center_x, center_y = entry["center"]
             anchor_x, anchor_y = entry.get("anchor", (center_x, center_y))
-            orientation_bearing = entry.get("orientation_bearing", self._bearing(center_x - cx_frame, cy_frame - center_y))
+            orientation_bearing = entry.get("orientation_bearing")
+            anchor_source = str(entry.get("anchor_source", "bbox_center"))
+            orientation_source = str(entry.get("orientation_source", "unavailable"))
 
             distance_center = math.hypot(anchor_x - cx_frame, anchor_y - cy_frame)
 
@@ -380,11 +433,13 @@ class TrackingMetricsRecorder:
             angular_velocity = None
             signed_angular_velocity = None
             if state is not None and state.last_center is not None:
+                frame_delta = max(1, frame_index - int(previous_frame)) if previous_frame is not None else 1
                 dx = anchor_x - state.last_center[0]
                 dy = anchor_y - state.last_center[1]
                 step_distance = math.hypot(dx, dy)
-                if step_distance > 0.0 and step_distance >= self._velocity_threshold:
-                    velocity = step_distance
+                speed = step_distance / float(frame_delta)
+                if step_distance > 0.0 and speed >= self._velocity_threshold:
+                    velocity = speed
                     movement_bearing = self._bearing(dx, -dy)
                     if state.last_movement_bearing is not None:
                         delta = self._angular_delta(state.last_movement_bearing, movement_bearing)
@@ -393,7 +448,7 @@ class TrackingMetricsRecorder:
                     state.last_movement_bearing = movement_bearing
                     state.total_distance += step_distance
                     if state.last_velocity is not None:
-                        acceleration = velocity - state.last_velocity
+                        acceleration = (velocity - state.last_velocity) / float(frame_delta)
                     state.last_velocity = velocity
                 else:
                     state.last_velocity = 0.0
@@ -403,10 +458,18 @@ class TrackingMetricsRecorder:
 
             if state is not None:
                 state.last_center = (anchor_x, anchor_y)
-                if state.last_orientation is not None:
-                    signed_angular_velocity = self._signed_angular_delta(state.last_orientation, orientation_bearing)
+                if (
+                    orientation_bearing is not None
+                    and state.last_orientation is not None
+                    and state.last_orientation_frame is not None
+                ):
+                    frame_delta = max(1, frame_index - int(state.last_orientation_frame))
+                    signed_angular_velocity = self._signed_angular_delta(state.last_orientation, orientation_bearing) / float(frame_delta)
                     angular_velocity = abs(signed_angular_velocity)
-                state.last_orientation = orientation_bearing
+                if orientation_bearing is not None:
+                    state.last_orientation = orientation_bearing
+                    state.last_orientation_frame = frame_index
+                state.last_frame = frame_index
 
             neighbors = pairwise.get(object_id, [])
             pairwise_str = ""
@@ -436,16 +499,14 @@ class TrackingMetricsRecorder:
                     kp_tip = kp_entry[self._heading_indices[1], :]
                     if np.isfinite(kp_root).all() and np.isfinite(kp_tip).all():
                         body_length = float(math.hypot(kp_tip[0] - kp_root[0], kp_tip[1] - kp_root[1]))
-                    xs = kp_entry[:, 0]
-                    ys = kp_entry[:, 1]
-                    if xs.size > 0 and ys.size > 0 and np.isfinite(xs).any() and np.isfinite(ys).any():
-                        width = float(np.nanmax(xs) - np.nanmin(xs))
-                        height = float(np.nanmax(ys) - np.nanmin(ys))
-                        minor = max(min(width, height), 1e-3)
-                        if body_length is not None:
-                            body_aspect = body_length / minor
-                        else:
-                            body_aspect = max(width, height) / minor if minor > 0 else None
+                    finite = kp_entry[np.isfinite(kp_entry).all(axis=1), :2]
+                    if finite.shape[0] >= 3:
+                        centered = finite - finite.mean(axis=0, keepdims=True)
+                        eigenvalues = np.linalg.eigvalsh(np.cov(centered, rowvar=False, ddof=1))
+                        major_variance = float(np.nanmax(eigenvalues))
+                        minor_variance = float(np.nanmin(eigenvalues))
+                        if major_variance > 0.0 and minor_variance > 1e-6:
+                            body_aspect = math.sqrt(major_variance / minor_variance)
                 except Exception:
                     pass
 
@@ -456,8 +517,10 @@ class TrackingMetricsRecorder:
                 confidence_value,
                 f"{anchor_x:.6f}",
                 f"{anchor_y:.6f}",
+                anchor_source,
                 f"{distance_center:.6f}",
-                f"{orientation_bearing:.6f}",
+                f"{orientation_bearing:.6f}" if orientation_bearing is not None else "",
+                orientation_source,
                 f"{angular_velocity:.6f}" if angular_velocity is not None else "",
                 f"{signed_angular_velocity:.6f}" if signed_angular_velocity is not None else "",
                 f"{velocity:.6f}",
@@ -516,10 +579,7 @@ class LabelsAggregateRecorder:
 
     @staticmethod
     def _safe_column_token(value: str) -> str:
-        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
-        token = "".join(ch if ch in allowed else "_" for ch in str(value))
-        token = token.strip("_")
-        return token or "kp"
+        return safe_keypoint_token(value)
 
     def _resolve_kp_name(self, idx: int) -> str:
         if 0 <= idx < len(self._keypoint_names):
@@ -530,15 +590,34 @@ class LabelsAggregateRecorder:
         if self._writer is not None and self._kp_count == kp_count:
             return True
         if self._writer is not None and self._kp_count != kp_count:
-            self._log(
-                f"Keypoint count changed while writing labels CSV (was {self._kp_count}, now {kp_count}); restarting file.",
-                "WARNING",
+            message = (
+                "Keypoint count changed while writing labels CSV "
+                f"(was {self._kp_count}, now {kp_count}); refusing to truncate earlier frames."
             )
-            self.close()
+            self._log(message, "ERROR")
+            raise RuntimeError(message)
+
+        # Zero keypoints is the valid schema for a detection-only model. Tab 2
+        # may still contain pose names for annotation/training; those names are
+        # irrelevant to bbox-only inference and must not block label export.
+        if int(kp_count) > 0:
+            if self._keypoint_names and len(self._keypoint_names) != int(kp_count):
+                message = (
+                    "Keypoint schema mismatch while creating labels CSV: "
+                    f"the model emitted {int(kp_count)} keypoints, but {len(self._keypoint_names)} names were supplied "
+                    f"({', '.join(self._keypoint_names)}). Run model preflight or correct the model dataset YAML."
+                )
+                self._log(message, "ERROR")
+                raise RuntimeError(message)
+            tokens = [self._safe_column_token(name).casefold() for name in self._keypoint_names]
+            if len(tokens) != len(set(tokens)):
+                message = "Keypoint names collide after conversion to labels.csv column tokens. Use unique keypoint names."
+                self._log(message, "ERROR")
+                raise RuntimeError(message)
 
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._file = self._path.open("w", newline="", encoding="utf-8")
+            self._file = self._path.open("x", newline="", encoding="utf-8")
         except Exception as exc:
             self._log(f"Failed to open labels CSV at {self._path}: {exc}", "ERROR")
             self._file = None
@@ -1625,6 +1704,7 @@ class SupervisionInferenceRunner:
         self._output_dir: Optional[Path] = None
         self._labels_dir: Optional[Path] = None
         self._labels_csv_recorder: LabelsAggregateRecorder | None = None
+        self._pose_label_schema: YoloPoseLabelSchema | None = None
         self._crops_dir: Optional[Path] = None
         self._metrics_recorder: TrackingMetricsRecorder | None = None
         self._metrics_path: Optional[Path] = None
@@ -1643,6 +1723,7 @@ class SupervisionInferenceRunner:
         self._keypoints_error_logged = False
         self._edge_warning_emitted = False
         self._tracker_label_warning_emitted = False
+        self._pose_label_schema_warning_emitted = False
         self._detections_error_logged = False
         self._detections_fallback_warned = False
         self._keypoints_fallback_warned = False
@@ -1655,6 +1736,7 @@ class SupervisionInferenceRunner:
         self._tracker_recover_logged = False
         self._single_track_fallback_logged = False
         self._tracker_guidance_logged = False
+        self._max_det_postcondition_warned = False
 
         self._perf_frame_times = deque(maxlen=120)
         self._perf_overlay_times = deque(maxlen=120)
@@ -1674,6 +1756,8 @@ class SupervisionInferenceRunner:
         self._color_fallback_warned = False
         self._keypoint_names: list[str] = settings.keypoint_names or []
         self._model_keypoint_names: list[str] = settings.model_keypoint_names or self._keypoint_names
+        self._model_class_names: list[str] = []
+        self._model_task: str = "unknown"
         self._custom_skeleton_names: list[str] = []
         self._custom_index_remap: list[int] | None = None
         self._skeleton_mapping_warned = False
@@ -1694,45 +1778,8 @@ class SupervisionInferenceRunner:
 
     @staticmethod
     def _normalize_device(value: str | None) -> str:
-        """Normalize a user-supplied device string into one Ultralytics accepts.
-
-        Falls back to CPU when CUDA isn't available or the requested
-        index doesn't exist. When torch reports ``cuda.is_available()
-        == True`` but ``device_count() == 0`` (broken Windows installs
-        where the CUDA libraries load but no GPU is usable), also sets
-        ``CUDA_VISIBLE_DEVICES=""`` so Ultralytics subsystems don't
-        crash on internal GPU enumeration. Mirrors
-        ``BatchPipeline._normalize_device``; keep the three in sync.
-        """
-        text = str(value or "").strip().lower()
-        if not text or text == "cpu":
-            return "cpu"
-        if text == "mps":
-            return "mps"
-        candidate_index: int | None = None
-        if text in ("cuda", "gpu"):
-            candidate_index = 0
-        elif text.isdigit():
-            candidate_index = int(text)
-        elif text.startswith("cuda:"):
-            tail = text.split(":", 1)[1].strip()
-            if tail.isdigit():
-                candidate_index = int(tail)
-        if candidate_index is None:
-            return text
-        try:
-            import os as _os  # noqa: PLC0415
-            import torch  # noqa: PLC0415
-
-            cuda_seen = bool(getattr(torch, "cuda", None) and torch.cuda.is_available())
-            n = int(torch.cuda.device_count()) if cuda_seen else 0
-            if (not cuda_seen) or n == 0 or candidate_index < 0 or candidate_index >= n:
-                if cuda_seen and n == 0:
-                    _os.environ["CUDA_VISIBLE_DEVICES"] = ""
-                return "cpu"
-        except Exception:
-            return "cpu"
-        return f"cuda:{candidate_index}"
+        """Normalize supervision device input for CUDA, ROCm, MPS, or CPU."""
+        return normalize_ultralytics_device(value, preserve_auto=True)
 
     @classmethod
     def _resolve_disk_usage_path(cls, candidate: Path) -> Path:
@@ -1939,6 +1986,21 @@ class SupervisionInferenceRunner:
         self.log(f"Loading model weights from {settings.model_path}...", "INFO")
         model = YOLO(str(settings.model_path))
         self.log("Model weights loaded successfully.", "INFO")
+        self._model_class_names, self._model_task = extract_model_class_metadata(model)
+        if self._model_class_names:
+            self.log(
+                "Resolved model class names for label metadata: "
+                + ", ".join(
+                    f"{class_id}={name}"
+                    for class_id, name in enumerate(self._model_class_names)
+                ),
+                "INFO",
+            )
+        else:
+            self.log(
+                "The model did not expose class names; label metadata will omit the class mapping.",
+                "WARNING",
+            )
         if settings.device:
             desired = settings.device
             normalized = self._normalize_device(desired)
@@ -1952,13 +2014,14 @@ class SupervisionInferenceRunner:
             if desired != normalized:
                 self.log(f"Inference device resolved: {desired!r} -> {normalized!r}", "INFO")
 
+        effective_max_det = 1 if bool(settings.single_animal_mode) else max(1, int(settings.max_det))
         self._prepare_output_directories()
 
         common_kwargs = dict(
             conf=settings.conf,
             iou=settings.iou,
             imgsz=settings.imgsz,
-            max_det=settings.max_det,
+            max_det=effective_max_det,
             device=settings.device,
             stream=True,
             augment=settings.augment,
@@ -1986,6 +2049,17 @@ class SupervisionInferenceRunner:
                 if self.stop_event.is_set():
                     self.log("Stop signal received. Ending inference loop.", "INFO")
                     break
+
+                limit_outcome = enforce_ultralytics_max_det(result, effective_max_det)
+                result = limit_outcome.result
+                if limit_outcome.dropped_count and not self._max_det_postcondition_warned:
+                    self._max_det_postcondition_warned = True
+                    self.log(
+                        "The inference backend returned "
+                        f"{limit_outcome.original_count} detections with effective cap={effective_max_det}; "
+                        "IntegraPose retained the highest-confidence detections before all outputs.",
+                        "WARNING",
+                    )
 
                 orig_frame = result.orig_img
                 if orig_frame is None:
@@ -2063,7 +2137,7 @@ class SupervisionInferenceRunner:
                 if self.settings.save:
                     self._write_frame(annotated, result, frame_index)
 
-                if self.settings.save_txt and detections is not None:
+                if self.settings.save_txt:
                     self._write_labels_file(result, detections, frame_index)
 
                 if self.settings.save_crop and detections is not None:
@@ -3432,6 +3506,8 @@ class SupervisionInferenceRunner:
                 velocity_threshold_px=velocity_threshold,
                 heading_indices=self.settings.heading_indices,
                 heading_names=self.settings.heading_names,
+                anchor_keypoint_index=self.settings.anchor_keypoint_index,
+                anchor_keypoint_name=self.settings.anchor_keypoint_name,
                 flush_interval_frames=max(1, int(self.settings.metrics_flush_interval_frames)),
             )
             try:
@@ -3442,6 +3518,11 @@ class SupervisionInferenceRunner:
                     "use_tracker": bool(self.settings.use_tracker),
                     "heading_indices": list(self.settings.heading_indices) if self.settings.heading_indices else None,
                     "heading_names": list(self.settings.heading_names) if self.settings.heading_names else None,
+                    "heading_source": str(self.settings.heading_source or "unavailable"),
+                    "anchor_keypoint_index": self.settings.anchor_keypoint_index,
+                    "anchor_keypoint_name": self.settings.anchor_keypoint_name,
+                    "keypoint_names": list(self.settings.keypoint_names or []),
+                    "keypoint_names_source": str(self.settings.keypoint_names_source or "unresolved"),
                     "grid_metrics_enabled": bool(self.settings.grid_metrics_enabled),
                     "grid_size_px": int(self.settings.grid_size_px) if self.settings.grid_metrics_enabled else None,
                     "definitions": {
@@ -3479,9 +3560,23 @@ class SupervisionInferenceRunner:
             self._metrics_recorder = None
             self._grid_metrics_dir = None
             self._grid_recorder = None
+        self._pose_label_schema = None
+        self._pose_label_schema_warning_emitted = False
         if self.settings.save_txt:
             self._labels_dir = run_dir / "labels"
             self._labels_dir.mkdir(parents=True, exist_ok=True)
+            write_frame_label_manifest(
+                self._labels_dir,
+                source=self.settings.source_path,
+                max_det=(
+                    1
+                    if bool(self.settings.single_animal_mode)
+                    else max(1, int(self.settings.max_det))
+                ),
+                class_names=self._model_class_names,
+                class_names_source="model.names",
+                model_task=self._model_task,
+            )
             try:
                 labels_csv_path = self._labels_dir / "labels.csv"
                 self._labels_csv_recorder = LabelsAggregateRecorder(
@@ -3579,7 +3674,7 @@ class SupervisionInferenceRunner:
             return
 
         if result.path and Path(result.path).suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}:
-            stem = Path(result.path).stem
+            stem = frame_artifact_stem(result.path, frame_index)
             target = output_dir / f"{stem}_annotated.jpg"
             cv2.imwrite(str(target), frame)
             return
@@ -3648,19 +3743,59 @@ class SupervisionInferenceRunner:
         cap.release()
         return float(fps)
 
-    def _write_labels_file(self, result, detections: sv.Detections, frame_index: int) -> None:
+    def _write_labels_file(
+        self,
+        result,
+        detections: sv.Detections | None,
+        frame_index: int,
+    ) -> None:
         labels_dir = self._labels_dir
         if labels_dir is None:
             return
 
+        # The run-level source is authoritative. Using ``result.path`` here
+        # makes folder inference switch filename prefixes per input item while
+        # the manifest still declares the folder, breaking source scoping.
+        source_identity = self.settings.source_path
+        label_path = labels_dir / frame_label_filename(source_identity, frame_index)
+        if label_path.exists():
+            raise RuntimeError(
+                f"Duplicate label output for zero-based frame {frame_index}: {label_path}"
+            )
+
         boxes = getattr(result, "boxes", None)
-        if boxes is None or boxes.xywhn is None or len(boxes) == 0:
+        if boxes is None or len(boxes) == 0:
+            label_path.write_text("", encoding="utf-8")
             return
+        if getattr(boxes, "xywhn", None) is None:
+            raise RuntimeError(
+                f"Frame {frame_index} reported detections without normalized bounding boxes."
+            )
 
         try:
             xywhn = boxes.xywhn.cpu().numpy()
         except Exception:
             xywhn = boxes.xywhn
+        try:
+            xywhn = np.asarray(xywhn, dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Frame {frame_index} contains non-numeric normalized bounding boxes."
+            ) from exc
+        if xywhn.ndim != 2 or xywhn.shape[1] < 4 or not np.isfinite(xywhn[:, :4]).all():
+            raise RuntimeError(
+                f"Frame {frame_index} contains malformed or non-finite normalized bounding boxes."
+            )
+
+        max_det = (
+            1
+            if bool(getattr(self.settings, "single_animal_mode", False))
+            else max(1, int(getattr(self.settings, "max_det", 300) or 300))
+        )
+        if len(xywhn) > max_det:
+            raise RuntimeError(
+                f"Label serialization received {len(xywhn)} detections with max_det={max_det}."
+            )
 
         cls = None
         if getattr(boxes, "cls", None) is not None:
@@ -3689,7 +3824,7 @@ class SupervisionInferenceRunner:
                 try:
                     kp_conf = keypoints.conf.cpu().numpy()
                 except Exception:
-                        kp_conf = keypoints.conf
+                    kp_conf = keypoints.conf
 
         if bool(getattr(self.settings, "single_animal_mode", False)):
             # In single-animal mode, keep only one detection line per frame.
@@ -3716,15 +3851,6 @@ class SupervisionInferenceRunner:
                     kp_xyn = np.asarray(kp_xyn)[[keep_idx], ...]
                 if kp_conf is not None:
                     kp_conf = np.asarray(kp_conf)[[keep_idx], ...]
-
-        if result.path:
-            stem = Path(result.path).stem
-        else:
-            stem = f"{self.settings.source_path.stem}_frame{frame_index:06d}"
-
-        label_path = labels_dir / f"{stem}.txt"
-        if label_path.exists():
-            label_path = labels_dir / f"{stem}_{frame_index:06d}.txt"
 
         tracker_ids = None
         if getattr(detections, "tracker_id", None) is not None:
@@ -3773,40 +3899,20 @@ class SupervisionInferenceRunner:
                     if flat.size == 0:
                         return None
                     value = flat[0]
-                if isinstance(value, (np.floating, float)):
-                    if math.isnan(float(value)):
-                        return None
-                    return str(int(round(float(value))))
-                if isinstance(value, (np.integer, int)):
-                    return str(int(value))
-                return str(value)
+                numeric = float(value)
+                if not math.isfinite(numeric) or numeric < 0:
+                    return None
+                rounded = round(numeric)
+                if abs(numeric - rounded) > 1e-6:
+                    return None
+                return str(int(rounded))
             except Exception:
                 return None
 
         track_strings: list[str | None] = []
         has_any_track = False
         all_have_track = True
-
-        lines: list[str] = []
         for idx in range(len(xywhn)):
-            class_id = int(cls[idx]) if cls is not None else 0
-            x, y, w, h = xywhn[idx]
-            fields = [
-                str(class_id),
-                f"{float(x):.6f}",
-                f"{float(y):.6f}",
-                f"{float(w):.6f}",
-                f"{float(h):.6f}",
-            ]
-
-            if kp_xyn is not None and idx < kp_xyn.shape[0]:
-                point_count = kp_xyn.shape[1]
-                for kp_idx in range(point_count):
-                    kx = kp_xyn[idx, kp_idx, 0]
-                    ky = kp_xyn[idx, kp_idx, 1]
-                    fields.append(f"{float(kx):.6f}")
-                    fields.append(f"{float(ky):.6f}")
-
             track_val = _extract_scalar(tracker_ids, idx)
             if track_val is None:
                 track_val = _extract_scalar(box_track_ids, idx)
@@ -3819,7 +3925,137 @@ class SupervisionInferenceRunner:
             else:
                 all_have_track = False
 
-            lines.append(" ".join(fields))
+        emit_track_ids = has_any_track and all_have_track
+        if self.settings.use_tracker and not emit_track_ids and not self._tracker_label_warning_emitted:
+            self._tracker_label_warning_emitted = True
+            self.log(
+                "Tracker IDs were unavailable or incomplete; label files emitted without track IDs.",
+                "WARNING",
+            )
+
+        kp_xyn_arr = None
+        if kp_xyn is not None:
+            try:
+                candidate = np.asarray(kp_xyn, dtype=float)
+                if candidate.ndim == 3 and candidate.shape[1] > 0 and candidate.shape[2] >= 2:
+                    kp_xyn_arr = candidate
+            except Exception:
+                kp_xyn_arr = None
+
+        kp_conf_arr = None
+        if kp_conf is not None:
+            try:
+                candidate = np.asarray(kp_conf, dtype=float)
+                if candidate.ndim == 2:
+                    kp_conf_arr = candidate
+            except Exception:
+                kp_conf_arr = None
+
+        pose_schema = None
+        if kp_xyn_arr is not None:
+            point_count = int(kp_xyn_arr.shape[1])
+            has_keypoint_confidence = bool(
+                kp_conf_arr is not None
+                and kp_conf_arr.shape[0] >= kp_xyn_arr.shape[0]
+                and kp_conf_arr.shape[1] >= point_count
+            )
+            candidate_schema = YoloPoseLabelSchema(
+                keypoint_count=point_count,
+                keypoint_dimensions=3 if has_keypoint_confidence else 2,
+                include_bbox=True,
+                include_bbox_confidence=bool(getattr(self.settings, "save_conf", False)),
+                include_track_id=True,
+            )
+            pose_schema = getattr(self, "_pose_label_schema", None)
+            if pose_schema is None:
+                pose_schema = candidate_schema
+                self._pose_label_schema = pose_schema
+                try:
+                    write_pose_label_schema(labels_dir, pose_schema)
+                except Exception as exc:
+                    if not getattr(self, "_pose_label_schema_warning_emitted", False):
+                        self._pose_label_schema_warning_emitted = True
+                        self.log(f"Failed to write pose-label schema: {exc}", "WARNING")
+            elif (
+                pose_schema.keypoint_count != candidate_schema.keypoint_count
+                or pose_schema.keypoint_dimensions != candidate_schema.keypoint_dimensions
+                or pose_schema.include_bbox_confidence != candidate_schema.include_bbox_confidence
+            ):
+                if not getattr(self, "_pose_label_schema_warning_emitted", False):
+                    self._pose_label_schema_warning_emitted = True
+                    self.log(
+                        "Pose-label shape changed during inference; this frame was skipped to avoid a mixed schema.",
+                        "WARNING",
+                    )
+                return
+
+        lines: list[str] = []
+        for idx in range(len(xywhn)):
+            raw_class_id = cls[idx] if cls is not None else 0
+            try:
+                class_value = float(raw_class_id)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Frame {frame_index}, detection {idx} has a non-numeric class ID."
+                ) from exc
+            if (
+                not math.isfinite(class_value)
+                or class_value < 0
+                or abs(class_value - round(class_value)) > 1e-6
+            ):
+                raise RuntimeError(
+                    f"Frame {frame_index}, detection {idx} has an invalid class ID {class_value!r}."
+                )
+            class_id = int(round(class_value))
+            bbox = [float(value) for value in xywhn[idx, :4]]
+            bbox_confidence = None
+            if bool(getattr(self.settings, "save_conf", False)):
+                raw_confidence = _extract_scalar(conf, idx)
+                try:
+                    bbox_confidence = float(raw_confidence)
+                    if not math.isfinite(bbox_confidence):
+                        bbox_confidence = 0.0
+                except (TypeError, ValueError):
+                    bbox_confidence = 0.0
+            track_id = int(track_strings[idx]) if emit_track_ids and track_strings[idx] is not None else None
+
+            try:
+                if pose_schema is not None and kp_xyn_arr is not None and idx < kp_xyn_arr.shape[0]:
+                    row_keypoints: list[tuple[float, ...]] = []
+                    for kp_idx in range(pose_schema.keypoint_count):
+                        kx = float(kp_xyn_arr[idx, kp_idx, 0])
+                        ky = float(kp_xyn_arr[idx, kp_idx, 1])
+                        if pose_schema.keypoint_dimensions == 3:
+                            kc = 0.0
+                            if (
+                                kp_conf_arr is not None
+                                and idx < kp_conf_arr.shape[0]
+                                and kp_idx < kp_conf_arr.shape[1]
+                            ):
+                                kc = float(kp_conf_arr[idx, kp_idx])
+                            row_keypoints.append((kx, ky, kc))
+                        else:
+                            row_keypoints.append((kx, ky))
+                    lines.append(
+                        format_yolo_pose_label(
+                            class_id=class_id,
+                            bbox=bbox,
+                            keypoints=row_keypoints,
+                            bbox_confidence=bbox_confidence,
+                            track_id=track_id,
+                        )
+                    )
+                else:
+                    fields = [str(class_id), *(f"{value:.6f}" for value in bbox)]
+                    if bbox_confidence is not None:
+                        fields.append(f"{bbox_confidence:.6f}")
+                    if track_id is not None:
+                        fields.append(str(track_id))
+                    lines.append(" ".join(fields))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Frame {frame_index}, detection {idx} cannot be serialized safely: {exc}"
+                ) from exc
 
         if self._labels_csv_recorder is not None:
             try:
@@ -3833,22 +4069,9 @@ class SupervisionInferenceRunner:
                     track_strings,
                 )
             except Exception as exc:
-                if not self._labels_error_logged:
-                    self._labels_error_logged = True
-                    self.log(f"Failed to write aggregate labels.csv: {exc}", "WARNING")
-
-        if has_any_track and all_have_track:
-            # Rebuild lines with appended track IDs to avoid partial columns.
-            adjusted_lines: list[str] = []
-            for base_line, track_str in zip(lines, track_strings):
-                adjusted_lines.append(f"{base_line} {track_str}")
-            lines = adjusted_lines
-        elif self.settings.use_tracker and not self._tracker_label_warning_emitted:
-            self._tracker_label_warning_emitted = True
-            self.log(
-                "Tracker IDs were unavailable or incomplete; label files emitted without track IDs.",
-                "WARNING",
-            )
+                self._labels_error_logged = True
+                self.log(f"Failed to write aggregate labels.csv: {exc}", "ERROR")
+                raise
 
         label_path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -3876,12 +4099,9 @@ class SupervisionInferenceRunner:
             target_dir = crops_dir / class_folder
             target_dir.mkdir(parents=True, exist_ok=True)
 
-            if result.path:
-                base_stem = Path(result.path).stem
-            else:
-                base_stem = f"{self.settings.source_path.stem}_frame{frame_index:06d}"
-
-            target_path = target_dir / f"{base_stem}_{idx:03d}.jpg"
+            source_identity = self.settings.source_path
+            base_stem = frame_artifact_stem(source_identity, frame_index)
+            target_path = target_dir / f"{base_stem}_det_{idx:03d}.jpg"
             cv2.imwrite(str(target_path), crop)
 
     def _teardown(self) -> None:
@@ -4739,5 +4959,3 @@ class SupervisionInferenceRunner:
             except Exception as exc:
                 self.log(f"External frame overlay failed: {exc}", "WARNING")
         return frame
-
-

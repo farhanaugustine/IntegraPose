@@ -125,7 +125,7 @@ def create_webcam_tab(app):
     iou_entry = ttk.Entry(options_frame, textvariable=app.config.webcam.webcam_iou_thres_var, width=10)
     iou_entry.grid(row=1, column=3, padx=5, pady=3, sticky="w")
     
-    device_label = ttk.Label(options_frame, text="Device (cpu, 0):")
+    device_label = ttk.Label(options_frame, text="Device (-1, cpu, 0):")
     device_label.grid(row=2, column=0, padx=5, pady=3, sticky="w")
     device_entry = ttk.Entry(options_frame, textvariable=app.config.webcam.webcam_device_var, width=10)
     device_entry.grid(row=2, column=1, padx=5, pady=3, sticky="w")

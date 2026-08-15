@@ -1,8 +1,15 @@
-import os
 import csv
+import os
 from collections import defaultdict
+
 import pandas as pd
-import re 
+
+from integra_pose.utils.frame_identity import (
+    load_frame_label_manifest,
+    resolve_frame_label_indices,
+)
+
+from .integra_pose_utils import frame_file_matches_source
 
 
 def parse_yolo_output_with_track_id(txt_file_path, class_labels_map, experiment_type="multi_animal", default_track_id=0):
@@ -101,32 +108,40 @@ def analyze_detections_per_track(yolo_txt_folder, class_labels_map, csv_output_f
     """
     os.makedirs(csv_output_folder, exist_ok=True)
     
-    def get_frame_num_from_filename(fname_str):
-        """Extracts the last sequence of digits from a filename as the frame number."""
-        try:
-            numbers = re.findall(r'\d+', fname_str)
-            return int(numbers[-1]) if numbers else float('inf') # float('inf') for unparsable names to sort last
-        except (AttributeError, ValueError, IndexError):
-            print(f"Warning: Could not parse frame number from filename: {fname_str}")
-            return float('inf') # Should not happen if re.findall is used correctly
-
     raw_bouts_data = defaultdict(lambda: defaultdict(list))
     last_frame_seen = defaultdict(lambda: defaultdict(lambda: -1)) # -1 indicates never seen or start of new bout
 
-    txt_files = sorted([f for f in os.listdir(yolo_txt_folder) if f.endswith(".txt")],
-                       key=lambda fname: get_frame_num_from_filename(fname)) # Sort files by frame number
+    txt_files = sorted(f for f in os.listdir(yolo_txt_folder) if f.lower().endswith(".txt"))
 
     if not txt_files:
         print(f"No .txt files found in {yolo_txt_folder}.")
         return None
-            
+
+    frame_manifest = load_frame_label_manifest(yolo_txt_folder)
+    source_hint = str(frame_manifest.get("source_stem") or "").strip() or None
+    scoped_files = [
+        filename for filename in txt_files if frame_file_matches_source(filename, source_hint)
+    ]
+    skipped_source_files = sorted(set(txt_files) - set(scoped_files))
+    if skipped_source_files:
+        print(
+            f"Warning: Skipping {len(skipped_source_files)} TXT file(s) that do not belong "
+            f"to source {source_hint!r}: {', '.join(skipped_source_files[:3])}"
+        )
+    frame_map = resolve_frame_label_indices(scoped_files, source=source_hint)
+    skipped = sorted(set(scoped_files) - set(frame_map))
+    if skipped:
+        print(
+            f"Warning: Skipping {len(skipped)} auxiliary/unparseable TXT file(s) "
+            f"in {yolo_txt_folder}: {', '.join(skipped[:3])}"
+        )
+    if not frame_map:
+        print(f"No frame-indexed .txt files found in {yolo_txt_folder}.")
+        return None
+             
     processed_frames_count = 0
-    for filename in txt_files:
-        current_frame_number = get_frame_num_from_filename(filename)
-        if current_frame_number == float('inf'): # Skip if frame number couldn't be parsed
-            print(f"Skipping file due to unparsable frame number: {filename}")
-            continue
-        
+    for filename, current_frame_number in sorted(frame_map.items(), key=lambda item: (item[1], item[0])):
+         
         processed_frames_count += 1
         txt_file_path = os.path.join(yolo_txt_folder, filename)
         detections_in_current_frame = parse_yolo_output_with_track_id(
