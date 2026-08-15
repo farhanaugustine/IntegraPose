@@ -18,9 +18,8 @@ profile that matches the features you intend to use.
 
 | Profile | IntegraPose command | What it supports |
 | --- | --- | --- |
-| Full desktop (recommended) | `pip install ".[plugins]"` | All seven tabs, including Behavior Clustering, plus the packages needed by bundled plugins; plugins remain disabled until you opt in |
+| Full desktop (recommended) | `pip install ".[dev,plugins]"` | All seven tabs, Behavior Clustering, bundled plugins, and supporting documentation and validation tools; plugins remain disabled until you opt in |
 | Minimal application | `pip install .` | Core preprocessing, setup, pose training, file/webcam inference, and Bout Analytics; Tab 7 and bundled plugins may report missing optional dependencies |
-| Contributor | `pip install ".[dev]"` | Full desktop dependencies plus tests, packaging, linting, and documentation tools |
 
 For a CPU-only PyTorch installation, the usual command pattern is:
 
@@ -32,6 +31,26 @@ For NVIDIA CUDA, AMD ROCm, or macOS, use the current command produced by the
 [official PyTorch install selector](https://pytorch.org/get-started/locally/).
 PyTorch wheel and platform versions change independently of IntegraPose, so a
 fixed CUDA or ROCm URL in an older tutorial should not be treated as current.
+
+### AMD GPU note
+
+For the IntegraPose desktop application, use a supported Linux configuration
+with Python 3.10 or 3.11 whenever possible. Confirm the exact GPU, operating
+system, and ROCm combination in AMD's
+[compatibility matrix](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility.html),
+install ROCm using AMD's
+[Linux guide](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/),
+then obtain the PyTorch command from the official selector. Do not reuse a
+hard-coded ROCm wheel URL from an older guide.
+
+If using AMD's `rocm/pytorch` Docker images, select a tag containing `py3.10`
+or `py3.11` and follow AMD's current container instructions. The `latest` tag
+may use a newer Python version, and running the IntegraPose desktop interface
+from a container also requires host-display configuration.
+
+AMD's Windows PyTorch support may require a Python version outside
+IntegraPose's supported range and may limit model training. Use the CPU path on
+Windows when AMD's supported versions do not align with Python 3.10-3.11.
 
 ## 1. Get the project files
 
@@ -69,8 +88,16 @@ For the complete workflow, including Tab 7, install from
 the repository root with:
 
 ```bash
-pip install ".[plugins]"
+pip install ".[dev,plugins]"
 ```
+
+The dot means “the project in the current folder.” Run this command from the
+IntegraPose folder that contains `setup.cfg`.
+
+The examples use double quotes because they work in Windows PowerShell,
+Anaconda Prompt, macOS Terminal, and most Linux shells. On macOS or Linux, you
+can use single quotes instead (`pip install '.[dev,plugins]'`) if that better
+matches your shell. Keep the brackets inside the quotes.
 
 The plugins are still disabled by default. Enable only the tools you want from
 `Plugins -> Manage Plugins...` after launch.
@@ -91,21 +118,21 @@ Recommended order for a plugin-enabled environment:
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-pip install ".[plugins]"
+pip install ".[dev,plugins]"
 python tools/install_albumentations_gui.py
 ```
 
 If you want a contributor environment with dev tools plus the packaged plugin stack:
 
 ```bash
-pip install ".[dev]"
+pip install ".[dev,plugins]"
 ```
 
 Recommended order for a contributor environment:
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-pip install ".[dev]"
+pip install ".[dev,plugins]"
 python tools/install_albumentations_gui.py
 ```
 

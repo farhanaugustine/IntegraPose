@@ -76,7 +76,9 @@ Inference (detect)
 - Use `Behavior Clustering (Tab 7)` only when you have pose data and want to split a YOLO class into its sub-behaviors.
 - Run Full Preflight after assigning the final batch metadata, ROIs, objects, and metrics.
 - If you are unsure where to begin, start with the workflow guide that matches your model type.
-- Install `.[plugins]` when you want Tab 7 and the packaged plugin dependency stack; the minimal `pip install .` profile may leave those dependencies unavailable.
+- Use `pip install ".[dev,plugins]"` for the complete user installation. The
+  minimal `pip install .` profile may leave Tab 7 and plugin packages
+  unavailable.
 
 ## 5. Know what to save
 

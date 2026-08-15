@@ -60,7 +60,7 @@ Each pose source can be assigned to a group (`Control`, `Treatment`, `WT`,
 ## Quick start
 
 Tab 7 checks its optional clustering dependencies before embedding the toolkit.
-Install the recommended full desktop profile with `pip install ".[plugins]"`
+Install the recommended full desktop profile with `pip install ".[dev,plugins]"`
 if the tab reports missing `sklearn`, `hmmlearn`, `umap`, or `hdbscan`.
 
 ### Option A - Continue from Bout Analytics

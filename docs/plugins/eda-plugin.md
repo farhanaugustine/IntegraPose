@@ -10,7 +10,7 @@ The EDA Tool helps you explore pose and bout outputs before final analysis.
 
 ## Requirements
 
-- Install optional analytics dependencies (`pip install ".[plugins]"`).
+- Install the complete user profile (`pip install ".[dev,plugins]"`).
 - Use a project with completed inference and/or bout exports, or provide a compatible CSV file.
 
 ## Key features

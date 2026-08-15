@@ -37,7 +37,7 @@ Quick links: **[Quick Start](docs/getting-started/quick-start.md)**,
 | Batch processing | Apply the same settings to many videos | Results organized by video plus combined summaries |
 | Sub-behavior discovery | Split known YOLO classes into the sub-behaviors actually present in your data, score them, name them, optionally export classifier-ready clip folders | Per-frame sub-cluster labels, bouts CSV, candidate scores, named clip folders |
 
-## (⭐New Addition): Review Predictions When Needed
+## Review Predictions When Needed
 
 After Bout Analytics, open **Review Behavior Bouts** or **Review ROI / Object
 Bouts** from Tab 6 or the Batch Processing Wizard. The review workspace keeps
@@ -99,6 +99,8 @@ A Conda environment is recommended.
 
 1. Install Python `3.10-3.11` (3.11 recommended).
 2. Install the PyTorch build that matches your hardware ([pytorch.org](https://pytorch.org/get-started/locally/)).
+3. Download and extract IntegraPose, or clone the repository, then open a
+   terminal in the IntegraPose project folder.
 
 ### Recommended full desktop install
 
@@ -108,12 +110,23 @@ NVIDIA or AMD GPU, replace the PyTorch line with the matching GPU command from
 the next section.
 
 ```bash
+git clone https://github.com/farhanaugustine/IntegraPose.git
+cd IntegraPose
 conda create -n integrapose python=3.11
 conda activate integrapose
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-pip install ".[plugins]"
+pip install ".[dev,plugins]"
 python tools/install_albumentations_gui.py
 ```
+
+The dot in `".[dev,plugins]"` means “install the IntegraPose project in the
+current folder.” The command therefore must be run from the folder containing
+`setup.cfg`.
+
+The examples use double quotes because they work in Windows PowerShell,
+Anaconda Prompt, macOS Terminal, and most Linux shells. On macOS or Linux, you
+can use single quotes instead (`pip install '.[dev,plugins]'`) if that better
+matches your shell. Keep the brackets inside the quotes.
 
 ### Choosing the PyTorch GPU build
 
@@ -140,44 +153,44 @@ For an NVIDIA GPU, install the current NVIDIA driver, then use the official PyTo
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 ```
 
-For an AMD GPU, use the ROCm PyTorch build. ROCm is Linux/Ubuntu-first, and support depends on your AMD GPU model and operating system. First check AMD's ROCm PyTorch guide as the source of truth for supported hardware and setup: [https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/native_linux/install-pytorch.html](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/native_linux/install-pytorch.html).
+For an AMD GPU, first check AMD's
+[compatibility matrix](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility.html).
+ROCm support depends on the exact GPU, operating system, driver, Python, and
+PyTorch combination.
 
-**Option A: native ROCm PyTorch install.** Use the official PyTorch selector and choose:
+For the IntegraPose desktop application, the recommended AMD path is a native
+Linux installation with Python 3.10 or 3.11:
 
-- OS: usually Linux for ROCm
-- Package: Pip
-- Language: Python
-- Compute Platform: ROCm
-
-**Example command:** install the PyTorch version compatible with your AMD ROCm setup.
-
-```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3
-```
-
-**Option B: AMD ROCm Docker container on Ubuntu.** This is often easier for AMD GPU users because AMD provides a prebuilt PyTorch container. Docker does not make unsupported AMD GPUs supported; your Ubuntu machine still needs AMD ROCm-compatible hardware and drivers.
-
-Install Docker on Ubuntu:
-
-```bash
-sudo apt update
-sudo apt install docker.io
-```
-
-From the IntegraPose repository folder, start AMD's ROCm PyTorch container:
+1. Confirm that AMD lists your GPU and Linux version as supported.
+2. Install the matching AMD driver and ROCm components by following the
+   [official ROCm Linux guide](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/).
+3. Open the [PyTorch install selector](https://pytorch.org/get-started/locally/)
+   and choose **Stable**, **Linux**, **Pip**, **Python**, and the ROCm version
+   supported by your system.
+4. Run the exact PyTorch command shown by the selector. Do not copy an older
+   hard-coded ROCm wheel URL from a tutorial.
+5. From the IntegraPose repository folder, run:
 
 ```bash
-sudo docker run -it --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size 8G -v "$PWD":/workspace -w /workspace rocm/pytorch:latest
-```
-
-Inside the container, install IntegraPose:
-
-```bash
-pip install ".[plugins]"
+pip install ".[dev,plugins]"
 python tools/install_albumentations_gui.py
 ```
 
-For specific tested ROCm/PyTorch container versions, use AMD's Docker image list instead of `latest`: [https://hub.docker.com/r/rocm/pytorch/tags](https://hub.docker.com/r/rocm/pytorch/tags).
+AMD also publishes prebuilt `rocm/pytorch` Docker images. This is an advanced
+option for the desktop application because the container needs access to the
+host display. Choose a specific image tag containing `py3.10` or `py3.11`;
+do not use `rocm/pytorch:latest` without first checking its Python version.
+Follow AMD's current
+[PyTorch on ROCm instructions](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/3rd-party/pytorch-install.html)
+for the required `/dev/kfd`, `/dev/dri`, security, IPC, and shared-memory
+options.
+
+Current AMD PyTorch-on-Windows packages may require a Python version outside
+IntegraPose's supported 3.10-3.11 range, and AMD's Windows support has
+additional training limitations. Check AMD's
+[Windows compatibility and limitations](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/limitations/limitationsrad.html)
+before attempting that path. Use the CPU installation on Windows when the
+supported versions do not align.
 
 Verify the install by starting Python in your Conda environment or Docker container:
 
@@ -203,7 +216,7 @@ else:
 
 For AMD ROCm, it is normal for PyTorch to use the `torch.cuda` API and device strings such as `cuda:0`. IntegraPose detects whether that `cuda:0` backend is NVIDIA CUDA or AMD ROCm automatically.
 
-References: [PyTorch install selector](https://pytorch.org/get-started/locally/), [AMD ROCm PyTorch guide](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/native_linux/install-pytorch.html), [NVIDIA CUDA installation guide](https://docs.nvidia.com/cuda/cuda-installation-guide-microsoft-windows/index.html).
+References: [PyTorch install selector](https://pytorch.org/get-started/locally/), [AMD ROCm Linux guide](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/), [AMD compatibility matrix](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility.html), [NVIDIA CUDA installation guide](https://docs.nvidia.com/cuda/cuda-installation-guide-microsoft-windows/index.html).
 
 For a minimal core installation (Tabs 1-6), from the repository root:
 
@@ -211,17 +224,17 @@ For a minimal core installation (Tabs 1-6), from the repository root:
 pip install .
 ```
 
-Tab 7 and some plugins require packages from the full profile. Install the
-recommended full profile with:
+Tab 7 and the bundled plugins require packages from the full profile. Install
+the recommended user profile with:
 
 ```bash
-pip install ".[plugins]"
+pip install ".[dev,plugins]"
 ```
 
 For a contributor environment with dev tools and the plugin stack:
 
 ```bash
-pip install ".[dev]"
+pip install ".[dev,plugins]"
 ```
 
 For Albumentations support, kept separate so it does not replace the GUI OpenCV build:

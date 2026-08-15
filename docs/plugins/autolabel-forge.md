@@ -30,7 +30,7 @@ Auto-labeling needs GroundingDINO and SAM. Install the packaged plugin
 stack and point the plugin at the model weights:
 
 ```bash
-pip install ".[plugins]"
+pip install ".[dev,plugins]"
 ```
 
 The plugin window prompts for missing weight paths the first time you
