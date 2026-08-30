@@ -247,10 +247,16 @@ class AnalysisGUI(tk.Toplevel):
             ttk.Checkbutton(steps_frame, text=step, variable=var).pack(anchor=tk.W)
         control_frame = ttk.Frame(parent)
         control_frame.grid(row=3, column=0, sticky='e')
-        self.run_button = ttk.Button(control_frame, text="RUN ENTIRE PIPELINE", command=self.start_analysis_thread, style="Accent.TButton")
+        gait_style = ttk.Style(self)
+        gait_style.configure("Gait.Accent.TButton", background="#28a745", foreground="white")
+        gait_style.map("Gait.Accent.TButton", background=[('active', '#218838')])
+        self.run_button = ttk.Button(
+            control_frame,
+            text="RUN ENTIRE PIPELINE",
+            command=self.start_analysis_thread,
+            style="Gait.Accent.TButton",
+        )
         self.run_button.pack()
-        self.style.configure("Accent.TButton", background="#28a745", foreground="white")
-        self.style.map("Accent.TButton", background=[('active', '#218838')])
 
     def _create_tab4_widgets(self, parent):
         parent.rowconfigure(0, weight=1)
