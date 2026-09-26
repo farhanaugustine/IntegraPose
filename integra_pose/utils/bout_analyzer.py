@@ -3105,13 +3105,24 @@ def generate_analytics_dashboard(output_folder, video_name, detailed_bouts_df, s
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 11))
     axes = axes.flatten()
+    fig.set_facecolor("white")
+    for ax in axes:
+        ax.set_facecolor('white')
+        ax.set_axisbelow(True)
+        ax.spines[:].set_color('#cccccc')
+        ax.spines[:].set_linewidth(0.8)
+        ax.tick_params(colors='#444444', labelsize=10)
+        ax.xaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+        ax.yaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+        ax.title.set(size=13, color='#333333', family='DejaVu Sans')
+        ax.grid(True, color='#d9d9d9', linewidth=0.8, linestyle='-', alpha=1.0)
     fig.suptitle(f"Bout Analytics Summary - {video_name}", fontsize=16, fontweight='bold')
 
     ax = axes[0]
     if summary_df is not None and not summary_df.empty and {'Behavior', 'Bout_Count'}.issubset(summary_df.columns):
         behavior_counts = summary_df.groupby('Behavior')['Bout_Count'].sum().sort_values(ascending=False)
         if not behavior_counts.empty:
-            ax.bar(behavior_counts.index, behavior_counts.values, color='#4C72B0')
+            ax.bar(behavior_counts.index, behavior_counts.values, color='#b3cde3', edgecolor='#666666', linewidth=0.7)
             ax.set_xlabel('Behavior')
             ax.set_ylabel('Bout Count')
             _format_x_labels(ax)
@@ -3125,7 +3136,7 @@ def generate_analytics_dashboard(output_folder, video_name, detailed_bouts_df, s
     if summary_df is not None and not summary_df.empty and {'Behavior', 'Mean_Duration_s'}.issubset(summary_df.columns):
         avg_duration = summary_df.groupby('Behavior')['Mean_Duration_s'].mean().sort_values(ascending=False)
         if not avg_duration.empty:
-            ax.bar(avg_duration.index, avg_duration.values, color='#55A868')
+            ax.bar(avg_duration.index, avg_duration.values, color='#ccebc5', edgecolor='#666666', linewidth=0.7)
             ax.set_xlabel('Behavior')
             ax.set_ylabel('Seconds')
             _format_x_labels(ax)
@@ -3160,7 +3171,7 @@ def generate_analytics_dashboard(output_folder, video_name, detailed_bouts_df, s
             else 'Raw Occupancy Time per ROI (s)'
         )
         if not time_series.empty:
-            ax.bar(time_series.index, time_series.values, color='#C44E52')
+            ax.bar(time_series.index, time_series.values, color='#fbb4ae', edgecolor='#666666', linewidth=0.7)
             ax.set_xlabel('ROI Name')
             ax.set_ylabel('Seconds')
             _format_x_labels(ax)
@@ -3175,6 +3186,7 @@ def generate_analytics_dashboard(output_folder, video_name, detailed_bouts_df, s
     if transitions_df is not None and not transitions_df.empty:
         pivot = transitions_df.pivot(index='From ROI', columns='To ROI', values='Transition Count').fillna(0)
         if not pivot.empty:
+            ax.grid(False)
             im = ax.imshow(pivot.values, cmap='Blues')
             ax.set_xticks(np.arange(len(pivot.columns)))
             ax.set_xticklabels([_wrap_label(col, width=12) for col in pivot.columns], rotation=45, ha='right')
@@ -3887,13 +3899,23 @@ def _module_temporal_trends(context: AnalyticsModuleContext, bin_size_seconds: i
                 fill_value=0.0,
             )
             fig, ax = plt.subplots(figsize=(10, 5))
+            fig.set_facecolor('white')
+            ax.set_facecolor('white')
+            ax.set_axisbelow(True)
+            ax.spines[:].set_color('#cccccc')
+            ax.spines[:].set_linewidth(0.8)
+            ax.tick_params(colors='#444444', labelsize=10)
+            ax.xaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+            ax.yaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+            ax.title.set(size=13, color='#333333', family='DejaVu Sans')
+            ax.grid(True, color='#d9d9d9', linewidth=0.8, linestyle='-', alpha=1.0)
+            ax.set_prop_cycle(color=plt.get_cmap('Set2').colors)
             for behavior in pivot_cum.columns:
-                ax.plot(pivot_cum.index, pivot_cum[behavior], label=str(behavior))
+                ax.plot(pivot_cum.index, pivot_cum[behavior], label=str(behavior), linewidth=1.8)
             ax.set_ylabel("Cumulative Duration (s)")
             ax.set_xlabel("Time (s)")
             ax.set_title("Cumulative Bout Duration per Behavior")
             ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1.0))
-            ax.grid(True, alpha=0.2)
             line_path = os.path.join(module_dir, f"{context.video_name}_behavior_time_cumulative.png")
             fig.tight_layout()
             fig.savefig(line_path, dpi=200)
@@ -3911,6 +3933,17 @@ def _module_temporal_trends(context: AnalyticsModuleContext, bin_size_seconds: i
                 fill_value=0.0,
             ).sort_index()
             fig, ax = plt.subplots(figsize=(10, 5))
+            fig.set_facecolor('white')
+            ax.set_facecolor('white')
+            ax.set_axisbelow(True)
+            ax.spines[:].set_color('#cccccc')
+            ax.spines[:].set_linewidth(0.8)
+            ax.tick_params(colors='#444444', labelsize=10)
+            ax.xaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+            ax.yaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+            ax.title.set(size=13, color='#333333', family='DejaVu Sans')
+            ax.grid(True, color='#d9d9d9', linewidth=0.8, linestyle='-', alpha=1.0)
+            ax.set_prop_cycle(color=plt.get_cmap('Set2').colors)
             bottoms = np.zeros(len(pivot_bar))
             for behavior in pivot_bar.columns:
                 ax.bar(
@@ -3919,13 +3952,15 @@ def _module_temporal_trends(context: AnalyticsModuleContext, bin_size_seconds: i
                     bottom=bottoms,
                     width=bin_size_seconds * 0.9,
                     label=str(behavior),
+                    edgecolor="white", linewidth=0.6,
                 )
                 bottoms += pivot_bar[behavior].to_numpy()
             ax.set_xlabel("Time Bin Start (s)")
             ax.set_ylabel("Bout Duration within Bin (s)")
             ax.set_title("Stacked Bout Duration per Behavior")
             ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1.0))
-            ax.grid(True, axis='y', alpha=0.2)
+            ax.grid(False, axis='x')
+            ax.grid(True, axis='y', color='#d9d9d9', alpha=1.0)
             bar_path = os.path.join(module_dir, f"{context.video_name}_behavior_time_stacked.png")
             fig.tight_layout()
             fig.savefig(bar_path, dpi=200)
@@ -4024,6 +4059,17 @@ def _module_activity_budgets(context: AnalyticsModuleContext) -> Dict[str, Any]:
             ).sort_index()
             width = max(6.0, min(14.0, 1.2 * len(pivot.index)))
             fig, ax = plt.subplots(figsize=(width, 5))
+            fig.set_facecolor('white')
+            ax.set_facecolor('white')
+            ax.set_axisbelow(True)
+            ax.spines[:].set_color('#cccccc')
+            ax.spines[:].set_linewidth(0.8)
+            ax.tick_params(colors='#444444', labelsize=10)
+            ax.xaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+            ax.yaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+            ax.title.set(size=13, color='#333333', family='DejaVu Sans')
+            ax.grid(True, color='#d9d9d9', linewidth=0.8, linestyle='-', alpha=1.0)
+            ax.set_prop_cycle(color=plt.get_cmap('Set2').colors)
             bottoms = np.zeros(len(pivot.index))
             x_labels = [str(lbl) for lbl in pivot.index]
             x_positions = np.arange(len(pivot.index))
@@ -4033,6 +4079,7 @@ def _module_activity_budgets(context: AnalyticsModuleContext) -> Dict[str, Any]:
                     pivot[behavior].to_numpy(),
                     bottom=bottoms,
                     label=str(behavior),
+                    edgecolor="white", linewidth=0.6,
                 )
                 bottoms += pivot[behavior].to_numpy()
             ax.set_xticks(x_positions)
@@ -4042,7 +4089,8 @@ def _module_activity_budgets(context: AnalyticsModuleContext) -> Dict[str, Any]:
             ax.set_title("Per-Track Activity Budget (Stacked)")
             ax.set_ylim(0, 1.05)
             ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1.0))
-            ax.grid(True, axis='y', alpha=0.2)
+            ax.grid(False, axis='x')
+            ax.grid(True, axis='y', color='#d9d9d9', alpha=1.0)
             stacked_path = os.path.join(module_dir, f"{context.video_name}_activity_budget_stacked.png")
             fig.tight_layout()
             fig.savefig(stacked_path, dpi=200)
@@ -4059,9 +4107,22 @@ def _module_activity_budgets(context: AnalyticsModuleContext) -> Dict[str, Any]:
                 data = [durations.loc[durations['Behavior'] == bh, 'Duration (s)'].to_numpy() for bh in behaviors]
                 if any(len(arr) for arr in data):
                     fig, ax = plt.subplots(figsize=(max(6.0, 1.0 * len(behaviors)), 5))
+                    fig.set_facecolor('white')
+                    ax.set_facecolor('white')
+                    ax.set_axisbelow(True)
+                    ax.spines[:].set_color('#cccccc')
+                    ax.spines[:].set_linewidth(0.8)
+                    ax.tick_params(colors='#444444', labelsize=10)
+                    ax.xaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+                    ax.yaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+                    ax.title.set(size=13, color='#333333', family='DejaVu Sans')
+                    ax.grid(True, color='#d9d9d9', linewidth=0.8, linestyle='-', alpha=1.0)
+                    ax.set_prop_cycle(color=plt.get_cmap('Set2').colors)
                     parts = ax.violinplot(data, showmeans=True, showextrema=False)
                     for pc in parts['bodies']:
-                        pc.set_facecolor('#4C72B0')
+                        pc.set_facecolor('#b3cde3')
+                        pc.set_edgecolor('#666666')
+                        pc.set_linewidth(0.8)
                         pc.set_alpha(0.6)
                     ax.set_xticks(np.arange(1, len(behaviors) + 1))
                     ax.set_xticklabels(behaviors, rotation=45, ha='right')
@@ -4675,6 +4736,16 @@ def _module_bout_timeline_export(context: AnalyticsModuleContext) -> Dict[str, A
 
                 height = max(4.0, min(12.0, 0.6 * len(tracks) + 2))
                 fig, ax = plt.subplots(figsize=(12, height))
+                fig.set_facecolor('white')
+                ax.set_facecolor('white')
+                ax.set_axisbelow(True)
+                ax.spines[:].set_color('#cccccc')
+                ax.spines[:].set_linewidth(0.8)
+                ax.tick_params(colors='#444444', labelsize=10)
+                ax.xaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+                ax.yaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+                ax.title.set(size=13, color='#333333', family='DejaVu Sans')
+                ax.grid(True, color='#d9d9d9', linewidth=0.8, linestyle='-', alpha=1.0)
                 for idx, track_id in enumerate(tracks):
                     track_rows = timeline_df[timeline_df['Track ID'] == track_id]
                     for _, row in track_rows.iterrows():
@@ -4703,7 +4774,8 @@ def _module_bout_timeline_export(context: AnalyticsModuleContext) -> Dict[str, A
                 ax.set_xlabel("Time (s)")
                 ax.set_ylabel("Track ID")
                 ax.set_title("Bout Timeline")
-                ax.grid(True, axis='x', alpha=0.2)
+                ax.grid(False, axis='y')
+                ax.grid(True, axis='x', color='#d9d9d9', alpha=1.0)
 
                 behavior_handles = [Patch(facecolor=behavior_colors[beh], label=str(beh)) for beh in behaviors]
                 legends = behavior_handles

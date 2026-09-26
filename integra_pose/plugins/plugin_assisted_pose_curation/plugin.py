@@ -18,7 +18,7 @@ def _resolve_ui_module() -> Optional[ModuleType]:
     if _ui_import_error is not None:
         return None
     try:
-        _ui_module = importlib.import_module(".ui", __package__)
+        _ui_module = importlib.import_module(".qt_bridge", __package__)
     except ModuleNotFoundError as exc:
         _ui_import_error = exc
         logging.getLogger(__name__).warning(
@@ -51,7 +51,7 @@ def _format_import_error() -> str:
 class AssistedPoseCurationPlugin:
     def __init__(self) -> None:
         self._main_app = None
-        self._window: Optional[tk.Misc] = None
+        self._window = None
         self._import_error_message: Optional[str] = None
 
     def attach(self, main_app) -> None:

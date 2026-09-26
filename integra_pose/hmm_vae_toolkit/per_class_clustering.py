@@ -87,6 +87,7 @@ class MultiClassClusterResult:
     seed: int
     label_column: str = "cluster_label"
     skipped_classes: list = field(default_factory=list)
+    backend_runs: list = field(default_factory=list)
 
     @property
     def total_clusters(self) -> int:
@@ -169,6 +170,13 @@ def cluster_per_class(
     # Late imports keep this module cheap to import.
     import numpy as np
 
+    for name, value in (("min_class_size", min_class_size), ("min_cluster_size", min_cluster_size),
+                        ("umap_neighbors", umap_neighbors), ("umap_components", umap_components), ("seed", seed)):
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise ValueError(f"{name} must be an integer.")
+    if seed < 0:
+        raise ValueError("seed must be non-negative.")
+
     if min_class_size < 1:
         raise ValueError("cluster_per_class: min_class_size must be at least 1.")
     if min_cluster_size < 2:
@@ -189,9 +197,29 @@ def cluster_per_class(
                 "detections_df. Run feature computation before clustering."
             )
 
-    out_df = detections_df.copy()
+    original_index = detections_df.index.copy()
+    out_df = detections_df.copy().reset_index(drop=True)
+    class_values = out_df["class_id"]
+    try:
+        numeric_ids = np.asarray(class_values, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("class_id must contain finite non-negative integer IDs.") from exc
+    if not np.isfinite(numeric_ids).all() or (numeric_ids < 0).any() or (numeric_ids != np.floor(numeric_ids)).any():
+        raise ValueError("class_id must contain finite non-negative integer IDs.")
+    if any(isinstance(value, (str, bool)) for value in class_values):
+        raise ValueError("class_id must contain numeric integer IDs, not strings or booleans.")
+    try:
+        all_features = np.asarray(list(out_df["feature_vector"]), dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Feature vectors must have one consistent numeric shape.") from exc
+    if all_features.ndim != 2 or not all_features.shape[1] or not np.isfinite(all_features).all():
+        raise ValueError("Feature vectors must be non-empty, equal-length and finite.")
     # Initialize unassigned and skipped rows with the noise sentinel.
     out_df[label_column] = "-1"
+    out_df["cluster_status"] = "not_processed"
+    out_df["cluster_backend"] = "not_run"
+    out_df['cluster_embedding'] = [None] * len(out_df)
+    backend_runs = []
 
     classes: list[PerClassClusterResult] = []
     skipped: list[int] = []
@@ -207,8 +235,9 @@ def cluster_per_class(
         class_indices = out_df.index[class_mask].tolist()
         n_frames = len(class_indices)
 
-        if n_frames < min_class_size:
-            reason = f"Only {n_frames} frame(s); need ≥{min_class_size} to cluster."
+        if n_frames < max(min_class_size, min_cluster_size):
+            out_df.loc[class_indices, "cluster_status"] = "insufficient_samples"
+            reason = f"Only {n_frames} samples; need at least {max(min_class_size, min_cluster_size)} to cluster."
             logger.warning(
                 "Skipping class %d (%s): %s",
                 class_id, class_name or "unnamed", reason,
@@ -219,7 +248,7 @@ def cluster_per_class(
                     class_name=class_name,
                     n_frames=n_frames,
                     n_clusters=0,
-                    n_noise_frames=n_frames,
+                    n_noise_frames=0,
                     skipped=True,
                     skip_reason=reason,
                 )
@@ -237,17 +266,28 @@ def cluster_per_class(
                 f"{class_id} ({class_name}): {exc}"
             )
 
+        backend_info = {'capture_embedding': True}
         local_labels = _cluster_one_class(
             feature_matrix,
             min_cluster_size=min_cluster_size,
             umap_neighbors=umap_neighbors,
             umap_components=umap_components,
             seed=seed,
+            metadata=backend_info,
         )
+        embedding = backend_info.pop('_embedding', None)
+        backend_info.pop('capture_embedding', None)
+        if embedding is not None:
+            for row_index, coordinates in zip(class_indices, embedding):
+                out_df.at[row_index, 'cluster_embedding'] = coordinates
+        backend_info.update(class_id=class_id)
+        backend_runs.append(backend_info)
 
         # Write namespaced labels back to the dataframe.
         namespaced = [_format_namespaced_label(class_id, int(lab)) for lab in local_labels]
         out_df.loc[class_indices, label_column] = namespaced
+        out_df.loc[class_indices, "cluster_status"] = ["noise" if int(lab) == -1 else "clustered" for lab in local_labels]
+        out_df.loc[class_indices, "cluster_backend"] = "cpu"
 
         local_unique = sorted({int(lab) for lab in local_labels if int(lab) != -1})
         n_noise = int(sum(1 for lab in local_labels if int(lab) == -1))
@@ -271,7 +311,9 @@ def cluster_per_class(
         seed=seed,
         label_column=label_column,
         skipped_classes=skipped,
+        backend_runs=backend_runs,
     )
+    out_df.index = original_index
     return out_df, result
 
 
@@ -282,91 +324,15 @@ def _cluster_one_class(
     umap_neighbors: int,
     umap_components: int,
     seed: int,
+    metadata=None,
 ):
-    """Run UMAP + HDBSCAN on one class's features. Returns local labels.
+    from .cluster_backend import cluster_features
 
-    Handles the "feature space is too small to UMAP" edge case by
-    skipping UMAP entirely and feeding raw features to HDBSCAN — this
-    keeps small classes (just above ``min_class_size``) from failing.
-    """
-    n = feature_matrix.shape[0]
-
-    # A zero value explicitly disables UMAP. Small classes also use the raw
-    # normalized features because UMAP cannot form a valid neighbourhood.
-    if umap_neighbors == 0 or n <= umap_neighbors + 1:
-        reduced = feature_matrix
-        if umap_neighbors == 0:
-            logger.debug("UMAP disabled; running HDBSCAN on raw features.")
-        else:
-            logger.debug(
-                "Skipping UMAP for small class (%d rows <= umap_neighbors+1=%d); "
-                "running HDBSCAN on raw features.",
-                n,
-                umap_neighbors + 1,
-            )
-    else:
-        try:
-            import umap as _umap_lib  # late import — heavy
-        except Exception as exc:
-            raise ImportError(
-                "cluster_per_class: UMAP is required. "
-                "`pip install umap-learn`. (For environments without UMAP, "
-                "set umap_neighbors=0 to skip dimension reduction, but for "
-                "real data UMAP yields better clusters.)"
-            ) from exc
-
-        # Clamp neighbors below n; UMAP errors otherwise.
-        effective_neighbors = max(2, min(umap_neighbors, n - 1))
-        reducer = _umap_lib.UMAP(
-            n_neighbors=effective_neighbors,
-            n_components=umap_components,
-            random_state=seed,
-            metric="euclidean",
-        )
-        reduced = reducer.fit_transform(feature_matrix)
-
-    # HDBSCAN clamp: min_cluster_size > n means no cluster ever; clamp.
-    effective_min_cluster = max(2, min(min_cluster_size, n // 2))
-    try:
-        import hdbscan as _hdbscan_lib  # late import — heavy
-    except Exception as exc:
-        raise ImportError(
-            "cluster_per_class: HDBSCAN is required. "
-            "`pip install hdbscan`."
-        ) from exc
-
-    clusterer = _hdbscan_lib.HDBSCAN(
-        min_cluster_size=effective_min_cluster,
-        metric="euclidean",
-        cluster_selection_method="eom",
+    return cluster_features(
+        feature_matrix, min_cluster_size=min_cluster_size,
+        umap_neighbors=umap_neighbors, umap_components=umap_components,
+        seed=seed, metadata=metadata,
     )
-    labels = clusterer.fit_predict(reduced)
-
-    # Visibility guard: when a class has very few feature rows, HDBSCAN
-    # almost always returns -1 (noise) for everything. The user has no
-    # way to distinguish that case from a legitimate "many points, no
-    # structure found" result without this warning. Emit at WARNING so
-    # it surfaces in the toolkit log alongside other run diagnostics.
-    if labels.size and (labels == -1).all():
-        if n < max(10, effective_min_cluster * 3):
-            logger.warning(
-                "All %d frames collapsed to noise (HDBSCAN returned -1 for "
-                "every point). The class has too few feature rows for "
-                "meaningful clustering at min_cluster_size=%d; consider "
-                "lowering min_cluster_size, raising min_class_size to "
-                "exclude this class entirely, or merging this class with "
-                "another upstream.",
-                n, effective_min_cluster,
-            )
-        else:
-            logger.warning(
-                "All %d frames collapsed to noise (HDBSCAN returned -1 for "
-                "every point). The feature distribution shows no detectable "
-                "sub-structure at min_cluster_size=%d; consider lowering "
-                "min_cluster_size or revisiting feature selection.",
-                n, effective_min_cluster,
-            )
-    return labels
 
 
 __all__ = [

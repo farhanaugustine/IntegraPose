@@ -38,7 +38,7 @@ its result files with the rest of the study record.
 | Plugin | What it adds | When to reach for it |
 | --- | --- | --- |
 | [Gait & Kinematic Dashboard](gait-kinematics.md) | Stride length, speed, paw angles, and group comparisons | Locomotion-focused experiments and gait-disorder studies |
-| [Fura Imaging Lab](fura-imaging-lab.md) | Fura-2 stack alignment, ROI tracking, ratio analysis, and workbook export | Calcium-imaging experiments whose outputs should be stored beside pose and behavior records |
+| [Fura Imaging Lab](fura-imaging-lab.md) **(incomplete)** | Fura-2 stack alignment, ROI tracking, ratio analysis, and workbook export under development | Evaluating standalone Fura-2 ROI and ratio-analysis workflows |
 | [Zone Counter](zone-counter.md) | Live polygon-based zone counts during inference | Real-time entry/exit counts for arenas, choice tests, social zones |
 
 ### Exploration & review
@@ -55,7 +55,7 @@ its result files with the rest of the study record.
 | Before training | Dataset Augmentor Lab |
 | After inference | EDA Tool, Gait & Kinematic Dashboard, Zone Counter |
 | After Tab 7 sub-behavior discovery | TandemYTC - Tandem YOLO + Temporal Classifier |
-| Adjacent imaging analysis | Fura Imaging Lab |
+| Experimental Fura-2 imaging analysis | Fura Imaging Lab (incomplete) |
 
 ## Browse by question
 
@@ -69,7 +69,7 @@ its result files with the rest of the study record.
 | Train a downstream behavior classifier | TandemYTC - Tandem YOLO + Temporal Classifier |
 | Run a multi-stage detector + classifier | TandemYTC - Tandem YOLO + Temporal Classifier |
 | Focus on gait or stride features | Gait & Kinematic Dashboard |
-| Analyze Fura-2 calcium-imaging stacks | Fura Imaging Lab |
+| Evaluate Fura-2 imaging analysis under development | Fura Imaging Lab (incomplete) |
 
 ## Enabling and launching plugins
 

@@ -3,6 +3,7 @@ import os
 from collections import defaultdict
 
 import pandas as pd
+from openpyxl.utils import get_column_letter
 
 from integra_pose.utils.frame_identity import (
     load_frame_label_manifest,
@@ -368,8 +369,7 @@ def save_analysis_to_excel_per_track(csv_file_path, output_folder, class_labels_
         return None
     except Exception as e:
         print(f"Error reading CSV for Excel summary: {e}, Path: {csv_file_path}")
-        pd.DataFrame(columns=summary_columns).to_excel(excel_path, sheet_name='Per-Track Bout Summary', index=False)
-        return None # Return None if CSV reading fails after attempting to create empty Excel
+        return None
 
     if isinstance(class_labels_map, list):
         class_labels_map_dict = {i: name for i, name in enumerate(class_labels_map)}
@@ -418,7 +418,7 @@ def save_analysis_to_excel_per_track(csv_file_path, output_folder, class_labels_
             pd.DataFrame(columns=summary_columns).to_excel(excel_path, sheet_name='Per-Track Bout Summary', index=False)
             return excel_path
             
-        with pd.ExcelWriter(excel_path, engine='xlsxwriter') as writer:
+        with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
             df_summary.to_excel(writer, sheet_name='Per-Track Bout Summary', index=False)
             worksheet = writer.sheets['Per-Track Bout Summary']
             for idx, col_name in enumerate(df_summary.columns):
@@ -427,14 +427,9 @@ def save_analysis_to_excel_per_track(csv_file_path, output_folder, class_labels_
                     series.astype(str).map(len).max() if not series.empty else 0,
                     len(str(col_name))
                 ) + 2 # Add a little padding
-                worksheet.set_column(idx, idx, max_len)
+                worksheet.column_dimensions[get_column_letter(idx + 1)].width = float(max_len)
         print(f"Bout summary Excel saved to: {excel_path}")
         return excel_path
     except Exception as e:
         print(f"Error saving per-track bout summary to Excel: {e}")
-        try:
-            pd.DataFrame(columns=summary_columns).to_excel(excel_path, sheet_name='Per-Track Bout Summary', index=False)
-            print(f"Saved an empty Excel due to previous error: {excel_path}")
-        except Exception as e_final:
-            print(f"Could not even save an empty Excel: {e_final}")
         return None

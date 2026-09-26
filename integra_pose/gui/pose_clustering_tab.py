@@ -11,19 +11,19 @@ if TYPE_CHECKING:
 
 
 def create_pose_clustering_tab(app: 'YoloApp') -> None:
-    """Repurpose the tab as a launcher for the VAE + HMM segmentation toolkit."""
+    """Repurpose the tab as a launcher for the Behavior Clustering segmentation toolkit."""
     tab = create_scrollable_tab(app, app.pose_clustering_tab)
     app.pose_clustering_content = tab
     tab.columnconfigure(0, weight=1)
 
-    header = ttk.Label(tab, text="Behavior Clustering (VAE + HMM)", font=("Segoe UI", 12, "bold"))
+    header = ttk.Label(tab, text="Behavior Clustering", font=("Segoe UI", 12, "bold"))
     header.grid(row=0, column=0, sticky="w", pady=(0, 6))
     sub = ttk.Label(
         tab,
         text=(
-            "Tab 7 models latent movement structure directly from pose data. "
+            "Tab 7 explores pose-derived movement patterns using UMAP and HDBSCAN on CPU. "
             "If Tab 6 or batch analytics outputs are available, you can also import their run manifests to "
-            "reuse bout segmentation and carry over source metadata."
+            "carry over pose/video paths and source metadata."
         ),
         wraplength=820,
         justify="left",
@@ -43,7 +43,7 @@ def create_pose_clustering_tab(app: 'YoloApp') -> None:
         "1) From Tab 6: import the latest single-run Bout Analytics manifest from the main workflow.",
         "2) From Batch Analytics: import one or more completed batch run manifests, grouped by condition when available.",
         "3) From Raw Pose + Video: launch the toolkit and add pose/video sources manually without Tab 6.",
-        "4) In all cases, Tab 7 recomputes modeling features from pose data; imported manifests mainly reuse bouts and metadata.",
+        "4) Tab 7 recomputes features and cluster bouts from pose data; imported reviews do not constrain the clustering.",
     )
     for i, text in enumerate(steps, start=1):
         ttk.Label(card, text=text).grid(row=i, column=0, columnspan=3, sticky="w")
@@ -58,7 +58,7 @@ def create_pose_clustering_tab(app: 'YoloApp') -> None:
             app._toast(f"Missing deps: {', '.join(missing)}", level="error")
         else:
             dep_label.config(text="All required dependencies found.", foreground="#0f172a")
-            app._toast("VAE + HMM dependencies OK.", level="info")
+            app._toast("Behavior Clustering dependencies OK.", level="info")
 
     ttk.Button(card, text="Check dependencies", command=_check).grid(row=6, column=0, padx=(0, 8), pady=(4, 4), sticky="w")
     ttk.Button(
@@ -103,7 +103,7 @@ def create_pose_clustering_tab(app: 'YoloApp') -> None:
 
     add_workflow_footer_grid(app, tab, row=10)
 
-    app.log_message("Behavior Clustering tab is now a VAE + HMM launcher.", "INFO")
+    app.log_message("Behavior Clustering tab is now a Behavior Clustering launcher.", "INFO")
 
 
 def _open_path(path: Path | None):
@@ -119,7 +119,7 @@ def _open_path(path: Path | None):
 
 
 def _embed_toolkit(app, tab):
-    """Instantiate the VAE+HMM toolkit inside the tab."""
+    """Instantiate the Behavior Clustering toolkit inside the tab."""
     toolkit_row = 9
     try:
         app._embedded_behavior_analysis_app = None
@@ -136,7 +136,7 @@ def _embed_toolkit(app, tab):
     missing, _present = app._check_hmm_vae_dependencies()
     if missing:
         app._toast(f"Missing deps: {', '.join(missing)}", level="error")
-        messagebox.showerror("VAE + HMM Toolkit", f"Install dependencies first:\n{', '.join(missing)}", parent=app.root)
+        messagebox.showerror("Behavior Clustering Toolkit", f"Install dependencies first:\n{', '.join(missing)}", parent=app.root)
         return
     toolkit_module = None
     toolkit_source = ""
@@ -146,10 +146,10 @@ def _embed_toolkit(app, tab):
         toolkit_module = importlib.import_module("integra_pose.hmm_vae_toolkit")
         toolkit_source = "built-in"
     except Exception as exc:
-        app.log_message(f"Built-in VAE+HMM import failed: {exc}", "ERROR")
+        app.log_message(f"Built-in Behavior Clustering import failed: {exc}", "ERROR")
         messagebox.showerror(
-            "VAE + HMM Toolkit",
-            f"Could not load the built-in VAE + HMM toolkit:\n{exc}\n\n"
+            "Behavior Clustering Toolkit",
+            f"Could not load the built-in Behavior Clustering toolkit:\n{exc}\n\n"
             "Reinstall IntegraPose or check that integra_pose/hmm_vae_toolkit "
             "is intact.",
             parent=app.root,
@@ -167,11 +167,11 @@ def _embed_toolkit(app, tab):
             app._embedded_behavior_analysis_app = controller
         except Exception:
             pass
-        app._toast(f"Embedded VAE + HMM toolkit ({toolkit_source}).", level="info")
+        app._toast(f"Embedded Behavior Clustering toolkit ({toolkit_source}).", level="info")
         return controller
     except Exception as exc:
-        app.log_message(f"Failed to embed VAE + HMM toolkit: {exc}", "ERROR")
-        messagebox.showerror("VAE + HMM Toolkit", f"Failed to embed: {exc}", parent=app.root)
+        app.log_message(f"Failed to embed Behavior Clustering toolkit: {exc}", "ERROR")
+        messagebox.showerror("Behavior Clustering Toolkit", f"Failed to embed: {exc}", parent=app.root)
         return None
 
 

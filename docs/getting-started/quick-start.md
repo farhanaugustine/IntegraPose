@@ -2,6 +2,11 @@
 
 This guide is the fastest way to understand how IntegraPose fits together.
 
+Sampled data shared with the original IntegraPose publication are available
+in the Google Drive folder below.
+
+[Open sampled data](https://drive.google.com/drive/folders/1JjxiEc-nflYSJaD9YTBtdv55HJxTO_BH?usp=drive_link){ .md-button .md-button--primary }
+
 On first launch, IntegraPose may offer **First-Run Onboarding**. You can reopen
 the same walkthrough later from `File -> Start First-Run Onboarding...`.
 
@@ -20,7 +25,7 @@ If you want a complete step-by-step workflow, jump straight to one of these:
 | `4. Inference` | Run file-based detection or pose inference |
 | `5. Webcam Inference` | Run live camera inference (pose-oriented; detection models are also accepted) |
 | `6. Bout Analytics` | Compute and review behavior, ROI, and object bouts |
-| `7. Behavior Clustering (VAE + HMM)` | Optional - split YOLO classes into the sub-behaviors they actually contain |
+| `7. Behavior Clustering` | Optional - explore candidate movement patterns within model classes |
 | `File -> Batch Processing Wizard...` | Process many videos with shared settings |
 | `Plugins` | Optional toolkits and specialty workflows |
 | `Log` | Follow long-running work and find useful error messages |
@@ -73,7 +78,7 @@ Inference (detect)
   legitimately occur together for the same animal.
 - Use **Review Behavior Bouts** or **Review ROI / Object Bouts** after analysis
   when manual confirmation is part of the protocol.
-- Use `Behavior Clustering (Tab 7)` only when you have pose data and want to split a YOLO class into its sub-behaviors.
+- Use [Behavior Clustering (Tab 7)](../user-guide/pose-clustering.md) when you have pose data and want to inspect candidate patterns within each model class. Open the [Discovery Explorer](../user-guide/pose-clustering.md#discovery-explorer) for linked video review and annotations.
 - Run Full Preflight after assigning the final batch metadata, ROIs, objects, and metrics.
 - If you are unsure where to begin, start with the workflow guide that matches your model type.
 - Use `pip install ".[dev,plugins]"` for the complete user installation. The

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from integra_pose.logic.analytics_metric_catalog import collect_enabled_metric_keys, expand_metrics_to_modules
 from integra_pose.utils import bout_analyzer
+from integra_pose.utils.analytics_manifest import CURRENT_SCHEMA_VERSION as ANALYTICS_MANIFEST_SCHEMA_VERSION
 from integra_pose.utils.frame_identity import load_frame_label_class_metadata
 
 
@@ -783,7 +784,7 @@ class Analytics:
             }
 
             manifest = {
-                "schema_version": 4,
+                "schema_version": ANALYTICS_MANIFEST_SCHEMA_VERSION,
                 "run_id": str(run_id),
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "integra_pose_version": integra_version,

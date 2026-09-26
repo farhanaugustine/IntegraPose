@@ -57,7 +57,7 @@ class LayoutBuilder:
             "inference": "4. Inference",
             "webcam": "5. Webcam Inference",
             "analytics": "6. Bout Analytics",
-            "pose_clustering": "7. Behavior Clustering (VAE + HMM)",
+            "pose_clustering": "7. Behavior Clustering",
             "log": "Log",
         }
         app.tab_widgets = {

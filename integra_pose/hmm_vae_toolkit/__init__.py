@@ -1,4 +1,4 @@
-"""HMM-VAE segmentation module for the IntegraPose plugin suite."""
+"""Pose-derived behavior clustering toolkit for IntegraPose."""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any

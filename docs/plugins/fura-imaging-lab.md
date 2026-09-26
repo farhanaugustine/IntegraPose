@@ -1,20 +1,23 @@
 # Fura Imaging Lab
 
-!!! note "Plugin status - research in progress"
-    The IntegraPose plugin ecosystem evolves with active research. Some plugins are stable, others are works in progress, and the set may change as research needs shift. Pin to a commit if you depend on a specific plugin for an in-flight project.
+!!! warning "Incomplete — under development"
+    Fura Imaging Lab is incomplete. Its available tools are intended for evaluation
+    and continued development; the plugin should not be treated as a complete,
+    validated imaging-analysis workflow. Check results against known inputs and
+    an independently validated method before relying on them for research.
 
-Fura Imaging Lab brings calcium-imaging analysis into IntegraPose. It
-opens TIFF stacks, aligns frames, lets you draw and track ROIs over
-time, and exports the resulting traces as a multi-sheet workbook ready
-for downstream statistics.
+Fura Imaging Lab provides a standalone Fura-2 imaging workspace within IntegraPose.
+Available tools include TIFF-stack import, frame alignment, ROI tracking, trace
+analysis, and workbook export. The sections below describe the implemented tools
+and their scientific conventions.
 
 ## When to use it
 
-| Best for | Less ideal for |
+| Evaluation use cases | Outside this role |
 | --- | --- |
 | Fura-2 ratiometric calcium imaging from upright or inverted scopes | Wide-field behavior video - that's the main app's job |
 | Quick alignment + ROI tracking workflows that don't need a full ImageJ pipeline | Highly customized post-processing already handled by lab-specific MATLAB tools |
-| Lab projects that want imaging traces alongside pose / behavior outputs in one project | Pure exploratory imaging without a downstream analytics need |
+| Testing ROI traces and workbook exports against known imaging inputs | Studies requiring a complete, validated analysis workflow |
 
 ## What it does
 
@@ -60,6 +63,5 @@ interpret the run.
 
 ## Where this fits
 
-Fura Imaging Lab is intentionally **adjacent** to the main pose
-workflow rather than embedded in it. Its analysis workbook can be stored
-beside pose and behavior outputs for a combined experiment record.
+Fura Imaging Lab operates on imaging inputs and exports its own workbook.
+It does not synchronize these recordings with pose or behavior outputs.

@@ -11,17 +11,18 @@
 
 ## Dependencies
 - Required: `pandas`, `numpy`, `matplotlib`, `opencv-python`, `Pillow`
-- Optional: `scikit-learn`, `seaborn`, `openpyxl` (enables clustering, heatmaps, and Excel exports)
+- Required for the interface: `scikit-learn`, `scipy`, `seaborn`, `PyYAML`
+- Excel exports: `openpyxl`
 
 ## Configuration
-- Accepts pose/bout CSV files and optional project `data.yaml` to recover keypoint schema.
+- Accepts frame-indexed, whitespace-separated YOLO pose-label files and optional `data.yaml` for keypoint configuration. General CSV tables and bout summaries are not loader inputs.
 - Respects defaults in `config/app_config.py` for font sizes, plotting style, and FPS.
 
 ## Usage
-1. Enable the plugin from **Plugins → Launch EDA Tool**.
+1. Enable the plugin in **Plugins → Manage Plugins...**, then select **Plugins → Launch EDA Tool**.
 2. Load or build an EDA dataset, select features, then run PCA/cluster routines.
 3. Explore clusters, sync to video, and export enriched CSVs or plots.
 
-## Development Notes
-- Core services now live under `core/` (data, features, analytics, bout helpers) with UI helpers under `ui/`.
+## Extending the plugin
+- Core services are organized under `core/` (data, features, analytics, bout helpers) with UI helpers under `ui/`.
 - Reuse `core.DataHandler` or `core.AnalysisHandler` in headless scripts and keep Tk-specific code inside `ui/`.

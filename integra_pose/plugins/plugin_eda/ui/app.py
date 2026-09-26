@@ -123,6 +123,7 @@ class PoseEDAApp:
         self.video_sync_is_playing = False
         self.video_sync_after_id = None
         self.video_sync_is_recording = False
+        self.video_sync_writer_size = None
         self.video_sync_video_writer = None
         self.video_sync_output_video_path = None
         self.video_sync_composite_frame_width = 1280 # Target width for recorded composite video
@@ -1055,16 +1056,21 @@ class PoseEDAApp:
 
             if cluster_target_type == "instances":
                 df_features_updated = df_features_snapshot.copy()
-                df_features_updated.drop(columns=['unsupervised_cluster'], inplace=True, errors='ignore')
+                stale_columns = [
+                    col for col in df_features_updated.columns
+                    if col == 'unsupervised_cluster' or (col.startswith('PC') and col[2:].isdigit())
+                ]
+                df_features_updated.drop(columns=stale_columns, inplace=True)
                 if pca_join_df is not None:
-                    cols_to_drop = [col for col in pca_feature_names if col in df_features_updated.columns]
-                    if cols_to_drop:
-                        df_features_updated.drop(columns=cols_to_drop, inplace=True, errors='ignore')
                     df_features_updated = df_features_updated.join(pca_join_df)
-                df_features_updated = df_features_updated.join(result["cluster_series"])
+                if result["cluster_series"] is not None:
+                    df_features_updated = df_features_updated.join(result["cluster_series"])
+                else:
+                    # A dendrogram without a requested cut has no flat assignments.
+                    df_features_updated['unsupervised_cluster'] = np.nan
                 result["df_features_updated"] = df_features_updated
                 result["df_clustered_instances"] = df_features_updated[df_features_updated['unsupervised_cluster'].notna()]
-            elif dendrogram_item_labels and len(dendrogram_item_labels) == len(result["cluster_series"]):
+            elif result["cluster_series"] is not None and dendrogram_item_labels and len(dendrogram_item_labels) == len(result["cluster_series"]):
                 result["avg_cluster_summary_df"] = pd.DataFrame({
                     'Behavior': dendrogram_item_labels,
                     'Unsupervised_Cluster': result["cluster_series"].values
@@ -1113,11 +1119,18 @@ class PoseEDAApp:
                     if hasattr(self, 'btn_plot_composition'):
                         self.btn_plot_composition.config(state=tk.NORMAL)
                 else:
-                    self._display_text_results("\nNo instances were assigned to clusters (e.g., all data filtered out before clustering).", append=True)
+                    self.cluster_dominant_behavior_map = {}
+                    if result["cluster_series"] is None:
+                        message = "\nDendrogram only: no flat cluster assignments were requested."
+                    else:
+                        message = "\nNo instances were assigned to clusters. Check feature coverage."
+                    self._display_text_results(message, append=True)
                     if hasattr(self, 'btn_plot_composition'):
                         self.btn_plot_composition.config(state=tk.DISABLED)
             elif "avg_cluster_summary_df" in result:
                 self._display_text_results(f"\nAverage Behavior Cluster Assignments:\n{result['avg_cluster_summary_df'].to_string()}\n", append=True)
+            elif result["cluster_series"] is None:
+                self._display_text_results("\nDendrogram of average behavior profiles; no flat assignments were requested.", append=True)
             else:
                 self._display_text_results("\nCould not display average behavior cluster assignments (label mismatch).", append=True)
 
@@ -1409,8 +1422,9 @@ class PoseEDAApp:
                 
                 composite_frame = np.hstack((resized_vid_frame_for_rec, resized_plot_img_for_rec))
                 
-                writer_w = int(self.video_sync_video_writer.get(cv2.CAP_PROP_FRAME_WIDTH))
-                writer_h = int(self.video_sync_video_writer.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                # VideoWriter.get(CAP_PROP_*) does not reliably report frame size.
+                # Use the dimensions supplied when the writer was opened.
+                writer_w, writer_h = self.video_sync_writer_size
 
                 if composite_frame.shape[1] != writer_w or composite_frame.shape[0] != writer_h:
                     if writer_w > 0 and writer_h > 0:
@@ -1490,6 +1504,7 @@ class PoseEDAApp:
             messagebox.showerror("Recording Error", f"Could not start video writer for:\n{self.video_sync_output_video_path}\nCheck OpenCV/FFmpeg installation and permissions.", parent=self.tabs["4. Video & Cluster Sync"])
             self.video_sync_video_writer = None; return
 
+        self.video_sync_writer_size = (writer_width, writer_height)
         self.video_sync_is_recording = True
         self.video_sync_record_btn.config(text="Stop Rec.")
         self.tabs["4. Video & Cluster Sync"].config(cursor="watch") 
@@ -1510,6 +1525,7 @@ class PoseEDAApp:
                     "INFO",
                 )
         self.video_sync_is_recording = False
+        self.video_sync_writer_size = None
         self.video_sync_record_btn.config(text="Start Rec.")
         self.video_sync_output_video_path = None 
         self.tabs["4. Video & Cluster Sync"].config(cursor="") 
@@ -1725,6 +1741,11 @@ class PoseEDAApp:
                 frame_rate=fps,
                 video_name=output_file_base,
             )
+            if not excel_report_path:
+                raise RuntimeError(
+                    "The bout CSV was saved, but the Excel summary failed. "
+                    "Check the output location and workbook permissions."
+                )
             return {
                 "generated_csv_path": generated_csv_path,
                 "excel_report_path": excel_report_path,

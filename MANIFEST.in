@@ -1,5 +1,4 @@
 include README.md
-include RELEASE_SNAPSHOT.md
 include LICENSE
 include THIRD_PARTY_NOTICES.md
 recursive-include integra_pose *.py *.json *.yaml *.yml *.txt *.csv *.html

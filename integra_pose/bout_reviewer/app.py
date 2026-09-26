@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 import cv2
+from integra_pose.utils.qt_runtime import prepare_qt_runtime
+prepare_qt_runtime()
 from PySide6.QtCore import QSettings, QSignalBlocker, Qt, QTimer
 from PySide6.QtGui import (
     QAction,

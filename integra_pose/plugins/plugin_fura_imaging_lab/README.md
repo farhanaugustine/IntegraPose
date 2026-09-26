@@ -1,5 +1,10 @@
 # Plugin Fura Imaging Lab
 
+> **Incomplete — under development.** This plugin is available for evaluation
+> and continued development. It is not a complete, validated imaging-analysis
+> workflow. Verify results against known inputs and an independently validated
+> method before relying on them for research.
+
 ## Overview
 - Adds a GUI workflow for Fura-style imaging analysis, alignment, ROI tracking, and workbook export.
 - Supports TIFF stacks directly when the optional `tifffile` package is installed.

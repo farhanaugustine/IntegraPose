@@ -47,7 +47,7 @@ class IntegraPosePlugin:
 
     def register(self, main_app) -> None:
         self.main_app = main_app
-        self.main_app.log_message('--- Inside Plugin Register Method ---', 'INFO')
+        self.main_app.log_message('Loading EDA Tool...', 'INFO')
 
         menu: Optional[Menu] = getattr(self.main_app, 'plugins_menu', None)
         if not menu:
@@ -90,7 +90,11 @@ class IntegraPosePlugin:
         eda_window = tk.Toplevel(parent) if parent else tk.Toplevel()
         try:
             self._window = eda_window
-            self._window.bind("<Destroy>", lambda _e: self._clear_window(), add="+")
+            self._window.bind(
+                "<Destroy>",
+                lambda event: self._clear_window() if event.widget is eda_window else None,
+                add="+",
+            )
             module.PoseEDAApp(eda_window, host_app=self.main_app)
         except Exception as exc:  # pragma: no cover - surfaced to UI
             self._clear_window()

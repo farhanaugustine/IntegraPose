@@ -1,0 +1,25 @@
+Tab 7 documentation image provenance
+
+Source collection: Tutoral_3_Sub_Behavior_Clustering (user-provided Tutorial 3 materials).
+All images are lossless WebP conversions of existing tutorial frames/cards.
+No model inference or clustering was performed to create these documentation assets.
+T-maze footage/data credit: Lin Lab, University of Maryland, Baltimore County (UMBC).
+
+Asset                 Source relative to tutorial collection                    Position
+concept.webp          08_final/Tutorial3_TMaze_Discovery_v3_Review.mp4            00:03:20
+parameters.webp       08_final/Tutorial3_TMaze_Discovery_v3_Review.mp4            00:06:55
+playback.webp         08_final/Tutorial3_TMaze_Discovery_v3_Review.mp4            00:09:50
+features.webp         08_final/Tutorial3_TMaze_Discovery_v3_Review.mp4            00:11:50
+review.webp           08_final/Tutorial3_TMaze_Discovery_v3_Review.mp4            00:17:00
+runs.webp             08_final/Tutorial3_TMaze_Discovery_v3_Review.mp4            00:18:22
+setup.webp            04_recordings/03_handoff.mp4                               00:00:20
+controls.webp         04_recordings/05_parameters.mp4                            00:00:42
+map.webp              04_recordings/12_interactive_map.mp4                       00:00:15
+run-controls.webp     04_recordings/07_support_comparison_start.mp4              00:00:25
+findings.webp         06_edit/v3/findings.png                                    static card
+outputs.webp          06_edit/v3/outputs.png                                     static card
+
+Numerical example: 06_edit/v3/findings.json.
+Narration/context: 05_audio/TIMED_SCRIPT_V3.md and 06_edit/edl_v3.json.
+concept.webp is deliberately synthetic; findings.webp describes two selected
+baseline Walking candidates in one Mouse43 source recording, track 0.

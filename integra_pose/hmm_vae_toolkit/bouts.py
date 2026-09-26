@@ -123,6 +123,8 @@ def aggregate_states_into_bouts(
             track_df[state_column] != track_df[state_column].shift()
         ).astype(int)
         bout_start = (track_df["_state_diff"] > 0) | (track_df["_frame_diff"] > max_frame_gap)
+        if "cluster_status" in track_df:
+            bout_start |= track_df["cluster_status"] != track_df["cluster_status"].shift()
         bout_ids = bout_start.cumsum()
 
         for _bout_id, bout_df in track_df.groupby(bout_ids):
@@ -175,6 +177,8 @@ def aggregate_states_into_bouts(
                 "detection_count": duration,
                 "mean_location": mean_bout_location,
             }
+            if "cluster_status" in bout_df:
+                bout["cluster_status"] = str(bout_df["cluster_status"].iloc[0])
             if has_class:
                 # Dominant class_id within the bout for held-out evaluation.
                 try:

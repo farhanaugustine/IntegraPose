@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import inspect
 import json
+import math
 import random
 import shutil
 import time
@@ -13,6 +14,8 @@ from typing import Callable, Iterable, Optional, Sequence
 
 import cv2
 import numpy as np
+
+from .dataset_io import load_metadata, validate_samples, validate_output, write_metadata, source_provenance
 
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
@@ -68,11 +71,12 @@ class TransformSettings:
 class AugmentationRecipe:
     dataset_root: Path
     output_root: Optional[Path] = None
-    split: str = "all"
+    split: str = "train"
     copy_originals: bool = True
     seed: int = 42
     plan: str = "add"
     add_count: int = 1000
+    target_total_images: int = 40000
     target_ratio: float = 1.0
     add_per_class: int = 0
     multiplier: float = 1.0
@@ -172,30 +176,32 @@ def sanitize_yolo_bbox(cx: float, cy: float, bw: float, bh: float) -> list[float
 
 
 def read_label_objects(label_path: Path, *, img_w: int, img_h: int) -> list[LabelObject]:
-    objects: list[LabelObject] = []
     if not label_path.exists():
-        return objects
+        raise DatasetAugmentorCoreError(f"Missing label: {label_path}; backgrounds require empty TXT files.")
+    objects = []
     for line in label_path.read_text(encoding="utf-8").splitlines():
-        parts = line.strip().split()
-        if len(parts) < 5:
+        parts = line.split()
+        if not parts:
             continue
         try:
-            class_id = int(float(parts[0]))
-            cx, cy, bw, bh = map(float, parts[1:5])
-        except Exception:
-            continue
-        keypoints: list[tuple[float, float, int]] = []
-        kp_payload = parts[5:]
-        if kp_payload and len(kp_payload) % 3 == 0:
-            for idx in range(0, len(kp_payload), 3):
-                try:
-                    kx = float(kp_payload[idx]) * img_w
-                    ky = float(kp_payload[idx + 1]) * img_h
-                    kv = int(float(kp_payload[idx + 2]))
-                except Exception:
-                    kx, ky, kv = 0.0, 0.0, 0
-                keypoints.append((kx, ky, kv))
-        objects.append(LabelObject(class_id, sanitize_yolo_bbox(cx, cy, bw, bh), keypoints))
+            values = list(map(float, parts))
+            if len(values) < 5 or (len(values) - 5) % 3 or not all(math.isfinite(x) for x in values):
+                raise ValueError("Malformed row or non-finite values")
+            cls, cx, cy, bw, bh = values[:5]
+            if cls != int(cls) or cls < 0:
+                raise ValueError("Invalid class ID")
+            if not (bw > 0 and bh > 0 and cx-bw/2 >= -1e-6 and cx+bw/2 <= 1+1e-6 and
+                    cy-bh/2 >= -1e-6 and cy+bh/2 <= 1+1e-6):
+                raise ValueError("Bounding box lies outside image")
+            keypoints = []
+            for i in range(5, len(values), 3):
+                x, y, visibility = values[i:i+3]
+                if not (0 <= x <= 1 and 0 <= y <= 1 and visibility in (0, 1, 2)):
+                    raise ValueError("Invalid keypoint or visibility")
+                keypoints.append((x * img_w, y * img_h, int(visibility)))
+            objects.append(LabelObject(int(cls), sanitize_yolo_bbox(cx, cy, bw, bh), keypoints))
+        except ValueError as exc:
+            raise DatasetAugmentorCoreError(f"Invalid label {label_path}: {exc}") from exc
     return objects
 
 
@@ -225,6 +231,8 @@ def write_label_objects(
                 kx = max(0.0, min(1.0, float(kx_px) / max(img_w, 1)))
                 ky = max(0.0, min(1.0, float(ky_px) / max(img_h, 1)))
                 kv = int(vis_flat[vis_idx]) if vis_idx < len(vis_flat) else 0
+                if kv == 0:
+                    kx = ky = 0.0
                 row.extend([f"{kx:.6f}", f"{ky:.6f}", str(kv)])
                 kp_idx += 1
                 vis_idx += 1
@@ -234,7 +242,7 @@ def write_label_objects(
     output_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
-def discover_samples(dataset_root: Path, split: str = "all") -> list[SourceSample]:
+def discover_samples(dataset_root: Path, split: str = "all", *, log=None) -> list[SourceSample]:
     images_root = dataset_root / "images"
     labels_root = dataset_root / "labels"
     if not images_root.exists() or not labels_root.exists():
@@ -255,10 +263,12 @@ def discover_samples(dataset_root: Path, split: str = "all") -> list[SourceSampl
             label_path = label_split_dir / f"{img_path.stem}.txt"
             image = cv2.imread(str(img_path))
             if image is None:
-                continue
+                raise DatasetAugmentorCoreError(f"Unreadable source image: {img_path}")
             h, w = image.shape[:2]
             objects = read_label_objects(label_path, img_w=w, img_h=h)
             samples.append(SourceSample(img_path, label_path, split_dir.name, objects))
+            if len(samples) % 1000 == 0:
+                _emit(log, f"Scanned {len(samples):,} source images and labels")
     return samples
 
 
@@ -330,8 +340,9 @@ def compute_class_plan(
 
     if plan == "random":
         total = max(1, int(add_count))
-        per_class = max(1, int(np.ceil(total / max(1, len(augment_classes)))))
-        need = {c: per_class if c in augment_classes else 0 for c in classes}
+        base, remainder = divmod(total, len(augment_classes))
+        selected = sorted(augment_classes)
+        need = {c: base + (selected.index(c) < remainder) if c in augment_classes else 0 for c in classes}
         target = {c: counts[c] + need[c] for c in classes}
     elif plan == "balance":
         need, target = need_balance()
@@ -363,158 +374,181 @@ def run_augmentation(
     log: Optional[ProgressCallback] = None,
     progress: Optional[Callable[[int, int], None]] = None,
 ) -> AugmentationResult:
-    try:
-        import albumentations as A
-    except Exception as exc:
-        if albumentations_module is None:
+    if albumentations_module is None:
+        try:
+            import albumentations as A
+        except ImportError as exc:
             raise DatasetAugmentorCoreError(
-                "Albumentations is required for augmentation. Install it with: "
-                "python tools/install_albumentations_gui.py "
-                "(or manually: python -m pip install --no-deps -r requirements-albumentations-gui.txt)"
+                "Albumentations is required. Use tools/install_albumentations_gui.py."
             ) from exc
+    else:
         A = albumentations_module
-    if albumentations_module is not None:
-        A = albumentations_module
-
-    dataset_root = recipe.dataset_root
-    if not dataset_root.exists():
-        raise DatasetAugmentorCoreError(f"Dataset root not found: {dataset_root}")
-
-    output_root = recipe.output_root or dataset_root / time.strftime("aug_run_%Y%m%d_%H%M%S")
-    output_root.mkdir(parents=True, exist_ok=True)
-    preview_dir = output_root / "aug_preview"
-    preview_dir.mkdir(parents=True, exist_ok=True)
-
+    dataset_root = Path(recipe.dataset_root).resolve()
+    output_root = Path(recipe.output_root or dataset_root.parent / time.strftime("aug_run_%Y%m%d_%H%M%S")).resolve()
+    if output_root == dataset_root or output_root in dataset_root.parents or dataset_root in output_root.parents:
+        raise DatasetAugmentorCoreError("Input and output must be separate, non-nested dataset folders.")
+    if output_root.exists() and any(output_root.iterdir()):
+        raise DatasetAugmentorCoreError("Output folder must be new or empty; existing runs are never overwritten.")
+    if recipe.max_total_augs < 1 or recipe.max_augs_per_source_image < 1:
+        raise DatasetAugmentorCoreError("Augmentation limits must be positive.")
     random.seed(recipe.seed)
     np.random.seed(recipe.seed)
-
-    samples = discover_samples(dataset_root, recipe.split)
-    if not samples:
-        raise DatasetAugmentorCoreError(
-            f"No samples found in {dataset_root}. Expected images/<split>/ and labels/<split>/ layout."
-        )
-    labeled_samples = [sample for sample in samples if sample.objects]
+    metadata = load_metadata(dataset_root)
+    _emit(log, "Scanning source images and validating label schema...")
+    all_samples = discover_samples(dataset_root, "all", log=log)
+    if not all_samples:
+        raise DatasetAugmentorCoreError("No images/<split> and labels/<split> samples found.")
+    metadata = validate_samples(all_samples, metadata)
+    provenance = source_provenance(dataset_root)
+    selected_splits = {s.split for s in all_samples} if recipe.split == "all" else {recipe.split}
+    samples = [s for s in all_samples if s.split in selected_splits]
+    labeled_samples = [s for s in samples if s.objects]
     counts = compute_instance_counts(labeled_samples)
     if not counts:
-        raise DatasetAugmentorCoreError("No labeled boxes found in the selected split(s).")
-
+        raise DatasetAugmentorCoreError("No labeled objects in the selected split(s).")
+    flip_idx = metadata.get("flip_idx", [])
+    if metadata.get("kpt_shape") and recipe.transforms.horizontal_flip_prob > 0 and not flip_idx:
+        raise DatasetAugmentorCoreError("Pose horizontal flips require flip_idx in the dataset YAML; otherwise set flip probability to zero.")
+    exact = recipe.plan == "target_total"
+    plan_name = "random" if exact else recipe.plan
+    requested = recipe.target_total_images - len(samples) if exact else recipe.add_count
+    if exact and (not recipe.copy_originals or requested < 0):
+        raise DatasetAugmentorCoreError("Final image count requires Copy originals and a target at least as large as the selected input splits.")
+    if exact and requested > recipe.max_total_augs:
+        raise DatasetAugmentorCoreError(f"Target needs {requested} new images; raise Max total augments accordingly.")
     need, target, augment_classes = compute_class_plan(
-        counts,
-        plan=recipe.plan,
-        add_count=recipe.add_count,
-        target_ratio=recipe.target_ratio,
-        add_per_class=recipe.add_per_class,
-        multiplier=recipe.multiplier,
-        include_classes=recipe.include_classes,
-        exclude_classes=recipe.exclude_classes,
+        counts, plan=plan_name, add_count=max(1, requested), target_ratio=recipe.target_ratio,
+        add_per_class=recipe.add_per_class, multiplier=recipe.multiplier,
+        include_classes=recipe.include_classes, exclude_classes=recipe.exclude_classes,
     )
-    total_requested = min(max(1, int(recipe.max_total_augs)), max(1, sum(need.values())))
-    _emit(log, f"Discovered {len(samples)} source samples; {len(labeled_samples)} contain labels.")
-    _emit(log, _format_plan_summary(counts, target, need, augment_classes, recipe.plan))
-
+    total_requested = requested if exact else min(recipe.max_total_augs, sum(need.values()))
+    if exact:
+        # The exact plan targets images, independent of how many objects they contain.
+        need = {c: requested if c in augment_classes else 0 for c in counts}
+        target = {}
+    _emit(log, f"Selected {len(samples)} images ({len(labeled_samples)} labeled); generating up to {total_requested} new images.")
+    if selected_splits - {"train"}:
+        _emit(log, "Evaluation splits selected explicitly: use an untouched holdout for unbiased evaluation.")
+    if not exact:
+        _emit(log, _format_plan_summary(counts, target, need, augment_classes, recipe.plan))
     transform = build_transform(A, recipe.transforms, recipe.min_visibility)
-
-    if recipe.copy_originals:
-        _copy_originals(samples, output_root)
-        _emit(log, "Copied original samples to output root.")
-
+    if hasattr(transform, "set_random_seed"):
+        transform.set_random_seed(recipe.seed)
+    output_root.mkdir(parents=True, exist_ok=True)
+    marker = output_root / "EXPORT_INCOMPLETE.txt"
+    marker.write_text("Augmentation/export validation has not completed. Do not train on this folder.\n", encoding="utf-8")
+    preview_dir = output_root / "aug_preview"
+    preview_dir.mkdir()
+    # Unselected splits are always copied unchanged, including empty-label backgrounds.
+    originals = [s for s in all_samples if recipe.copy_originals or s.split not in selected_splits]
+    _copy_originals(originals, output_root)
+    if (dataset_root / "manifest.csv").is_file():
+        shutil.copy2(dataset_root / "manifest.csv", output_root / "source_manifest.csv")
     recipe_path = output_root / "augmentation_recipe.json"
     _write_recipe(recipe_path, recipe, output_root)
     manifest_path = output_root / "aug_manifest.csv"
-    augmented_image_paths: list[Path] = []
-    per_source_aug_count: dict[Path, int] = defaultdict(int)
+    augmented_image_paths = []
+    per_source_aug_count = defaultdict(int)
+    actual_counts = dict(counts)
+    lineage = []
+    def record_lineage(image_path, sample, augmented):
+        source_image = f"images/{sample.split}/{sample.image_path.name}"
+        original = provenance.get(source_image, {})
+        lineage.append(dict(image=image_path.relative_to(output_root).as_posix(),
+                            split=sample.split, source_image=source_image, augmented=int(augmented),
+                            source_group=original.get("source_group", ""),
+                            source_video=original.get("source_video", ""), frame=original.get("frame", "")))
+    for sample in originals:
+        record_lineage(output_root / "images" / sample.split / sample.image_path.name, sample, False)
     aug_counter = 0
-
     with manifest_path.open("w", newline="", encoding="utf-8") as manifest_file:
         manifest = csv.writer(manifest_file)
         manifest.writerow(["aug_image", "aug_label", "split", "source_image", "source_label"])
-
-        while aug_counter < recipe.max_total_augs and sum(need.values()) > 0:
-            sample = _pick_source(labeled_samples, need, augment_classes, per_source_aug_count, recipe)
+        while aug_counter < total_requested and (exact or sum(need.values()) > 0):
+            weights = need
+            if exact:
+                # Favor the least represented selected behaviors without duplicating only one clip.
+                ceiling = max(actual_counts[c] for c in augment_classes) + 1
+                weights = {c: ceiling - actual_counts[c] if c in augment_classes else 0 for c in counts}
+            sample = _pick_source(labeled_samples, weights, augment_classes, per_source_aug_count, recipe)
             if sample is None:
-                _emit(log, "No eligible source images remain for the requested class plan.")
-                break
-
+                raise DatasetAugmentorCoreError("Source/retry limit reached before the requested augmentation completed; output remains marked incomplete.")
+            per_source_aug_count[sample.image_path] += 1
             image = cv2.imread(str(sample.image_path))
             if image is None:
-                per_source_aug_count[sample.image_path] += 1
-                continue
-
-            transformed = _transform_sample(transform, image, sample)
+                raise DatasetAugmentorCoreError(f"Could not read source image: {sample.image_path}")
+            transformed = _transform_sample(transform, image, sample,
+                                            horizontal_flip_prob=recipe.transforms.horizontal_flip_prob,
+                                            flip_idx=flip_idx)
             if transformed is None:
-                per_source_aug_count[sample.image_path] += 1
                 continue
-
-            aug_img, aug_boxes, aug_classes, keypoints_flat, vis_flat, keypoint_counts = transformed
+            aug_img, boxes, classes, keypoints, vis, kp_counts = transformed
+            if not any(c in augment_classes and (exact or need.get(c, 0) > 0) for c in classes):
+                continue
             aug_img = apply_domain_shift(aug_img, recipe.domain_shift)
-            aug_img = apply_frame_and_patch_artifacts(aug_img, recipe.artifacts)
-
-            per_class_gain: dict[int, int] = defaultdict(int)
-            for class_id in aug_classes:
-                if class_id in augment_classes and need.get(class_id, 0) > 0:
-                    per_class_gain[class_id] += 1
-            if sum(per_class_gain.values()) == 0:
-                per_source_aug_count[sample.image_path] += 1
-                continue
-
-            aug_counter += 1
-            per_source_aug_count[sample.image_path] += 1
-            out_img_dir = output_root / "images" / sample.split
-            out_lbl_dir = output_root / "labels" / sample.split
-            out_img_dir.mkdir(parents=True, exist_ok=True)
-            out_lbl_dir.mkdir(parents=True, exist_ok=True)
-
-            new_stem = f"{sample.image_path.stem}_aug_{aug_counter:06d}"
-            out_img_path = out_img_dir / f"{new_stem}{sample.image_path.suffix.lower()}"
-            out_lbl_path = out_lbl_dir / f"{new_stem}.txt"
-            cv2.imwrite(str(out_img_path), aug_img)
-            write_label_objects(
-                out_lbl_path,
-                boxes=aug_boxes,
-                classes=aug_classes,
-                keypoints=keypoints_flat,
-                vis_flat=vis_flat,
-                keypoint_counts=keypoint_counts,
-                img_w=aug_img.shape[1],
-                img_h=aug_img.shape[0],
-            )
-            manifest.writerow(
-                [
-                    out_img_path.name,
-                    out_lbl_path.name,
-                    sample.split,
-                    sample.image_path.name,
-                    sample.label_path.name,
-                ]
-            )
-            augmented_image_paths.append(out_img_path)
-
-            for class_id, gain in per_class_gain.items():
-                need[class_id] = max(0, need[class_id] - gain)
-
+            regions = []
+            aug_img = apply_frame_and_patch_artifacts(aug_img, recipe.artifacts, occluded_regions=regions)
+            for i, (x, y) in enumerate(keypoints):
+                if vis[i] == 2 and any(x1 <= x < x2 and y1 <= y < y2 for x1, y1, x2, y2 in regions):
+                    vis[i] = 1
+            next_index = aug_counter + 1
+            stem = f"{sample.image_path.stem}_aug_{next_index:06d}"
+            image_path = output_root / "images" / sample.split / f"{stem}{sample.image_path.suffix.lower()}"
+            label_path = output_root / "labels" / sample.split / f"{stem}.txt"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            label_path.parent.mkdir(parents=True, exist_ok=True)
+            if image_path.exists() or label_path.exists():
+                raise DatasetAugmentorCoreError(f"Output name collision: {stem}")
+            if not cv2.imwrite(str(image_path), aug_img):
+                raise DatasetAugmentorCoreError(f"Image write failed: {image_path}")
+            write_label_objects(label_path, boxes=boxes, classes=classes, keypoints=keypoints,
+                                vis_flat=vis, keypoint_counts=kp_counts,
+                                img_w=aug_img.shape[1], img_h=aug_img.shape[0])
+            manifest.writerow([image_path.name, label_path.name, sample.split, sample.image_path.name, sample.label_path.name])
+            augmented_image_paths.append(image_path)
+            record_lineage(image_path, sample, True)
+            aug_counter = next_index
+            for c in classes:
+                actual_counts[c] = actual_counts.get(c, 0) + 1
+                if not exact:
+                    need[c] = max(0, need.get(c, 0) - 1)
             if progress is not None and (aug_counter % 25 == 0 or aug_counter == total_requested):
                 progress(aug_counter, total_requested)
             if aug_counter % 200 == 0:
-                _emit(log, f"Saved {aug_counter} augmentations; remaining needed instances: {sum(need.values())}")
-
-    _write_previews(augmented_image_paths, output_root, preview_dir, recipe.preview_count)
-    _emit(log, f"Augmentation complete. Created {aug_counter} samples. Output: {output_root}")
-    return AugmentationResult(
-        output_root=output_root,
-        augmented_samples=aug_counter,
-        original_counts=counts,
-        target_counts=target,
-        remaining_need=dict(sorted(need.items())),
-        manifest_path=manifest_path,
-        recipe_path=recipe_path,
-        preview_dir=preview_dir,
+                _emit(log, f"Saved {aug_counter}/{total_requested} augmentations")
+    _emit(log, "Validating every exported image and label...")
+    validation = validate_output(output_root, metadata, progress=lambda message: _emit(log, message))
+    if exact and sum(validation[s]["images"] for s in selected_splits) != recipe.target_total_images:
+        raise DatasetAugmentorCoreError("Final image count does not match requested target.")
+    with (output_root / "manifest.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(lineage[0]))
+        writer.writeheader()
+        writer.writerows(lineage)
+    source_provenance(output_root)
+    write_metadata(output_root, metadata)
+    _write_previews(augmented_image_paths, output_root, preview_dir, recipe.preview_count, metadata=metadata)
+    (output_root / "augmentation_validation.json").write_text(json.dumps(validation, indent=2), encoding="utf-8")
+    (output_root / "README.txt").write_text(
+        "YOLO dataset augmentation export. See data.yaml for training paths and keypoint schema.\n"
+        "augmentation_recipe.json records parameters; aug_manifest.csv maps derivatives to source images.\n"
+        "Unselected splits are copied unchanged. Derivatives remain in their source split.\n"
+        "Empty labels are backgrounds; invisible/occluded keypoints retain their fixed slots.\n"
+        "Visibility: 0=unlabeled/outside image, 1=occluded, 2=visible.\n"
+        "Validation checks file pairs, coordinates, schema, and exact-pixel duplicates across splits.\n"
+        "It cannot establish animal/recording independence without source provenance.\n"
+        "If moving this folder, update path in data.yaml. Preserve an untouched evaluation holdout.\n",
+        encoding="utf-8",
     )
+    marker.unlink()
+    _emit(log, f"Complete: {aug_counter} augmentations; validated dataset at {output_root}")
+    return AugmentationResult(output_root, aug_counter, counts, target,
+                              {c: 0 for c in counts} if exact else dict(sorted(need.items())),
+                              manifest_path, recipe_path, preview_dir)
 
 
 def build_transform(A, settings: TransformSettings, min_visibility: float):
     transforms = []
-    if settings.horizontal_flip_prob > 0:
-        transforms.append(A.HorizontalFlip(p=_prob(settings.horizontal_flip_prob)))
+    # Mirror explicitly in _transform_sample so keypoint identities follow flip_idx.
     if settings.affine_prob > 0:
         transforms.append(
             A.Affine(
@@ -568,7 +602,7 @@ def apply_domain_shift(image: np.ndarray, settings: DomainShiftSettings) -> np.n
     return out
 
 
-def apply_frame_and_patch_artifacts(image: np.ndarray, settings: ArtifactSettings) -> np.ndarray:
+def apply_frame_and_patch_artifacts(image: np.ndarray, settings: ArtifactSettings, *, occluded_regions=None) -> np.ndarray:
     out = image
     if random.random() < _prob(settings.frame_noise_prob):
         out = _apply_whole_frame_noise(out, settings.frame_noise_std)
@@ -589,22 +623,32 @@ def apply_frame_and_patch_artifacts(image: np.ndarray, settings: ArtifactSetting
             settings.occlusion_min_frac,
             settings.occlusion_max_frac,
             settings.occlusion_mode,
+            regions=occluded_regions,
         )
     return out
 
 
-def _transform_sample(transform, image: np.ndarray, sample: SourceSample):
+def _transform_sample(transform, image: np.ndarray, sample: SourceSample, *, horizontal_flip_prob=0.0, flip_idx=()):
     objects = sample.objects
     bboxes = [obj.bbox for obj in objects]
     classes = [obj.class_id for obj in objects]
     original_keypoint_counts = [len(obj.keypoints) for obj in objects]
+    mirrored = random.random() < _prob(horizontal_flip_prob)
+    if mirrored:
+        image = np.ascontiguousarray(image[:, ::-1])
+        bboxes = [[1.0-box[0], *box[1:]] for box in bboxes]
     original_vis: list[int] = []
     original_keypoints: list[tuple[float, float]] = []
     object_kp_offsets: list[int] = []
     running_offset = 0
     for obj in objects:
         object_kp_offsets.append(running_offset)
-        for kx, ky, kv in obj.keypoints:
+        points = obj.keypoints
+        if mirrored and points:
+            if len(flip_idx) != len(points):
+                raise DatasetAugmentorCoreError("Missing or mismatched flip_idx for pose mirroring")
+            points = [(image.shape[1]-1-points[i][0], points[i][1], points[i][2]) for i in flip_idx]
+        for kx, ky, kv in points:
             original_keypoints.append((kx, ky))
             original_vis.append(kv)
         running_offset += len(obj.keypoints)
@@ -643,7 +687,7 @@ def _transform_sample(transform, image: np.ndarray, sample: SourceSample):
                 continue
             kx_px, ky_px = aug_keypoints[flat_idx]
             original_visibility = original_vis[flat_idx] if flat_idx < len(original_vis) else 0
-            in_frame = (0.0 <= float(kx_px) <= float(aug_w)) and (0.0 <= float(ky_px) <= float(aug_h))
+            in_frame = (0.0 <= float(kx_px) < float(aug_w)) and (0.0 <= float(ky_px) < float(aug_h))
             vis_flat.append(0 if int(original_visibility) == 0 or not in_frame else int(original_visibility))
             keypoints_flat.append((float(kx_px), float(ky_px)))
     return aug_img, aug_boxes, aug_classes, keypoints_flat, vis_flat, keypoint_counts
@@ -675,12 +719,17 @@ def _pick_source(
     recipe: AugmentationRecipe,
 ) -> Optional[SourceSample]:
     candidates: list[SourceSample] = []
-    weights: list[int] = []
+    weights: list[float] = []
+    availability = defaultdict(int)
+    for sample in samples:
+        if per_source_aug_count[sample.image_path] < int(recipe.max_augs_per_source_image):
+            for c in {obj.class_id for obj in sample.objects}:
+                availability[c] += 1
     for sample in samples:
         if per_source_aug_count[sample.image_path] >= int(recipe.max_augs_per_source_image):
             continue
         present = {obj.class_id for obj in sample.objects}.intersection(augment_classes)
-        weight = sum(need.get(class_id, 0) for class_id in present)
+        weight = sum(need.get(class_id, 0) / max(1, availability[class_id]) for class_id in present)
         if weight > 0:
             candidates.append(sample)
             weights.append(weight)
@@ -701,6 +750,8 @@ def _write_previews(
     output_root: Path,
     preview_dir: Path,
     preview_count: int,
+    *,
+    metadata=None,
 ) -> None:
     if not augmented_image_paths or int(preview_count) <= 0:
         return
@@ -717,7 +768,23 @@ def _write_previews(
         boxes = [obj.bbox for obj in objects]
         classes = [obj.class_id for obj in objects]
         preview = _draw_boxes(image, boxes, classes)
-        cv2.imwrite(str(preview_dir / f"{image_path.stem}_preview.jpg"), preview)
+        for obj in objects:
+            names_by_class = (metadata or {}).get("kpt_names", {})
+            names = names_by_class.get(obj.class_id, names_by_class.get(str(obj.class_id), []))
+            for edge in (metadata or {}).get("skeleton", []):
+                if len(edge) == 2 and all(isinstance(i, int) and 0 <= i < len(obj.keypoints) for i in edge):
+                    a, b = [obj.keypoints[i] for i in edge]
+                    if a[2] and b[2]:
+                        cv2.line(preview, (round(a[0]), round(a[1])), (round(b[0]), round(b[1])), (200, 200, 0), 1)
+            for i, (x, y, visible) in enumerate(obj.keypoints):
+                if visible:
+                    color = (0, 220, 0) if visible == 2 else (0, 170, 255)
+                    cv2.circle(preview, (round(x), round(y)), 4, color, -1 if visible == 2 else 1)
+                    name = names[i] if i < len(names) else str(i)
+                    cv2.putText(preview, f"{i}:{name}", (round(x)+5, round(y)-5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+        if not cv2.imwrite(str(preview_dir / f"{image_path.stem}_preview.jpg"), preview):
+            raise DatasetAugmentorCoreError("Preview image write failed")
 
 
 def _draw_boxes(image_bgr: np.ndarray, boxes: Sequence[Sequence[float]], classes: Sequence[int]) -> np.ndarray:
@@ -813,11 +880,15 @@ def _apply_occlusions(
     min_frac: float,
     max_frac: float,
     mode: str,
+    *,
+    regions=None,
 ) -> np.ndarray:
     out = image.copy()
     modes = ["black", "gray", "noise"] if mode == "random" else [mode]
     for _ in range(max(1, int(count))):
         x1, y1, x2, y2 = _patch_bounds(out.shape, min_frac, max_frac)
+        if regions is not None:
+            regions.append((x1, y1, x2, y2))
         selected = random.choice(modes)
         if selected == "black":
             fill = np.zeros_like(out[y1:y2, x1:x2])

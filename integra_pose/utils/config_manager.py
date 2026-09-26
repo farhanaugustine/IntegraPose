@@ -383,7 +383,7 @@ class ConfigManager:
 
         Class name retained as PoseClusteringConfig for backward
         compatibility with saved config files; the in-app tab is named
-        Behavior Clustering (VAE + HMM).
+        Behavior Clustering.
         """
         def __init__(self):
             self.umap_neighbors_var = tk.StringVar(value="15")
@@ -557,6 +557,10 @@ class ConfigManager:
                         else:
                             serialized_rois = section_obj.webcam_rois if hasattr(section_obj, 'webcam_rois') else {}
                         config_data[section_name][var_name] = serialized_rois
+        from integra_pose.discovery.bridge import capture_project
+        discovery = capture_project(self.app)
+        if discovery:
+            config_data['tab7_discovery'] = discovery
         return config_data
 
     def _migrate_project_payload(self, payload):
@@ -627,6 +631,8 @@ class ConfigManager:
                     ),
                     "WARNING",
                 )
+        from integra_pose.discovery.bridge import restore_project
+        restore_project(self.app, config_data.get('tab7_discovery'))
         skeleton_needs_refresh = False
         webcam_payload = config_data.get("webcam") if isinstance(config_data, dict) else None
         has_webcam_rois = isinstance(webcam_payload, dict) and "webcam_rois" in webcam_payload
@@ -694,9 +700,9 @@ class ConfigManager:
         self._call_app_method("_on_webcam_roi_source_mode_change")
         self._call_app_method("update_status", "Project loaded successfully.")
 
-    def open_project(self):
+    def open_project(self, path=None):
         """Opens a file dialog to load a project file."""
-        path = filedialog.askopenfilename(
+        path = path or filedialog.askopenfilename(
             title="Open Project File",
             filetypes=[("YOLO GUI Project", "*.json"), ("All files", "*.*")],
             parent=self._get_app_attr('root')
@@ -719,6 +725,9 @@ class ConfigManager:
         if not self.project_file_path:
             return self.save_project_as()
         else:
+            previous_discovery = None
+            discovery = None
+            project_written = False
             try:
                 roi_manager = self._get_app_attr('roi_manager')
                 if roi_manager and hasattr(roi_manager, 'to_serializable'):
@@ -731,15 +740,25 @@ class ConfigManager:
                 self._call_app_method("update_skeleton")
                 # Always gather fresh config after syncing UI; ignore any stale payloads.
                 config_data = self._gather_config_as_dict()
+                previous_discovery = config_data.get('tab7_discovery')
+                from integra_pose.discovery.bridge import capture_project, commit_project
+                discovery = capture_project(self.app, self.project_file_path)
+                if discovery:
+                    config_data['tab7_discovery'] = discovery
                 from integra_pose.utils.safe_io import safe_write_json
 
                 safe_write_json(self.project_file_path, config_data, indent=4)
+                project_written = True
+                commit_project(self.app, discovery)
                 self._call_app_method("update_status", f"Project saved to {os.path.basename(self.project_file_path)}")
                 return OperationResult.success(
                     "Project saved successfully.",
                     project_path=str(self.project_file_path),
                 )
             except Exception as e:
+                from integra_pose.discovery.bridge import rollback_project_copy
+                if not project_written:
+                    rollback_project_copy(previous_discovery, discovery)
                 messagebox.showerror("Save Error", f"Failed to save project file:\n{e}", parent=self._get_app_attr('root'))
                 return OperationResult.failure("Project save failed.", error=str(e))
 

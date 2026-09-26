@@ -154,15 +154,13 @@ class ClusterNamingDialog(tk.Toplevel):
             return [c.namespaced_label for c in signal_report.candidates]
         # Fallback: collect from bouts, sort alphabetically for stability.
         labels = set()
+        from .labels import parse_bout_label
+
         for b in self._bouts:
-            try:
-                cid = int(b.get("class_id", -1))
-                sid_raw = b.get("state")
-                sid = int(sid_raw)
-            except Exception:
+            parsed = parse_bout_label(b)
+            if parsed is None:
                 continue
-            if sid < 0:
-                continue  # noise
+            cid, sid = parsed
             labels.add(f"{cid}:{sid}")
         return sorted(labels)
 

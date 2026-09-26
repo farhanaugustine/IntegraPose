@@ -1,0 +1,162 @@
+name: Validate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-compatibility:
+    name: Package and import (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11']
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            setup.cfg
+
+      - name: Install validation tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "setuptools>=68" wheel "build==1.2.2.post1" "pytest==8.3.3"
+
+      - name: Enforce the supported interpreter range
+        run: |
+          python - <<'PY'
+          import sys
+
+          version = sys.version_info[:2]
+          assert (3, 10) <= version < (3, 12), f"Unsupported CI interpreter: {version}"
+          PY
+
+      - name: Compile package and tests
+        run: python -m compileall -q -f integra_pose tests
+
+      - name: Validate declared installation contract
+        run: >-
+          python -m pytest -q
+          tests/test_installation_contract.py
+          tests/test_packaging_metadata.py
+
+      - name: Build wheel and source distribution
+        run: python -m build --wheel --sdist
+
+      - name: Install wheel without optional runtime stacks
+        run: python -m pip install --no-deps --force-reinstall dist/*.whl
+
+      - name: Validate installed metadata, entry points, and lazy import
+        run: |
+          python -I - <<'PY'
+          from importlib import metadata
+
+          import integra_pose
+          import integra_pose.logic.plugin_api
+          import integra_pose.plugins.plugin_zone_counter
+
+          distribution = metadata.distribution("IntegraPose")
+          requires_python = distribution.metadata["Requires-Python"]
+          declared_range = {part.strip() for part in requires_python.split(",")}
+          assert declared_range == {">=3.10", "<3.12"}
+          assert integra_pose.__version__ == distribution.version
+
+          console_scripts = {
+              entry.name: entry.value
+              for entry in distribution.entry_points
+              if entry.group == "console_scripts"
+          }
+          expected = {
+              "IntegraPose": "integra_pose.__main__:main",
+              "integrapose": "integra_pose.__main__:main",
+              "integrapose-gui": "integra_pose.__main__:main",
+          }
+          assert {name: console_scripts.get(name) for name in expected} == expected
+          PY
+
+  scientific-core:
+    name: Scientific and core regression suite (Python 3.11)
+    runs-on: ubuntu-latest
+    env:
+      MPLBACKEND: Agg
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: .github/requirements-scientific-core.txt
+
+      - name: Install the headless-safe scientific test stack
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r .github/requirements-scientific-core.txt
+
+      - name: Verify excluded dependency stacks are absent
+        run: |
+          python - <<'PY'
+          import re
+          from importlib import metadata
+
+          normalize = lambda value: re.sub(r"[-_.]+", "-", value).lower()
+          installed = {
+              normalize(distribution.metadata["Name"])
+              for distribution in metadata.distributions()
+              if distribution.metadata.get("Name")
+          }
+          blocked = {
+              "opencv-python-headless",
+              "roboflow",
+              "torch",
+              "torchvision",
+              "ultralytics",
+          }
+          assert blocked.isdisjoint(installed), sorted(blocked & installed)
+          assert "opencv-python" in installed
+          assert "supervision" in installed
+          PY
+
+      - name: Run scientific and core regression tests
+        run: |
+          python -m pytest -q \
+            tests/test_dataset_split.py \
+            tests/test_frame_transfer.py \
+            tests/test_operation_results.py \
+            tests/test_config_manager.py \
+            tests/test_project_save_outcomes.py \
+            tests/test_repro_bundle_security.py \
+            tests/test_yolo_pose_label_contract.py \
+            tests/test_hmm_feature_vectors.py \
+            tests/test_bout_review.py \
+            tests/test_bout_analyzer_bout_logic.py \
+            tests/test_bout_analyzer_roi_memberships.py \
+            tests/test_analytics_service.py \
+            tests/test_analytics_roi_sources.py \
+            tests/test_batch_preflight.py \
+            tests/test_batch_pipeline_cancellation.py \
+            tests/test_batch_processing_service_outcomes.py \
+            tests/test_batch_resume_outcomes.py \
+            tests/test_batch_exporter_reviewed_bouts.py \
+            tests/test_group_stats_scientific_units.py \
+            tests/test_gait_scientific_contracts.py \
+            tests/test_fura_scientific_contracts.py

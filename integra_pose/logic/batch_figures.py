@@ -178,27 +178,33 @@ def _apply_publication_theme() -> None:
     sns.set_theme(style="whitegrid", context="paper")
     plt.rcParams.update(
         {
-            "axes.spines.top": False,
-            "axes.spines.right": False,
+            "axes.spines.top": True,
+            "axes.spines.right": True,
             "axes.spines.left": True,
             "axes.spines.bottom": True,
-            "axes.edgecolor": "#374151",
-            "axes.linewidth": 0.9,
-            "axes.titlesize": 16,
-            "axes.labelsize": 12.5,
+            "axes.edgecolor": "#cccccc",
+            "axes.linewidth": 0.8,
+            "axes.titlesize": 13,
+            "axes.labelsize": 11,
             "axes.titlepad": 12,
             "xtick.labelsize": 10.5,
             "ytick.labelsize": 10.5,
             "legend.fontsize": 9.5,
             "legend.title_fontsize": 10,
-            "figure.titlesize": 17,
+            "figure.titlesize": 16,
             "font.family": "DejaVu Sans",
             "font.weight": "regular",
             "figure.dpi": 160,
-            "grid.color": "#d7dde6",
-            "grid.linestyle": ":",
-            "grid.linewidth": 0.75,
-            "axes.facecolor": "#fbfcfe",
+            "grid.color": "#d9d9d9",
+            "grid.linestyle": "-",
+            "grid.linewidth": 0.8,
+            "axes.facecolor": "white",
+            "figure.facecolor": "white",
+            "axes.axisbelow": True,
+            "text.color": "#333333",
+            "axes.labelcolor": "#333333",
+            "xtick.color": "#444444",
+            "ytick.color": "#444444",
             "savefig.transparent": False,
         }
     )
@@ -493,7 +499,7 @@ def _render_dashboard_module_panel(
         plot_df = work[work["comparison_label"] == top_label].copy()
         plot_df[metric_column] = _coerce_numeric(plot_df[metric_column])
         plot_df = plot_df.dropna(subset=[metric_column])
-        sns.boxplot(data=plot_df, x=group_col, y=metric_column, ax=ax, color="#dbeafe", showfliers=False)
+        sns.boxplot(data=plot_df, x=group_col, y=metric_column, ax=ax, color="#b3cde3", showfliers=False)
         sns.stripplot(data=plot_df, x=group_col, y=metric_column, ax=ax, color="#0f172a", alpha=0.75, size=5)
         ax.axhline(0.0, color="#334155", linewidth=1.0, linestyle="--")
         ax.set_title(f"Preference: {_wrap_label(str(top_label), width=28)}", loc="left", fontweight="bold")
@@ -512,7 +518,7 @@ def _render_dashboard_module_panel(
             work = work[work[entity_col].astype(str) == top_entity].copy()
         work[metric_column] = _coerce_numeric(work[metric_column])
         work = work.dropna(subset=[metric_column])
-        sns.boxplot(data=work, x=group_col, y=metric_column, ax=ax, color="#fde68a", showfliers=False)
+        sns.boxplot(data=work, x=group_col, y=metric_column, ax=ax, color="#fed9a6", showfliers=False)
         sns.stripplot(data=work, x=group_col, y=metric_column, ax=ax, color="#92400e", alpha=0.75, size=5)
         ax.set_title("Latency summary", loc="left", fontweight="bold")
         ax.set_xlabel("Group")
@@ -1067,7 +1073,7 @@ def _draw_spatial_context(
     if background is not None:
         ax.imshow(background, origin="upper", zorder=0)
     else:
-        ax.set_facecolor("#f8fafc")
+        ax.set_facecolor("white")
 
     roi_polygons = _normalise_named_polygons(context.get("roi_polygons", {}))
     object_polygons = _normalise_named_polygons(context.get("object_polygons", {}))
@@ -1539,6 +1545,7 @@ def _render_object_interaction_figure(
     )
 
 
+@plt.rc_context()
 def render_video_quicklook_bundle(
     video_result: dict[str, Any],
     *,
@@ -1911,7 +1918,7 @@ def _render_group_distribution_plots(
             y="__group_label__",
             x=metric,
             ax=ax,
-            color="#dbeafe",
+            color="#b3cde3",
             width=0.55,
             showfliers=False,
             order=display_order,
@@ -1949,7 +1956,7 @@ def _render_group_distribution_plots(
         ax.set_ylabel(_display_label(group_col))
         ax.set_yticks(np.arange(len(display_order)))
         ax.set_yticklabels([_wrap_label(label, width=18) for label in display_order])
-        ax.legend(frameon=False, loc="lower right")
+        ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(1.02, 1.0))
         fig.tight_layout()
 
         base_path = output_dir / f"{_slugify(metric)}_by_{_slugify(group_col)}"
@@ -3080,6 +3087,7 @@ def _build_assay_figure_index(
     return out
 
 
+@plt.rc_context()
 def export_batch_figure_bundle(
     *,
     video_summary_df: pd.DataFrame,

@@ -1,17 +1,12 @@
 from __future__ import annotations
 
-import inspect
 import os
-import random
-import shutil
 import subprocess
 import threading
 import traceback
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Optional
 
-import cv2
-import numpy as np
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -26,7 +21,11 @@ from integra_pose.plugins.plugin_dataset_augmentor_lab.core import (
     DomainShiftSettings,
     TransformSettings,
     run_augmentation,
+    parse_class_set,
 )
+
+
+from .dataset_io import load_metadata
 
 
 class DatasetAugmentorLabUIError(DatasetAugmentorCoreError):
@@ -91,7 +90,7 @@ class DatasetAugmentorLabWindow(tk.Toplevel):
             "Output root:",
             self._output_root_var,
             lambda: self._browse_dir(self._output_root_var),
-            "Destination dataset folder. Leave blank to create a timestamped run under the dataset root.",
+            "Destination dataset folder. Leave blank to create a timestamped sibling folder next to the dataset root.",
         )
 
         options = ttk.Notebook(root)
@@ -126,9 +125,10 @@ class DatasetAugmentorLabWindow(tk.Toplevel):
     def _init_vars(self) -> None:
         self._dataset_root_var = tk.StringVar()
         self._output_root_var = tk.StringVar()
-        self._split_var = tk.StringVar(value="all")
+        self._split_var = tk.StringVar(value="train")
         self._plan_var = tk.StringVar(value="balance")
         self._add_count_var = tk.StringVar(value="1000")
+        self._target_total_var = tk.StringVar(value="40000")
         self._target_ratio_var = tk.StringVar(value="1.0")
         self._add_per_class_var = tk.StringVar(value="200")
         self._multiplier_var = tk.StringVar(value="1.5")
@@ -184,17 +184,17 @@ class DatasetAugmentorLabWindow(tk.Toplevel):
             0,
             "Plan:",
             self._plan_var,
-            ("balance", "add", "scale", "balance_add", "balance_scale", "random"),
+            ("target_total", "balance", "add", "scale", "balance_add", "balance_scale", "random"),
             "How to choose source images and decide how many labeled instances to add per class.",
         )
-        self._entry_row(tab, 0, 2, "Split:", self._split_var, "Use 'all' or a split folder name such as train, val, or test.")
-        self._entry_row(tab, 1, 0, "Random sample count:", self._add_count_var, "Used by the random plan as the approximate number of augmented samples to create.")
+        self._entry_row(tab, 0, 2, "Split:", self._split_var, "Choose train, val, test, all, or a custom split. Unselected splits are copied unchanged. Keep an untouched holdout for evaluation.")
+        self._entry_row(tab, 1, 0, "Random sample count:", self._add_count_var, "Random-plan object quotas; use target_total for an exact final image count.")
         self._entry_row(tab, 1, 2, "Target ratio:", self._target_ratio_var, "For balance plans, target each selected class to this fraction of the largest class.")
         self._entry_row(tab, 2, 0, "Add per class:", self._add_per_class_var, "For add plans, add this many labeled instances for each selected class.")
         self._entry_row(tab, 2, 2, "Multiplier:", self._multiplier_var, "For scale plans, grow each selected class to original count times this multiplier.")
         self._entry_row(tab, 3, 0, "Include classes:", self._include_classes_var, "Comma-separated class IDs to augment, or 'all'.")
         self._entry_row(tab, 3, 2, "Exclude classes:", self._exclude_classes_var, "Comma-separated class IDs to leave unchanged.")
-        self._entry_row(tab, 4, 0, "Preview count:", self._preview_count_var, "Number of augmented preview images to save with boxes drawn.")
+        self._entry_row(tab, 4, 0, "Preview count:", self._preview_count_var, "Number of previews showing boxes and named keypoints; optional YAML skeleton edges are drawn.")
         self._entry_row(tab, 4, 2, "Max total augments:", self._max_total_augs_var, "Hard cap on generated augmented samples for this run.")
         self._entry_row(tab, 5, 0, "Max per source:", self._max_augs_per_source_image_var, "Prevents one source image from dominating the augmented dataset.")
         self._entry_row(tab, 5, 2, "Min box visibility:", self._min_visibility_var, "Minimum bbox visibility Albumentations requires before keeping a transformed box.")
@@ -204,6 +204,13 @@ class DatasetAugmentorLabWindow(tk.Toplevel):
             row=6, column=2, columnspan=2, sticky="w", padx=(8, 0), pady=(8, 0)
         )
         self._attach_tooltip(copy_check, "Copy source images and labels into the output dataset before adding augmented samples.")
+        self._entry_row(tab, 7, 0, "Final image count:", self._target_total_var,
+                        "target_total only: total images across selected splits, including originals and backgrounds. Requires Copy originals.")
+        behavior_btn = ttk.Button(tab, text="Choose behaviors by name...", command=self._choose_behaviors)
+        behavior_btn.grid(row=7, column=2, columnspan=2, sticky="ew", padx=(8, 0), pady=4)
+        ttk.Label(tab, text="Train is the default. Other splits may be selected explicitly; derivatives stay with their source.",
+                  wraplength=850).grid(row=8, column=0, columnspan=4, sticky="w", pady=4)
+
 
     def _build_transform_tab(self, notebook: ttk.Notebook) -> None:
         tab = ttk.Frame(notebook, padding=10)
@@ -377,329 +384,41 @@ class DatasetAugmentorLabWindow(tk.Toplevel):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _run_augmentation_pipeline(self, job: Dict[str, object]) -> None:
+    def _choose_behaviors(self) -> None:
         try:
-            import albumentations as A
-        except Exception as exc:
-            raise DatasetAugmentorLabUIError(
-                "Albumentations is required for augmentation. Install it with: "
-                "python tools/install_albumentations_gui.py "
-                "(or manually: python -m pip install --no-deps -r requirements-albumentations-gui.txt)"
-            ) from exc
-
-        dataset_root = Path(job["dataset_root"])
-        if not dataset_root.exists():
-            raise DatasetAugmentorLabUIError(f"Dataset root not found: {dataset_root}")
-
-        output_raw = str(job["output_raw"])
-        output_root = Path(output_raw) if output_raw else Path(f"{dataset_root}_augmented")
-        add_count = int(job["add_count"])
-        copy_originals = bool(job["copy_originals"])
-        seed = int(job["seed"])
-        domain_shift = dict(job["domain_shift"])
-        random.seed(seed)
-
-        samples = self._discover_samples(dataset_root)
-        if not samples:
-            raise DatasetAugmentorLabUIError(
-                f"No samples found in {dataset_root}. Expected images/<split>/ and labels/<split>/ layout."
-            )
-        self.after(0, lambda: self._append_log(f"Discovered {len(samples)} source samples."))
-
-        transform = self._build_transform(A)
-        if copy_originals:
-            self._copy_originals(samples, output_root)
-            self.after(0, lambda: self._append_log("Copied original samples to output root."))
-
-        for i in range(add_count):
-            src_img, src_lbl, split_name = random.choice(samples)
-            img = cv2.imread(str(src_img))
-            if img is None:
-                continue
-            h, w = img.shape[:2]
-            objects = self._read_label_objects(src_lbl, img_w=w, img_h=h)
-            bboxes = [obj["bbox"] for obj in objects]
-            classes = [obj["class_id"] for obj in objects]
-            original_keypoint_counts = [len(obj["keypoints"]) for obj in objects]
-            original_vis: List[int] = []
-            original_keypoints: List[Tuple[float, float]] = []
-            # Pre-compute the (start, length) slice of the flat keypoint
-            # arrays that belongs to each input bbox. We need this when a
-            # bbox is dropped by the transform — we use it to drop the
-            # matching keypoints / visibility entries.
-            object_kp_offsets: List[int] = []
-            running_offset = 0
-            for obj_kp in (obj["keypoints"] for obj in objects):
-                object_kp_offsets.append(running_offset)
-                for kp in obj_kp:
-                    original_keypoints.append((kp[0], kp[1]))
-                    original_vis.append(kp[2])
-                running_offset += len(obj_kp)
-
-            box_indices = list(range(len(bboxes)))
-            result = transform(
-                image=img,
-                bboxes=bboxes,
-                class_labels=classes,
-                box_indices=box_indices,
-                keypoints=original_keypoints,
-            )
-            aug_img = result["image"]
-            aug_boxes = list(result["bboxes"])
-            aug_classes = list(result["class_labels"])
-            aug_keypoints = list(result["keypoints"])
-            surviving_box_indices = [int(idx) for idx in result.get("box_indices", [])]
-
-            aug_img = self._apply_domain_shift(aug_img, domain_shift)
-            aug_h, aug_w = aug_img.shape[:2]
-
-            # Rebuild parallel arrays keyed off which input bboxes survived
-            # the transform. Keypoints belonging to dropped bboxes are
-            # discarded; keypoints belonging to surviving bboxes keep their
-            # transformed coordinates and original visibility (which we
-            # reconcile against the post-transform image bounds below).
-            keypoint_counts: List[int] = []
-            vis_flat: List[int] = []
-            keypoints_flat: List[Tuple[float, float]] = []
-            for orig_idx in surviving_box_indices:
-                if orig_idx < 0 or orig_idx >= len(original_keypoint_counts):
-                    continue
-                start = object_kp_offsets[orig_idx]
-                count = original_keypoint_counts[orig_idx]
-                keypoint_counts.append(int(count))
-                for k in range(count):
-                    flat_idx = start + k
-                    if flat_idx >= len(aug_keypoints):
-                        # Albumentations should preserve length when
-                        # remove_invisible=False, but guard defensively.
-                        keypoints_flat.append((0.0, 0.0))
-                        vis_flat.append(0)
-                        continue
-                    kx_px, ky_px = aug_keypoints[flat_idx]
-                    original_visibility = (
-                        original_vis[flat_idx] if flat_idx < len(original_vis) else 0
-                    )
-                    # P0-C1: a keypoint that landed outside the augmented
-                    # frame must be flagged invisible. Original code clipped
-                    # x/y but kept visibility=2, which is a lie about what
-                    # the model is being asked to learn.
-                    in_frame = (0.0 <= float(kx_px) <= float(aug_w)) and (
-                        0.0 <= float(ky_px) <= float(aug_h)
-                    )
-                    if int(original_visibility) == 0 or not in_frame:
-                        new_visibility = 0
-                    else:
-                        new_visibility = int(original_visibility)
-                    keypoints_flat.append((float(kx_px), float(ky_px)))
-                    vis_flat.append(new_visibility)
-
-            if len(surviving_box_indices) != len(box_indices):
-                dropped = len(box_indices) - len(surviving_box_indices)
-                self.after(
-                    0,
-                    lambda idx=i, d=dropped: self._append_log(
-                        f"[WARN] Sample {idx}: {d} bbox(es) dropped by augmentation; "
-                        f"associated keypoints removed in lockstep."
-                    ),
-                )
-
-            out_img_dir = output_root / "images" / split_name
-            out_lbl_dir = output_root / "labels" / split_name
-            out_img_dir.mkdir(parents=True, exist_ok=True)
-            out_lbl_dir.mkdir(parents=True, exist_ok=True)
-
-            out_name = f"{src_img.stem}_aug_{i:06d}{src_img.suffix}"
-            out_img_path = out_img_dir / out_name
-            out_lbl_path = out_lbl_dir / f"{Path(out_name).stem}.txt"
-            cv2.imwrite(str(out_img_path), aug_img)
-            self._write_label_objects(
-                out_lbl_path,
-                boxes=aug_boxes,
-                classes=aug_classes,
-                keypoints=aug_keypoints,
-                vis_flat=vis_flat,
-                keypoint_counts=keypoint_counts,
-                img_w=aug_img.shape[1],
-                img_h=aug_img.shape[0],
-            )
-            if i % 25 == 0 or i == add_count - 1:
-                self.after(0, lambda idx=i + 1, total=add_count: self._progress_var.set(f"Generated {idx}/{total} samples"))
-
-        self.after(0, lambda: self._append_log(f"Augmentation complete. Output: {output_root}"))
-        self.after(0, lambda: messagebox.showinfo("Dataset Augmentor Lab", f"Augmentation complete.\n{output_root}", parent=self))
-
-    def _discover_samples(self, dataset_root: Path) -> List[Tuple[Path, Path, str]]:
-        images_root = dataset_root / "images"
-        labels_root = dataset_root / "labels"
-        if not images_root.exists() or not labels_root.exists():
-            return []
-        out: List[Tuple[Path, Path, str]] = []
-        for split_dir in sorted(images_root.iterdir()):
-            if not split_dir.is_dir():
-                continue
-            split = split_dir.name
-            label_split_dir = labels_root / split
-            for pattern in ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp"):
-                for img_path in split_dir.glob(pattern):
-                    lbl_path = label_split_dir / f"{img_path.stem}.txt"
-                    out.append((img_path, lbl_path, split))
-        return out
-
-    def _copy_originals(self, samples: Sequence[Tuple[Path, Path, str]], output_root: Path) -> None:
-        for src_img, src_lbl, split in samples:
-            out_img_dir = output_root / "images" / split
-            out_lbl_dir = output_root / "labels" / split
-            out_img_dir.mkdir(parents=True, exist_ok=True)
-            out_lbl_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_img, out_img_dir / src_img.name)
-            if src_lbl.exists():
-                shutil.copy2(src_lbl, out_lbl_dir / src_lbl.name)
-
-    def _build_transform(self, A):
-        noise_kwargs = {"p": 0.2}
-        if "var_limit" in inspect.signature(A.GaussNoise).parameters:
-            noise_kwargs["var_limit"] = (10.0, 50.0)
-        return A.Compose(
-            [
-                A.HorizontalFlip(p=0.5),
-                A.Affine(scale=(0.8, 1.2), translate_percent=(0.0, 0.1), rotate=(-15, 15), shear=(-10, 10), p=0.85),
-                A.GaussNoise(**noise_kwargs),
-            ],
-            # Pass a parallel `box_indices` field so we can identify *which*
-            # bboxes survived a transform. Without this, when Albumentations
-            # drops a bbox (e.g. translated entirely off-frame), we have no
-            # way to know which input bbox went away — and thus which
-            # keypoints / visibility flags belong to the dropped object.
-            bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels", "box_indices"], min_visibility=0.0),
-            keypoint_params=A.KeypointParams(format="xy", remove_invisible=False),
-        )
-
-    def _apply_domain_shift(self, image: np.ndarray, domain_shift: Dict[str, object]) -> np.ndarray:
-        out = image
-        if bool(domain_shift.get("white_mouse")):
-            intensity = float(domain_shift.get("invert_intensity", 1.0))
-            hsv = cv2.cvtColor(out, cv2.COLOR_BGR2HSV)
-            h, s, v = cv2.split(hsv)
-            inv_v = 255 - v
-            v_final = cv2.addWeighted(inv_v, intensity, v, 1.0 - intensity, 0) if intensity < 1.0 else inv_v
-            out = cv2.cvtColor(cv2.merge([h, s, v_final]), cv2.COLOR_HSV2BGR)
-        if bool(domain_shift.get("red_light")):
-            red_boost = float(domain_shift.get("red_boost", 1.5))
-            bg_suppress = float(domain_shift.get("bg_suppress", 0.2))
-            b, g, r = cv2.split(out)
-            r = np.clip(r.astype(np.float32) * red_boost, 0, 255).astype(np.uint8)
-            g = np.clip(g.astype(np.float32) * bg_suppress, 0, 255).astype(np.uint8)
-            b = np.clip(b.astype(np.float32) * bg_suppress, 0, 255).astype(np.uint8)
-            out = cv2.merge([b, g, r])
-        if bool(domain_shift.get("bw")):
-            bw_prob = float(domain_shift.get("bw_prob", 0.5))
-            if random.random() < max(0.0, min(1.0, bw_prob)):
-                gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
-                out = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        return out
-
-    def _sanitize_yolo_bbox(self, cx: float, cy: float, bw: float, bh: float) -> List[float]:
-        eps = float(self._BBOX_EPSILON)
-
-        cx = float(np.clip(cx, 0.0, 1.0))
-        cy = float(np.clip(cy, 0.0, 1.0))
-        bw = float(np.clip(bw, 0.0, 1.0))
-        bh = float(np.clip(bh, 0.0, 1.0))
-
-        x1 = max(0.0, min(1.0, cx - (bw / 2.0)))
-        y1 = max(0.0, min(1.0, cy - (bh / 2.0)))
-        x2 = max(0.0, min(1.0, cx + (bw / 2.0)))
-        y2 = max(0.0, min(1.0, cy + (bh / 2.0)))
-
-        if x2 <= x1:
-            midpoint = float(np.clip((x1 + x2) / 2.0, eps, 1.0 - eps))
-            x1 = max(0.0, midpoint - eps)
-            x2 = min(1.0, midpoint + eps)
-        if y2 <= y1:
-            midpoint = float(np.clip((y1 + y2) / 2.0, eps, 1.0 - eps))
-            y1 = max(0.0, midpoint - eps)
-            y2 = min(1.0, midpoint + eps)
-
-        if x1 <= 0.0:
-            x1 = eps
-        if y1 <= 0.0:
-            y1 = eps
-        if x2 >= 1.0:
-            x2 = 1.0 - eps
-        if y2 >= 1.0:
-            y2 = 1.0 - eps
-
-        x1 = min(x1, x2 - eps)
-        y1 = min(y1, y2 - eps)
-
-        safe_cx = float(np.clip((x1 + x2) / 2.0, 0.0, 1.0))
-        safe_cy = float(np.clip((y1 + y2) / 2.0, 0.0, 1.0))
-        safe_bw = float(np.clip(x2 - x1, eps, 1.0))
-        safe_bh = float(np.clip(y2 - y1, eps, 1.0))
-        return [safe_cx, safe_cy, safe_bw, safe_bh]
-
-    def _read_label_objects(self, label_path: Path, *, img_w: int, img_h: int) -> List[Dict[str, object]]:
-        objects: List[Dict[str, object]] = []
-        if not label_path.exists():
-            return objects
-        for line in label_path.read_text(encoding="utf-8").splitlines():
-            parts = line.strip().split()
-            if len(parts) < 5:
-                continue
-            try:
-                class_id = int(float(parts[0]))
-                cx, cy, bw, bh = map(float, parts[1:5])
-            except Exception:
-                continue
-            kp_payload = parts[5:]
-            keypoints: List[Tuple[float, float, int]] = []
-            if kp_payload and len(kp_payload) % 3 == 0:
-                for idx in range(0, len(kp_payload), 3):
-                    try:
-                        kx = float(kp_payload[idx]) * img_w
-                        ky = float(kp_payload[idx + 1]) * img_h
-                        kv = int(float(kp_payload[idx + 2]))
-                    except Exception:
-                        kx, ky, kv = 0.0, 0.0, 0
-                    keypoints.append((kx, ky, kv))
-            safe_bbox = self._sanitize_yolo_bbox(cx, cy, bw, bh)
-            objects.append({"class_id": class_id, "bbox": safe_bbox, "keypoints": keypoints})
-        return objects
-
-    def _write_label_objects(
-        self,
-        output_path: Path,
-        *,
-        boxes: Sequence[Sequence[float]],
-        classes: Sequence[int],
-        keypoints: Sequence[Sequence[float]],
-        vis_flat: Sequence[int],
-        keypoint_counts: Sequence[int],
-        img_w: int,
-        img_h: int,
-    ) -> None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        kp_idx = 0
-        vis_idx = 0
-        lines: List[str] = []
-        for obj_idx, box in enumerate(boxes):
-            cls = int(classes[obj_idx]) if obj_idx < len(classes) else 0
-            cx, cy, bw, bh = self._sanitize_yolo_bbox(*[float(v) for v in box[:4]])
-            row = [f"{cls}", f"{cx:.8f}", f"{cy:.8f}", f"{bw:.8f}", f"{bh:.8f}"]
-            kp_count = int(keypoint_counts[obj_idx]) if obj_idx < len(keypoint_counts) else 0
-            for _ in range(max(0, kp_count)):
-                if kp_idx < len(keypoints):
-                    kx_px, ky_px = keypoints[kp_idx]
-                    kx = max(0.0, min(1.0, float(kx_px) / max(img_w, 1)))
-                    ky = max(0.0, min(1.0, float(ky_px) / max(img_h, 1)))
-                    kv = int(vis_flat[vis_idx]) if vis_idx < len(vis_flat) else 2
-                    row.extend([f"{kx:.6f}", f"{ky:.6f}", str(kv)])
-                    kp_idx += 1
-                    vis_idx += 1
-                else:
-                    row.extend(["0.000000", "0.000000", "0"])
-            lines.append(" ".join(row))
-        output_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+            metadata = load_metadata(Path(self._dataset_root_var.get().strip()))
+            names = metadata.get("names")
+            if not names:
+                raise ValueError("Choose a dataset with a YAML containing behavior names first.")
+            included = parse_class_set(self._include_classes_var.get())
+            excluded = parse_class_set(self._exclude_classes_var.get()) or set()
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Choose behaviors", str(exc), parent=self)
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("Behaviors to augment")
+        dialog.transient(self)
+        dialog.geometry("440x460")
+        body = ttk.Frame(dialog, padding=10)
+        body.pack(fill="both", expand=True)
+        _, content = create_scrollable_section(dialog, body)
+        variables = {}
+        for class_id, name in names.items():
+            value = (included is None or class_id in included) and class_id not in excluded
+            variable = tk.BooleanVar(value=value)
+            variables[class_id] = variable
+            ttk.Checkbutton(content, text=f"{class_id}: {name}", variable=variable).pack(anchor="w", pady=3)
+        actions = ttk.Frame(dialog, padding=8)
+        actions.pack(fill="x")
+        def apply():
+            selected = [str(i) for i, variable in variables.items() if variable.get()]
+            self._include_classes_var.set(",".join(selected) if selected else "none")
+            self._exclude_classes_var.set("")
+            dialog.destroy()
+        ttk.Button(actions, text="All", command=lambda: [v.set(True) for v in variables.values()]).pack(side="left")
+        ttk.Button(actions, text="None", command=lambda: [v.set(False) for v in variables.values()]).pack(side="left")
+        ttk.Button(actions, text="Apply", command=apply).pack(side="right")
+        dialog.grab_set()
 
     def _collect_recipe(self) -> AugmentationRecipe:
         dataset_raw = self._dataset_root_var.get().strip()
@@ -711,11 +430,12 @@ class DatasetAugmentorLabWindow(tk.Toplevel):
             return AugmentationRecipe(
                 dataset_root=Path(dataset_raw),
                 output_root=Path(output_raw) if output_raw else None,
-                split=self._split_var.get().strip() or "all",
+                split=self._split_var.get().strip() or "train",
                 copy_originals=bool(self._copy_originals_var.get()),
                 seed=self._int_var(self._seed_var, "Seed", minimum=0),
                 plan=self._plan_var.get().strip() or "balance",
                 add_count=self._int_var(self._add_count_var, "Random sample count", minimum=1),
+                target_total_images=self._int_var(self._target_total_var, "Final image count", minimum=1),
                 target_ratio=self._float_var(self._target_ratio_var, "Target ratio", minimum=0.000001, maximum=1.0),
                 add_per_class=self._int_var(self._add_per_class_var, "Add per class", minimum=0),
                 multiplier=self._float_var(self._multiplier_var, "Multiplier", minimum=1.0),

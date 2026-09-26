@@ -29,7 +29,7 @@ class DiscoveredPlugin:
 
 
 class PluginController:
-    """Plugin discovery/launching and VAE+HMM toolkit management."""
+    """Plugin discovery/launching and Behavior Clustering toolkit management."""
 
     def __init__(self, app: Any, plugins_dir: Path | None = None, user_plugins_dir: Path | None = None):
         self.app = app
@@ -44,7 +44,7 @@ class PluginController:
         self._assisted_pose_curation_plugin = None
 
     def check_hmm_vae_dependencies(self) -> tuple[list[str], list[str]]:
-        required = ["torch", "sklearn", "hmmlearn", "pandas", "numpy", "umap", "hdbscan", "matplotlib"]
+        required = ["sklearn", "pandas", "numpy", "scipy", "cv2", "jsonschema", "umap", "hdbscan", "matplotlib"]
         present: list[str] = []
         missing: list[str] = []
         for mod in required:
@@ -63,7 +63,7 @@ class PluginController:
         return root if isinstance(root, tk.Misc) else None
 
     def launch_hmm_vae_toolkit(self) -> None:
-        """Launch the integrated VAE+HMM toolkit window."""
+        """Launch the integrated Behavior Clustering toolkit window."""
         with self._hmm_vae_lock:
             window = self._hmm_vae_window()
             if window is not None and window.winfo_exists():
@@ -75,9 +75,9 @@ class PluginController:
                 return
             missing, _present = self.check_hmm_vae_dependencies()
             if missing:
-                msg = "Missing dependencies for VAE + HMM toolkit:\n- " + "\n- ".join(missing)
+                msg = "Missing dependencies for Behavior Clustering toolkit:\n- " + "\n- ".join(missing)
                 self.app._toast(msg, level="error", duration_ms=3500)
-                messagebox.showerror("VAE + HMM Toolkit", msg, parent=self.app.root)
+                messagebox.showerror("Behavior Clustering Toolkit", msg, parent=self.app.root)
                 return
             toolkit_module = None
             toolkit_source = ""
@@ -87,9 +87,9 @@ class PluginController:
             except Exception:
                 toolkit_module = None
             if toolkit_module is None:
-                msg = "VAE + HMM toolkit files are missing from the install."
+                msg = "Behavior Clustering toolkit files are missing from the install."
                 self.app._toast(msg, level="error", duration_ms=4000)
-                messagebox.showerror("VAE + HMM Toolkit", msg, parent=self.app.root)
+                messagebox.showerror("Behavior Clustering Toolkit", msg, parent=self.app.root)
                 return
             try:
                 controller = toolkit_module.launch(self.app.root)
@@ -100,15 +100,15 @@ class PluginController:
                         win.bind("<Destroy>", lambda _e: self._clear_hmm_vae_controller(), add="+")
                     except Exception:
                         pass
-                self.app.log_message(f"Opened VAE + HMM segmentation toolkit ({toolkit_source}).", "INFO")
-                self.app._toast("Launched VAE + HMM toolkit.", level="info")
+                self.app.log_message(f"Opened Behavior Clustering segmentation toolkit ({toolkit_source}).", "INFO")
+                self.app._toast("Launched Behavior Clustering toolkit.", level="info")
             except ModuleNotFoundError as exc:
                 self.app._toast(f"Missing dependency: {exc}", level="error")
-                messagebox.showerror("VAE + HMM Toolkit", f"Missing dependency: {exc}", parent=self.app.root)
+                messagebox.showerror("Behavior Clustering Toolkit", f"Missing dependency: {exc}", parent=self.app.root)
             except Exception as exc:
-                self.app._toast(f"Failed to launch VAE + HMM toolkit: {exc}", level="error")
-                self.app.log_message(f"Failed to launch VAE + HMM toolkit: {exc}", "ERROR")
-                messagebox.showerror("VAE + HMM Toolkit", f"Failed to launch: {exc}", parent=self.app.root)
+                self.app._toast(f"Failed to launch Behavior Clustering toolkit: {exc}", level="error")
+                self.app.log_message(f"Failed to launch Behavior Clustering toolkit: {exc}", "ERROR")
+                messagebox.showerror("Behavior Clustering Toolkit", f"Failed to launch: {exc}", parent=self.app.root)
 
     def _clear_hmm_vae_controller(self) -> None:
         with self._hmm_vae_lock:

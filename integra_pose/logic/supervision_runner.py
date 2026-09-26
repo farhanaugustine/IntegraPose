@@ -1464,6 +1464,16 @@ class GridMetricsRecorder:
         if self._dwell_counts is None:
             return
         dwell_fig, dwell_ax = plt.subplots(figsize=(8, 6))
+        dwell_fig.set_facecolor('white')
+        dwell_ax.set_facecolor('white')
+        dwell_ax.set_axisbelow(True)
+        dwell_ax.spines[:].set_color('#cccccc')
+        dwell_ax.spines[:].set_linewidth(0.8)
+        dwell_ax.tick_params(colors='#444444', labelsize=10)
+        dwell_ax.xaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+        dwell_ax.yaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+        dwell_ax.title.set(size=13, color='#333333', family='DejaVu Sans')
+        dwell_ax.grid(False)
         dwell_values = self._dwell_counts / fps if fps and fps > 0 else self._dwell_counts
         base_unit = "seconds" if fps and fps > 0 else "frames"
         if self._dwell_unit_mode == "object":
@@ -1488,6 +1498,16 @@ class GridMetricsRecorder:
 
         if self._occupancy_counts is not None:
             occupancy_fig, occupancy_ax = plt.subplots(figsize=(8, 6))
+            occupancy_fig.set_facecolor('white')
+            occupancy_ax.set_facecolor('white')
+            occupancy_ax.set_axisbelow(True)
+            occupancy_ax.spines[:].set_color('#cccccc')
+            occupancy_ax.spines[:].set_linewidth(0.8)
+            occupancy_ax.tick_params(colors='#444444', labelsize=10)
+            occupancy_ax.xaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+            occupancy_ax.yaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+            occupancy_ax.title.set(size=13, color='#333333', family='DejaVu Sans')
+            occupancy_ax.grid(False)
             occupancy_values = self._occupancy_counts / fps if fps and fps > 0 else self._occupancy_counts
             occupancy_unit = "seconds" if fps and fps > 0 else "frames"
             extent = None
@@ -1526,6 +1546,16 @@ class GridMetricsRecorder:
                     dominant_grid[r, c] = behavior_idx[best_behavior]
 
         dom_fig, dom_ax = plt.subplots(figsize=(8, 6))
+        dom_fig.set_facecolor('white')
+        dom_ax.set_facecolor('white')
+        dom_ax.set_axisbelow(True)
+        dom_ax.spines[:].set_color('#cccccc')
+        dom_ax.spines[:].set_linewidth(0.8)
+        dom_ax.tick_params(colors='#444444', labelsize=10)
+        dom_ax.xaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+        dom_ax.yaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+        dom_ax.title.set(size=13, color='#333333', family='DejaVu Sans')
+        dom_ax.grid(False)
         dominant_masked = np.ma.masked_where(dominant_grid < 0, dominant_grid)
         cmap = plt.get_cmap("tab20", len(behaviors))
         extent = None
@@ -4653,6 +4683,17 @@ class SupervisionInferenceRunner:
         def _plot_single_track_dashboard() -> None:
             fig, axes = plt.subplots(3, 2, figsize=(12, 12))
             axes = axes.flatten()
+            fig.set_facecolor('white')
+            for ax in axes:
+                ax.set_facecolor('white')
+                ax.set_axisbelow(True)
+                ax.spines[:].set_color('#cccccc')
+                ax.spines[:].set_linewidth(0.8)
+                ax.tick_params(colors='#444444', labelsize=10)
+                ax.xaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+                ax.yaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+                ax.title.set(size=13, color='#333333', family='DejaVu Sans')
+                ax.grid(True, color='#d9d9d9', linewidth=0.8, linestyle='-', alpha=1.0)
 
             def plot_series(ax, col, kind="line", title=None, ylabel=None, color=None, xlabel=None):
                 if col not in df.columns:
@@ -4668,17 +4709,16 @@ class SupervisionInferenceRunner:
                         x_vals = df.loc[series.index, "frame"]
                     else:
                         x_vals = np.arange(series.shape[0])
-                    ax.plot(x_vals, series, color=color or "#2563eb", linewidth=1.2)
+                    ax.plot(x_vals, series, color=color or "#377eb8", linewidth=1.5)
                     x_label = x_label or "frame"
                     y_label = ylabel or col
                 elif kind == "hist":
-                    ax.hist(series, bins=40, color=color or "#10b981", alpha=0.8)
+                    ax.hist(series, bins=40, color=color or "#fb8072", alpha=0.7, edgecolor="#444444", linewidth=0.6)
                     x_label = x_label or col
                     y_label = ylabel or "count"
-                ax.set_title(title or col, fontsize=10)
+                ax.set_title(title or col, fontsize=11)
                 ax.set_ylabel(y_label)
                 ax.set_xlabel(x_label)
-                ax.grid(True, alpha=0.2)
                 return True
 
             plot_series(axes[0], "movement_speed_px_per_frame", title="Speed (px/frame)", ylabel="px/frame")
@@ -4701,8 +4741,8 @@ class SupervisionInferenceRunner:
                 plot_series(axes[3], signed_ang_col, kind="hist", title="Signed angular velocity (deg/frame; +CW)", ylabel="count")
             else:
                 plot_series(axes[3], "angular_velocity_deg_per_frame", kind="hist", title="Angular speed |Δorientation| (deg/frame)", ylabel="count")
-            plot_series(axes[4], "body_length_px", title="Body Length (px)", ylabel="px", color="#f59e0b")
-            plot_series(axes[5], "body_aspect_ratio", title="Aspect Ratio (length/width)", ylabel="ratio", color="#7c3aed")
+            plot_series(axes[4], "body_length_px", title="Body Length (px)", ylabel="px", color="#e6ab02")
+            plot_series(axes[5], "body_aspect_ratio", title="Aspect Ratio (length/width)", ylabel="ratio", color="#8da0cb")
 
             fig.tight_layout()
             out_path = metrics_path.parent / "metrics_dashboard.png"
@@ -4713,16 +4753,24 @@ class SupervisionInferenceRunner:
         def _plot_multi_track_dashboard() -> None:
             fig, axes = plt.subplots(4, 2, figsize=(12, 16))
             axes = axes.flatten()
-
+            fig.set_facecolor('white')
             for ax in axes:
-                ax.grid(True, alpha=0.2)
+                ax.set_facecolor('white')
+                ax.set_axisbelow(True)
+                ax.spines[:].set_color('#cccccc')
+                ax.spines[:].set_linewidth(0.8)
+                ax.tick_params(colors='#444444', labelsize=10)
+                ax.xaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+                ax.yaxis.label.set(size=11, color='#333333', family='DejaVu Sans')
+                ax.title.set(size=13, color='#333333', family='DejaVu Sans')
+                ax.grid(True, color='#d9d9d9', linewidth=0.8, linestyle='-', alpha=1.0)
 
             def plot_hist_with_stats(
                 ax,
                 series: pd.Series | None,
                 *,
                 bins: int = 40,
-                color: str = "#2563eb",
+                color: str = "#377eb8",
                 title: str,
                 xlabel: str,
                 value_range: tuple[float, float] | None = None,
@@ -4739,7 +4787,7 @@ class SupervisionInferenceRunner:
                 hist_kwargs: dict[str, object] = {}
                 if value_range is not None:
                     hist_kwargs["range"] = value_range
-                ax.hist(values, bins=bins, color=color, alpha=0.8, **hist_kwargs)
+                ax.hist(values, bins=bins, color=color, alpha=0.65, edgecolor="#444444", linewidth=0.6, **hist_kwargs)
                 mean_val = float(values.mean())
                 median_val = float(values.median())
                 if math.isfinite(mean_val):
@@ -4748,7 +4796,7 @@ class SupervisionInferenceRunner:
                     ax.axvline(median_val, color="#111827", linestyle=":", linewidth=1.0, alpha=0.75, label=f"median={median_val:.2f}")
                 if extra_lines:
                     for x, label in extra_lines:
-                        ax.axvline(x, color="#ef4444", linestyle="-", linewidth=1.0, alpha=0.6, label=label)
+                        ax.axvline(x, color="#fb8072", linestyle="-", linewidth=1.0, alpha=0.6, label=label)
 
                 # Tight x-axis scaling so distributions don't appear overly sparse.
                 if value_range is not None:
@@ -4772,7 +4820,7 @@ class SupervisionInferenceRunner:
                     x_max += pad
                 ax.set_xlim(x_min, x_max)
 
-                ax.set_title(title, fontsize=10)
+                ax.set_title(title, fontsize=11)
                 ax.set_xlabel(xlabel)
                 ax.set_ylabel("count")
                 handles, labels = ax.get_legend_handles_labels()
@@ -4787,7 +4835,7 @@ class SupervisionInferenceRunner:
                     color="#111827",
                     linewidth=1.2,
                 )
-                axes[0].set_title(f"Objects in Frame (unique tracks; stable={stable_track_count})", fontsize=10)
+                axes[0].set_title(f"Objects in Frame (unique tracks; stable={stable_track_count})", fontsize=11)
                 axes[0].set_xlabel("frame")
                 axes[0].set_ylabel("count")
             else:
@@ -4797,7 +4845,7 @@ class SupervisionInferenceRunner:
                 axes[1].plot(
                     summary_by_frame["frame"],
                     summary_by_frame["mean_speed_px_per_frame"],
-                    color="#2563eb",
+                    color="#377eb8",
                     linewidth=1.2,
                     label="mean",
                 )
@@ -4810,7 +4858,7 @@ class SupervisionInferenceRunner:
                         alpha=0.35,
                         label="IQR",
                     )
-                axes[1].set_title("Speed (mean ± IQR across detections, px/frame)", fontsize=10)
+                axes[1].set_title("Speed (mean ± IQR across detections, px/frame)", fontsize=11)
                 axes[1].set_xlabel("frame")
                 axes[1].set_ylabel("px/frame")
                 axes[1].legend(fontsize=8, loc="upper right")
@@ -4839,7 +4887,7 @@ class SupervisionInferenceRunner:
                         orientation_ax.plot(frames, values_plot, linewidth=1.0, alpha=0.85, label=str(track_id))
                     orientation_ax.set_title(
                         f"Orientation vs Frame (deg; line breaks at wrap; plotted={len(selected_tracks)})",
-                        fontsize=10,
+                        fontsize=11,
                     )
                     orientation_ax.set_xlabel("frame")
                     orientation_ax.set_ylabel("deg")
@@ -4858,7 +4906,7 @@ class SupervisionInferenceRunner:
                     axes[3],
                     signed_ang,
                     bins=60,
-                    color="#2563eb",
+                    color="#377eb8",
                     title="Signed angular velocity (deg/frame; +CW) distribution",
                     xlabel="deg/frame",
                     extra_lines=[(0.0, "0")],
@@ -4868,7 +4916,7 @@ class SupervisionInferenceRunner:
                     axes[3],
                     df.get("angular_velocity_deg_per_frame"),
                     bins=40,
-                    color="#2563eb",
+                    color="#377eb8",
                     title="Angular speed |Δorientation| (deg/frame) distribution",
                     xlabel="deg/frame",
                 )
@@ -4877,7 +4925,7 @@ class SupervisionInferenceRunner:
                 axes[4],
                 df.get("acceleration_px_per_frame2"),
                 bins=40,
-                color="#10b981",
+                color="#66c2a5",
                 title="Acceleration (Δspeed, px/frame²) distribution",
                 xlabel="px/frame²",
             )
@@ -4886,7 +4934,7 @@ class SupervisionInferenceRunner:
                 axes[5],
                 df.get("nearest_distance_px"),
                 bins=40,
-                color="#f59e0b",
+                color="#e6ab02",
                 title="Nearest-neighbor distance (px) distribution (per detection)",
                 xlabel="px",
             )
@@ -4898,10 +4946,10 @@ class SupervisionInferenceRunner:
                 axes[6].bar(
                     plot_df[object_col].astype(str),
                     plot_df["total_path_length_px"],
-                    color="#7c3aed",
+                    color="#8da0cb",
                     alpha=0.85,
                 )
-                axes[6].set_title("Top Tracks by Total Path Length (px, cumulative)", fontsize=10)
+                axes[6].set_title("Top Tracks by Total Path Length (px, cumulative)", fontsize=11)
                 axes[6].set_xlabel("track")
                 axes[6].set_ylabel("px")
                 axes[6].tick_params(axis="x", rotation=45, labelsize=7)
@@ -4915,10 +4963,10 @@ class SupervisionInferenceRunner:
                 axes[7].bar(
                     plot_df[object_col].astype(str),
                     plot_df["turn_count"],
-                    color="#ef4444",
+                    color="#fb8072",
                     alpha=0.85,
                 )
-                axes[7].set_title(f"Top Tracks by Direction Change Events{turn_threshold_label}", fontsize=10)
+                axes[7].set_title(f"Top Tracks by Direction Change Events{turn_threshold_label}", fontsize=11)
                 axes[7].set_xlabel("track")
                 axes[7].set_ylabel("events")
                 axes[7].tick_params(axis="x", rotation=45, labelsize=7)

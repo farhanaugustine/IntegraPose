@@ -814,6 +814,7 @@ class BehaviorAnalysisApp:
             )
         
         self.groups, self.running = {}, False
+        self.discovery_workspace = ''
         self.status_var, self.progress_var = tk.StringVar(value="Ready"), tk.DoubleVar(value=0)
         self.output_folder = tk.StringVar()
         self.keypoints_entry_var = tk.StringVar(value="nose,left_eye,right_eye,left_ear,right_ear,left_shoulder,right_shoulder")
@@ -828,6 +829,7 @@ class BehaviorAnalysisApp:
         self.umap_neighbors = tk.StringVar(value="15")
         self.umap_components = tk.StringVar(value="5")
         self.min_cluster_size = tk.StringVar(value="10")
+        self.min_class_size = tk.StringVar(value="30")
         self.social_mode = tk.BooleanVar(value=False)
         # Opt-in stability audit. When True, the
         # sub-behavior runner re-clusters with N seeds and reports
@@ -1265,13 +1267,15 @@ class BehaviorAnalysisApp:
             "lower if you want fine-grained sub-behaviors.",
         )
 
+        ttk.Label(cluster_frame, text="Minimum samples per class:").grid(row=4, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(cluster_frame, textvariable=self.min_class_size, width=10).grid(row=4, column=1, sticky=tk.W)
         ttk.Label(
             cluster_frame,
-            text="These parameters drive Sub-Behavior Discovery on Tab 3.",
+            text="Clustering runs on CPU. Minimum class samples, cluster size, and bout length are independent settings.",
             font=CAPTION_FONT,
             foreground=MUTED_FG,
             wraplength=320,
-        ).grid(row=4, column=0, columnspan=3, sticky='w', pady=(6, 0))
+        ).grid(row=5, column=0, columnspan=3, sticky='w', pady=(6, 0))
 
     def create_tab3_execute(self, parent_tab):
         parent_tab.columnconfigure(0, weight=1)
@@ -1293,30 +1297,32 @@ class BehaviorAnalysisApp:
             style="Accent.TButton",
         )
         sub_run_button.grid(row=0, column=3, padx=20, pady=(0, 4), sticky='ew')
+        ttk.Button(exec_frame, text='Open Discovery Explorer', command=self.open_discovery_explorer).grid(row=1, column=3, padx=20, pady=4, sticky='ew')
         self.review_candidates_button = ttk.Button(
             exec_frame,
             text="Review Candidate Sub-Clusters",
             command=self.open_review_candidates_dialog,
             state=tk.DISABLED,
         )
-        self.review_candidates_button.grid(row=1, column=3, padx=20, pady=(0, 4), sticky='ew')
+        self.review_candidates_button.grid(row=2, column=3, padx=20, pady=(0, 4), sticky='ew')
         self.naming_button = ttk.Button(
             exec_frame,
             text="Name Sub-Behaviors...",
             command=self.open_cluster_naming_dialog,
             state=tk.DISABLED,
         )
-        self.naming_button.grid(row=2, column=3, padx=20, pady=(0, 4), sticky='ew')
+        self.naming_button.grid(row=3, column=3, padx=20, pady=(0, 4), sticky='ew')
         self.clip_export_button = ttk.Button(
             exec_frame,
             text="Export Sub-cluster Clips",
             command=self.export_sub_cluster_clips_action,
             state=tk.DISABLED,
         )
-        self.clip_export_button.grid(row=3, column=3, padx=20, sticky='ew')
+        self.clip_export_button.grid(row=4, column=3, padx=20, sticky='ew')
+        ttk.Label(exec_frame, text='Candidate, naming and clip-export controls refer to the last Tk run. Use the Explorer for reviewed annotations and Qt reruns.', wraplength=650).grid(row=6, column=0, columnspan=4, sticky='w')
 
         status_frame = ttk.Frame(exec_frame)
-        status_frame.grid(row=4, column=0, columnspan=4, sticky='ew', pady=(10, 0))
+        status_frame.grid(row=5, column=0, columnspan=4, sticky='ew', pady=(10, 0))
         status_frame.columnconfigure(1, weight=1)
         ttk.Label(status_frame, text="Status:").grid(row=0, column=0, sticky=tk.W)
         ttk.Label(status_frame, textvariable=self.status_var).grid(row=0, column=1, sticky=tk.W)
@@ -1468,41 +1474,37 @@ class BehaviorAnalysisApp:
         export_frame = ttk.LabelFrame(parent_tab, text="Export Raw Data", padding="20"); export_frame.grid(row=0, column=0, sticky="ew", padx=20, pady=20); export_frame.columnconfigure(0, weight=1)
         info_label = ttk.Label(export_frame, text="This tool aggregates individual detection .txt files into a single CSV per video. The output is a 'wide' table with columns for track ID, frame, and x, y, confidence for each keypoint.", wraplength=500, justify=tk.LEFT); info_label.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(0, 20))
         ttk.Label(export_frame, text="Export to same Output Folder:").grid(row=1, column=0, sticky=tk.E, padx=5); ttk.Entry(export_frame, textvariable=self.output_folder, state='readonly', width=60).grid(row=1, column=1, sticky='ew'); ttk.Button(export_frame, text="Export Keypoints to CSV", command=self.start_csv_export, style="Accent.TButton").grid(row=2, column=0, columnspan=2, pady=20)
-        ttk.Button(export_frame, text="Export Latent Embeddings (CSV)", command=self.export_latent_embeddings).grid(row=3, column=0, columnspan=2, pady=5)
+        # Per-class discovery does not produce VAE latent embeddings. Do not
+        # bind the removed legacy exporter here: it prevents Tab 7 opening.
 
     def create_tab5_help(self, parent_tab):
         parent_tab.columnconfigure(0, weight=1)
         parent_tab.rowconfigure(0, weight=1)
 
         help_text = (
-            "HMM Selector Cheat Sheet\n"
-            "• categorical: choose when your observations are discrete pose/behavior IDs. "
-            "Best match for frame-wise pose clusters or labeled ethograms.\n"
-            "• gaussian: use when feeding continuous feature vectors (e.g., VAE latents or motion features) "
-            "and you expect unimodal state emissions.\n"
-            "• gmm: like Gaussian but allows multiple mixture components per hidden state—helpful for richer "
-            "feature spaces or when behaviors show multi-modal variability.\n"
-            "• sticky_gaussian: same as Gaussian but biases the model to stay in the current state using the "
-            "Sticky Self-Transition weight. Ideal when behaviors linger and you want smoother sequences.\n\n"
-            "Practical Hints\n"
-            "• Frame-based (Poses) mode pairs well with categorical HMMs and UMAP/HDBSCAN clustering.\n"
-            "• Event-based (Bouts) works with continuous variants when you aggregate bout-level statistics.\n"
-            "• Increase mix components only if groups remain broad after initial runs—each extra component "
-            "raises training cost.\n"
-            "• Sticky weights near 0.7–0.9 encourage longer dwell times; values ≤0.2 behave similar to plain Gaussian.\n\n"
-            "VAE Workflow\n"
-            "• Baseline group: the first listed group seeds VAE training. Ensure it contains representative data.\n"
-            "• Device selection: enable GPU only when CUDA is available; the app automatically falls back to CPU "
-            "and updates the status bar if no GPU is detected.\n"
-            "• Latent inspection: use the Preview Latent Space and Show Loss Curve buttons prior to exporting.\n\n"
-            "Data & Export Notes\n"
-            "• Each group needs at least one pose/video pair; missing directories are skipped with a warning.\n"
-            "• Latent exports include optional group, frame, and UMAP projections when available.\n"
-            "• CSV export writes one aggregated file per video source with track-level pose coordinates.\n\n"
-            "Need More?\n"
-            "• Review the diagnostics panel for preprocessing warnings.\n"
-            "• Use the Preset selector on the Analysis Parameters tab to load tuned defaults.\n"
-            "• For detailed logs, open behavior_analysis.log in your home directory."
+            "Behavior Clustering\n\n"
+            "Run Sub-Behavior Discovery computes pose-derived features, optionally reduces them "
+            "with UMAP, and clusters them with HDBSCAN. Clustering runs on CPU.\n\n"
+            "Input classes\n"
+            "Each source Class ID is clustered separately, pooling its observations across the "
+            "configured sources and groups. A single animal class gives pose-pattern candidates; "
+            "behavior classes give within-class candidates. Cluster names require video review.\n\n"
+            "Parameters\n"
+            "Minimum samples per class, HDBSCAN Min Cluster Size, and Min Bout Duration are "
+            "independent. The bout minimum counts observed detections, not elapsed seconds. "
+            "Max Frame Gap limits the frame-index difference between adjacent observations. "
+            "Set UMAP Neighbors to 0 to cluster normalized features without UMAP.\n\n"
+            "Review and interpretation\n"
+            "Check Data Health Summary, then Review Candidate Sub-Clusters and Name Sub-Behaviors. "
+            "A stability audit measures sensitivity to the tested random seeds; it does not "
+            "validate a biological behavior. Candidate scores prioritize inspection only.\n\n"
+            "Inputs and outputs\n"
+            "Analytics manifests carry pose/video paths and metadata. The discovery run recomputes "
+            "features and cluster bouts; imported reviewed bouts do not constrain it. "
+            "Use a separate output folder for each parameter run because output filenames repeat. "
+            "Per-frame and bout CSVs distinguish clustered, noise, and insufficient samples. "
+            "Clip export is optional. Save the project to retain your setup.\n\n"
+            "See the Behavior Clustering user guide for thresholds, outputs, and limitations."
         )
 
         text_widget = scrolledtext.ScrolledText(parent_tab, wrap=tk.WORD)
@@ -1525,7 +1527,7 @@ class BehaviorAnalysisApp:
             "Import Analytics Runs",
             "Enter the group name to import into (existing or new).\n"
             f"Existing groups: {existing}\n\n"
-            "Tip: Add your baseline/control group first (VAE training uses the first group as baseline).",
+            "Use group names from your study design. Group order does not select a training baseline.",
         )
         if not group_name:
             return
@@ -1614,14 +1616,9 @@ class BehaviorAnalysisApp:
     def _read_analytics_manifest(self, manifest_path: str) -> dict:
         with open(manifest_path, "r", encoding="utf-8") as fh:
             manifest = json.load(fh)
-        if not isinstance(manifest, dict):
-            raise ValueError("Manifest JSON must be an object.")
-        # Accept schema v1 and v2 (v2 adds an optional `provenance` block).
-        # v1 has no subject_id; v2 may have an empty provenance block when
-        # the run wasn't created via the batch pipeline.
-        schema = manifest.get("schema_version")
-        if schema not in (1, 2):
-            raise ValueError(f"Unsupported or missing schema_version (expected 1 or 2, got {schema!r}).")
+        from integra_pose.utils.analytics_manifest import validate_schema_version
+
+        schema = validate_schema_version(manifest)
 
         run_id = str(manifest.get("run_id") or "").strip()
         inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), dict) else {}
@@ -1663,6 +1660,7 @@ class BehaviorAnalysisApp:
         behavior_names = inputs.get("behavior_names")
 
         return {
+            "schema_version": schema,
             "run_id": run_id,
             "manifest_path": str(Path(manifest_path).resolve()),
             "output_folder": str(Path(output_folder).resolve()),
@@ -1853,6 +1851,7 @@ class BehaviorAnalysisApp:
     
     def get_all_params(self):
         params = {
+            'discovery_workspace': getattr(self, 'discovery_workspace', ''),
             'groups': self.groups,
             'output_folder': self.output_folder.get(),
             'keypoints_entry_var': self.keypoints_entry_var.get(),
@@ -1867,6 +1866,7 @@ class BehaviorAnalysisApp:
             'umap_neighbors': self.umap_neighbors.get(),
             'umap_components': self.umap_components.get(),
             'min_cluster_size': self.min_cluster_size.get(),
+            'min_class_size': self.min_class_size.get(),
             # Stability-audit flags.
             'run_stability_audit': bool(self.run_stability_audit.get()),
             'stability_n_seeds': self.stability_n_seeds.get(),
@@ -2077,11 +2077,24 @@ class BehaviorAnalysisApp:
 
         return bouts, covered_dirs
 
+    def open_discovery_explorer(self):
+        try:
+            from integra_pose.discovery.bridge import launch
+            path = getattr(self, 'discovery_workspace', '')
+            if not path:
+                path = os.path.join(self.output_folder.get(), 'discovery.sqlite')
+            launch(path, schedule=self.root.after,
+                   on_failure=lambda message: messagebox.showerror('Discovery Explorer could not start', message, parent=self.root))
+        except Exception as exc:
+            messagebox.showerror('Discovery Explorer', str(exc), parent=self.root)
+
     def _build_bouts_from_tab6_runs(self, detections_df: pd.DataFrame) -> tuple[list[dict], set[str]]:
         """Backward-compatible alias for older integrations."""
         return self._build_bouts_from_analytics_runs(detections_df)
 
     def set_all_params(self, state):
+        self.discovery_workspace = str(state.get('discovery_workspace', '') or '')
+        self.min_class_size.set(state.get('min_class_size', '30'))
         for key, value in state.items():
             if hasattr(self, key):
                 attr = getattr(self, key)
@@ -2118,6 +2131,8 @@ class BehaviorAnalysisApp:
         self.update_keypoint_combos()
 
     def save_project(self):
+        if getattr(self, 'integra_app', None) is not None:
+            return self.integra_app.config.save_project()
         file_path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON Project Files", "*.json")])
         if file_path:
             params = self.get_all_params()
@@ -2129,17 +2144,36 @@ class BehaviorAnalysisApp:
                 logger.error(f"Failed to save project: {e}", exc_info=True)
                 messagebox.showerror("Error", f"Failed to save project file:\n{e}")
 
-    def load_project(self, file_path=None):
+    def load_project(self, file_path=None, *, during_batch=False):
         if not file_path:
             file_path = filedialog.askopenfilename(filetypes=[("JSON Project Files", "*.json")])
-        if not file_path: return
+        if not file_path: return False
         try:
-            with open(file_path, 'r') as f: state = json.load(f)
-            self.set_all_params(state)
+            from integra_pose.utils.safe_io import safe_read_json
+            from integra_pose.discovery.project_io import tab7_project_payload
+            from integra_pose.discovery.bridge import active, restore_project
+            payload = safe_read_json(file_path)
+            main_project, state = tab7_project_payload(payload)
+            if self.running and not during_batch:
+                raise ValueError('Wait for the current analysis to finish before loading another project.')
+            if active(getattr(self, 'discovery_workspace', '')):
+                raise ValueError('Close the Discovery Explorer before loading another project.')
+            host = getattr(self, 'integra_app', None)
+            if main_project and host is not None:
+                if host.config.open_project(file_path) is None:
+                    return False
+            elif host is not None:
+                restore_project(host, state)
+            else:
+                self.set_all_params(state)
+            count = sum(len(group.get('sources', [])) for group in state['groups'].values())
+            self.status_var.set(f'Loaded project: {count} sources, {len(state["groups"])} groups. Open Discovery Explorer to inspect saved runs.')
             logger.info(f"Project loaded from {file_path}")
+            return True
         except Exception as e:
             logger.error(f"Failed to load project: {e}", exc_info=True)
             messagebox.showerror("Error", f"Failed to load project file:\n{e}")
+            return False
 
     def load_multiple_projects(self):
         file_paths = filedialog.askopenfilenames(filetypes=[("JSON Project Files", "*.json")])
@@ -2151,7 +2185,8 @@ class BehaviorAnalysisApp:
             self._set_status_progress_async(message="Processing multiple projects...", progress=0)
             for i, file_path in enumerate(file_paths):
                 self._set_status_progress_async(message=f"Loading project {i+1}/{len(file_paths)}: {os.path.basename(file_path)}")
-                self._ui_call_sync(self.load_project, file_path)
+                if not self._ui_call_sync(lambda: self.load_project(file_path, during_batch=True)):
+                    raise ValueError(f'Could not load project: {file_path}. No analysis was started for this file.')
                 params = self._ui_call_sync(self._capture_analysis_params)
                 self._set_status_progress_async(message=f"Running analysis for project {i+1}/{len(file_paths)}")
                 self._run_analysis_worker_from_params(params, notify=False)
@@ -2182,6 +2217,7 @@ class BehaviorAnalysisApp:
             umap_neighbors = int(self.umap_neighbors.get())
             umap_components = int(self.umap_components.get())
             min_cluster_size = int(self.min_cluster_size.get())
+            min_class_size = int(self.min_class_size.get())
         except ValueError as e:
             raise ValueError(f"Invalid numerical parameter. Please check your inputs. Error: {e}")
 
@@ -2191,6 +2227,8 @@ class BehaviorAnalysisApp:
             raise ValueError("UMAP Components must be at least 1.")
         if min_cluster_size < 2:
             raise ValueError("HDBSCAN Min Cluster Size must be at least 2.")
+        if min_class_size < 1:
+            raise ValueError("Minimum samples per class must be at least 1.")
 
         if not self.normalization_left.get() or not self.normalization_right.get():
             raise ValueError("Both normalization reference keypoints must be selected.")
@@ -2307,11 +2345,11 @@ class BehaviorAnalysisApp:
             self._refresh_diagnostics_async()
 
             normalization_ref_points = (
-                self.normalization_left.get(),
-                self.normalization_right.get(),
+                params['normalization_left'],
+                params['normalization_right'],
             )
             roi_defs = (
-                json.loads(self.roi_text.get("1.0", tk.END))
+                json.loads(params['roi_definitions_text'])
                 if params['location_mode'] == 'roi'
                 else None
             )
@@ -2360,10 +2398,7 @@ class BehaviorAnalysisApp:
                 class_names[idx] = str(name)
 
             self.progress_callback(40, 100, "Clustering per class...")
-            min_class_size = max(
-                10,
-                int(params.get('min_bout_duration', 0)) * 5,
-            )
+            min_class_size = int(params.get('min_class_size', 30))
             # Reuse the existing UMAP/HDBSCAN params from Tab 2.
             clustered_df, multi_result = cluster_per_class(
                 detections_df,
@@ -2373,6 +2408,13 @@ class BehaviorAnalysisApp:
                 umap_neighbors=int(params.get('umap_neighbors', 15)),
                 umap_components=int(params.get('umap_components', 5)),
             )
+            feature_diag['clustering_backend_runs'] = multi_result.backend_runs
+            feature_diag['clustering_settings'] = {
+                key: params.get(key) for key in (
+                    'min_class_size', 'min_cluster_size',
+                    'umap_neighbors', 'umap_components', 'min_bout_duration', 'max_frame_gap',
+                )
+            }
 
             self.progress_callback(60, 100, "Aggregating sub-cluster bouts...")
             bouts = aggregate_states_into_bouts(
@@ -2429,7 +2471,9 @@ class BehaviorAnalysisApp:
 
             # Persist outputs.
             self.progress_callback(85, 100, "Writing outputs...")
-            output_folder = params.get('output_folder') or self.output_folder.get()
+            from integra_pose.discovery.bridge import register_result
+            register_result(self, clustered_df, params, video_map, run_id, feature_diag)
+            output_folder = os.path.join(params['output_folder'], 'latest_exports')
             saved_paths = self._save_sub_behavior_outputs(
                 output_folder=output_folder,
                 clustered_df=clustered_df,
@@ -2540,7 +2584,7 @@ class BehaviorAnalysisApp:
                 c for c in [
                     "group", "subject_id", "video_source", "directory",
                     "frame", "track_id", "class_id", "behavior",
-                    "cluster_label",
+                    "cluster_label", "cluster_status", "cluster_backend",
                 ]
                 if c in clustered_df.columns
             ]
@@ -2563,6 +2607,7 @@ class BehaviorAnalysisApp:
                     "class_id": b.get("class_id"),
                     "behavior": b.get("behavior"),
                     "cluster_label": b.get("state"),
+                    "cluster_status": b.get("cluster_status"),
                     "start_frame": b.get("start_frame"),
                     "end_frame": b.get("end_frame"),
                     "duration_frames": b.get("duration_frames"),

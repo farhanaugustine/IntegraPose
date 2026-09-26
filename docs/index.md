@@ -118,7 +118,7 @@ analysis settings.
 | Inference | Detection or pose labels, videos, optional motion summaries |
 | Bout & ROI Analytics | Behavior bouts, ROI measures, object interactions, and review-ready results |
 | Batch Processing Wizard | Repeated analytics runs across many videos |
-| Behavior Clustering | Per-class sub-behaviors, candidate scores, named clip folders for downstream classifier training (pose workflows) |
+| Behavior Clustering | Candidate movement patterns within model classes, review scores, and optional named bout clips (pose workflows) |
 
 ```text
 Raw videos
@@ -136,7 +136,7 @@ Raw videos
 When the standard tabs are not quite enough:
 
 - **[Customize the YOLO architecture](advanced/customizing-yolo-model.md)** - edit the model `.yaml` to swap backbones, fuse modules differently, add attention or transformer blocks, or tune for edge deployment. CLI training instructions included.
-- **[Behavior Clustering](user-guide/pose-clustering.md)** - split a known YOLO class into the sub-behaviors actually present in your data, score them, name them, and export classifier-ready clip folders.
+- **[Behavior Clustering](user-guide/pose-clustering.md)** - explore candidate movement patterns within a YOLO class, inspect them against the video, and export reviewed names and bout clips for further analysis.
 
 ## The Plugin Ecosystem
 

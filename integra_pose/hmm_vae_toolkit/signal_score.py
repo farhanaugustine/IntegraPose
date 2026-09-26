@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
+from .labels import parse_bout_label
 
 logger = logging.getLogger(__name__)
 
@@ -174,17 +175,10 @@ def compute_signal_scores(
     # Group bouts by (class_id, sub_id).
     grouped: dict[tuple[int, int], list] = {}
     for b in (bouts or []):
-        try:
-            cid = int(b.get("class_id", -1))
-        except Exception:
+        parsed = parse_bout_label(b)
+        if parsed is None:
             continue
-        state = b.get("state")
-        try:
-            sid = int(state)
-        except Exception:
-            continue
-        if sid == -1:  # HDBSCAN noise — not a candidate
-            continue
+        cid, sid = parsed
         grouped.setdefault((cid, sid), []).append(b)
 
     candidates: list[SubClusterCandidate] = []

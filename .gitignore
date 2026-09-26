@@ -28,6 +28,7 @@ Thumbs.db
 
 # Common output folders
 runs/
+tab7_review/
 
 # Notebook caches
 .ipynb_checkpoints/

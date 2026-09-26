@@ -58,28 +58,17 @@ def _write_manifest(tmpdir: Path, *, schema_version: int, provenance: dict | Non
 
 
 class TestManifestReader(unittest.TestCase):
-    """Hand-roll a minimal stand-in for the BehaviorAnalysisApp method.
-
-    The full Tk app is not instantiated in the test environment. The
-    manifest-reader logic is reproduced here as a pure function.
-    The body below tracks the implementation in
-    ``integra_pose/hmm_vae_toolkit/main.py::_read_analytics_manifest``;
-    when that drifts, this test breaks loudly.
-    """
+    """Exercise the production reader without opening file-selection dialogs."""
 
     def _read(self, manifest_path: Path) -> dict:
-        with open(manifest_path, "r", encoding="utf-8") as fh:
-            manifest = json.load(fh)
-        schema = manifest.get("schema_version")
-        if schema not in (1, 2):
-            raise ValueError(f"bad schema_version {schema!r}")
-        provenance = manifest.get("provenance") if isinstance(manifest.get("provenance"), dict) else {}
-        return {
-            "schema_version": schema,
-            "subject_id": str(provenance.get("subject_id") or "").strip(),
-            "manifest_group": str(provenance.get("group") or "").strip(),
-            "time_point": str(provenance.get("time_point") or "").strip(),
-        }
+        from types import SimpleNamespace
+        from integra_pose.hmm_vae_toolkit.main import BehaviorAnalysisApp
+
+        context = SimpleNamespace(
+            _resolve_existing_dir=lambda path, *_: path,
+            _resolve_existing_file=lambda path, *_, **kwargs: path,
+        )
+        return BehaviorAnalysisApp._read_analytics_manifest(context, str(manifest_path))
 
     def test_v1_manifest_yields_empty_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as td:

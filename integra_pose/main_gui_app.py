@@ -1000,7 +1000,7 @@ class YoloApp:
             "Run file/folder inference and generate YOLO outputs for downstream analysis.",
             "Run live webcam inference and optionally record outputs/metrics.",
             "Analyze bouts and ROI metrics, then review summary outputs.",
-            "Model behavior transitions and latent structure using VAE + HMM tooling.",
+            "Explore pose-derived movement patterns with per-class UMAP/HDBSCAN clustering.",
         ]
 
     # Documentation links surfaced from the onboarding dialog.
@@ -1300,14 +1300,14 @@ class YoloApp:
                 pass
 
     def _check_hmm_vae_dependencies(self) -> tuple[list[str], list[str]]:
-        """Return (missing, present) dependency names for the VAE+HMM toolkit."""
+        """Return (missing, present) dependency names for the Behavior Clustering toolkit."""
         return self.plugin_controller.check_hmm_vae_dependencies()
 
     def _hmm_vae_window(self):
         return self.plugin_controller._hmm_vae_window()
 
     def _launch_hmm_vae_toolkit(self) -> None:
-        """Launch the integrated VAE+HMM toolkit window."""
+        """Launch the integrated Behavior Clustering toolkit window."""
         self.plugin_controller.launch_hmm_vae_toolkit()
 
     def _clear_hmm_vae_controller(self) -> None:
@@ -4503,7 +4503,7 @@ class YoloApp:
         group_name = simpledialog.askstring(
             "Import into Group",
             f"Enter the group name for the imported {source_context}.\n"
-            "Tip: Import your baseline/control group first (VAE training uses the first group as baseline).",
+            "Use group names from your study design. Group order does not select a training baseline.",
             initialvalue=default_group,
             parent=parent or self.root,
         )

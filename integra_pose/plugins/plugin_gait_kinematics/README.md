@@ -22,6 +22,6 @@
 2. Select the input dataset or project folder when prompted.
 3. Use the dashboard tabs to review stride cycles, compare subjects, and export summaries.
 
-## Development Notes
+## Extending the plugin
 - GUI launcher stays small; business logic sits in `gait_kinematics/` modules so tests can import them directly.
 - When expanding analytics, keep UI hooks thin and expose processing helpers from the package for reuse.
