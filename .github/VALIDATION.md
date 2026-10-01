@@ -1,7 +1,7 @@
 # Continuous validation
 
-`.github/workflows/validation.yml` runs on every push, pull request, and manual
-dispatch. It is intentionally split into a broad compatibility gate and a
+`.github/workflows/validation.yml` runs only when manually dispatched from
+GitHub Actions. It is split into a broad compatibility gate and a
 focused scientific regression gate.
 
 ## Covered

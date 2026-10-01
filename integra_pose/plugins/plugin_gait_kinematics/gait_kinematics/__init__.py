@@ -25,11 +25,7 @@ def launch(parent: Optional[tk.Misc]) -> AnalysisGUI:
             pass
     window = AnalysisGUI(parent)
     window._owns_parent = owns_parent
-    if parent is not None:
-        try:
-            window.transient(parent)
-        except Exception:
-            pass
+    # A normal Toplevel retains native maximize controls on Windows.
     window.focus_set()
     window.lift()
     return window

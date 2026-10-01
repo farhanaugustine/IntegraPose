@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.1.0b1 — 2026-09-28
+
+- Added human COCO-17 and mouse gait presets, custom model/schema import, ordered landmark validation, and explicit selection of measurement goals.
+- Preserved subject IDs, added confidence masking and source-frame interval selection, and enabled individual-video analysis alongside group and advanced workflows.
+- Added offline HTML gait reports with limb-motion timelines, searchable stride tables, skeleton overlays and bounded review clips; group reports export per-video means.
+- Rejected contradictory landmark order even when keypoint counts agree; nameless legacy exports require explicit model-order confirmation.
+- Kept verified-FPS, missing-frame and elapsed-time contracts. Human spatial proxies are opt-in; gait events remain image-motion estimates requiring visual review.
+- Added synchronized limb-motion visuals with human-specific landmark geometry, image-motion timelines, angle traces, and coordination plots.
+- Fixed track-ID visibility in inference labels and preserved video proportions in resized inference previews.
+- Kept the native annotation path active when custom overlays are disabled, including when tracking is enabled.
+- Made GitHub validation manual-only through workflow dispatch.
+
 ## 3.1.0b0 — 2026-09-26
 
 - Added Discovery Explorer with linked video, cluster views, feature plots,

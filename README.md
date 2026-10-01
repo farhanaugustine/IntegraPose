@@ -8,7 +8,7 @@
 
 [![Documentation](https://img.shields.io/badge/Documentation-Read%20the%20docs-2563EB?style=flat)](https://farhanaugustine.github.io/IntegraPose/) [![Paper](https://img.shields.io/badge/Paper-Neuroscience-7C3AED?style=flat)](https://doi.org/10.1016/j.neuroscience.2025.10.020) [![Software DOI](https://zenodo.org/badge/988759361.svg)](https://doi.org/10.5281/zenodo.15565090)
 
-[![Version: 3.1.0b0 beta](https://img.shields.io/badge/Version-3.1.0b0%20%28beta%29-2563EB?style=flat)](CHANGELOG.md) [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-168B83?style=flat)](LICENSE)
+[![Version: 3.1.0b1 beta](https://img.shields.io/badge/Version-3.1.0b1%20%28beta%29-2563EB?style=flat)](CHANGELOG.md) [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-168B83?style=flat)](LICENSE)
 
 Computational ethology has matured into a rich ecosystem - DeepLabCut and
 SLEAP for pose, B-SOiD and VAME for unsupervised discovery, BORIS for manual

@@ -119,7 +119,7 @@ def _ensure_track_ids(detections: list[dict], max_frame_gap: int = 10) -> None:
         available_tracks = {
             track_id: info
             for track_id, info in active_tracks.items()
-            if info["centroid"] is not None
+            if info["centroid"] is not None and info["frame"] < frame
         }
 
         candidates = [det for det in to_assign if det["_centroid"] is not None]

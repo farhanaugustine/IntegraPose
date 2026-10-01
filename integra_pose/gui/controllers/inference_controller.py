@@ -347,7 +347,7 @@ class InferenceController:
             use_boxes=bool(cfg.sv_use_box_var.get()),
             use_labels=bool(cfg.sv_use_label_var.get()),
             use_trace=trace_enabled,
-            use_tracker_ids=False,
+            use_tracker_ids=use_tracker and bool(cfg.sv_use_label_var.get()) and not hide_labels_flag,
             use_edges=use_edges,
             use_vertices=vertices_enabled,
             use_heading_arrows=heading_arrows_enabled,
@@ -373,6 +373,7 @@ class InferenceController:
         )
 
         if disable_overlays:
+            annotation.use_tracker_ids = False
             annotation.use_boxes = False
             annotation.use_labels = False
             annotation.use_trace = False

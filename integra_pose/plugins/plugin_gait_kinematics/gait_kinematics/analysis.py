@@ -3,6 +3,7 @@ import numpy as np
 import logging
 
 from .stride_detector import detect_and_filter_strides
+from .profiles import opposing_paw
 from .scientific_utils import (
     GAIT_RESULT_COLUMNS,
     contiguous_difference,
@@ -75,6 +76,11 @@ def process_data(df, config_obj, *, fps=None):
     
     logger.info("Performing gait and step analysis...")
     gait_df = perform_gait_analysis(df, config_obj, fps=fps)
+    measures = config_obj['GAIT_ANALYSIS'].get('MEASURES', ['stride_timing', 'body_motion', 'spatial_proxies'])
+    if 'spatial_proxies' not in measures:
+        gait_df[['stride_length', 'step_length', 'step_width']] = np.nan
+    if 'body_motion' not in measures:
+        gait_df[['stride_speed', 'stride_speed_px_per_frame', 'stride_speed_px_per_s']] = np.nan
     
     return df, gait_df
 
@@ -141,12 +147,7 @@ def calculate_original_gait_metrics(events_df, full_df, config_obj, *, fps=None)
     gait_params = config_obj['GAIT_ANALYSIS']
     ref_paw = gait_params['STRIDE_REFERENCE_PAW']
     
-    other_paws = [p for p in gait_params['GAIT_PAWS'] if p != ref_paw]
-    opposing_paw_name = None
-    if 'Left' in ref_paw and 'Rear' in ref_paw:
-        opposing_paw_name = next((p for p in other_paws if 'Right' in p and 'Rear' in p), None)
-    elif 'Right' in ref_paw and 'Rear' in ref_paw:
-        opposing_paw_name = next((p for p in other_paws if 'Left' in p and 'Rear' in p), None)
+    opposing_paw_name = opposing_paw(gait_params)
 
     ref_paw_events = events_df[events_df['paw'] == ref_paw]
     for track_id, track_events in ref_paw_events.groupby('track_id'):
@@ -242,16 +243,23 @@ def calculate_pose_metrics(df, config_obj, *, fps=None):
     df['speed'] = df['speed_px_per_frame']
     df['video_fps'] = fps if fps is not None else np.nan
     
-    p1_elong, p2_elong = config_obj['POSE_METRICS']['ELONGATION_CONNECTION']
-    df['elongation'] = np.linalg.norm(df[[f'{p1_elong}_x', f'{p1_elong}_y']].values - df[[f'{p2_elong}_x', f'{p2_elong}_y']].values, axis=1)
+    elongation_pair = config_obj.get('POSE_METRICS', {}).get('ELONGATION_CONNECTION')
+    df['elongation'] = np.nan
+    if elongation_pair:
+        p1_elong, p2_elong = elongation_pair
+        df['elongation'] = np.linalg.norm(df[[f'{p1_elong}_x', f'{p1_elong}_y']].values - df[[f'{p2_elong}_x', f'{p2_elong}_y']].values, axis=1)
     segment_id = df['frame_delta'].ne(1).groupby(df['track_id'], sort=False).cumsum()
     df['posture_variability'] = df.groupby(
         [df['track_id'], segment_id], sort=False
     )['elongation'].transform(lambda x: x.rolling(window=30, min_periods=1).std())
 
-    p1_angle, p2_angle = config_obj['POSE_METRICS']['BODY_ANGLE_CONNECTION']
-    vec = df[[f'{p2_angle}_x', f'{p2_angle}_y']].values - df[[f'{p1_angle}_x', f'{p1_angle}_y']].values
-    rad = np.arctan2(vec[:, 1], vec[:, 0])
+    angle_pair = config_obj.get('POSE_METRICS', {}).get('BODY_ANGLE_CONNECTION')
+    rad = np.full(len(df), np.nan)
+    if angle_pair:
+        p1_angle, p2_angle = angle_pair
+        vec = df[[f'{p2_angle}_x', f'{p2_angle}_y']].values - df[[f'{p1_angle}_x', f'{p1_angle}_y']].values
+        rad = np.arctan2(vec[:, 1], vec[:, 0])
+        rad[np.linalg.norm(vec, axis=1) == 0] = np.nan
     
     df['body_angle_rad'] = rad
     

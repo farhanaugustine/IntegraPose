@@ -6,6 +6,7 @@ import matplotlib
 matplotlib.use('Agg') # FIX: Use a non-interactive backend for running in a thread
 import matplotlib.pyplot as plt
 import logging
+from .profiles import advanced_unavailable
 
 logger = logging.getLogger(__name__)
 
@@ -66,12 +67,16 @@ def extract_transition_windows(full_df, from_behavior, to_behavior, pre_frames, 
 
 def main(base_results_dir, group_config, config_obj):
     """Main function to drive the decision dynamics analysis."""
+    reason = advanced_unavailable(config_obj).get('Run Decision Dynamics Analysis')
+    if reason:
+        raise ValueError(reason)
+    generated = 0
     plots_dir = os.path.join(base_results_dir, "decision_dynamics_plots")
     os.makedirs(plots_dir, exist_ok=True)
     
     full_df = load_and_prepare_data(base_results_dir, group_config)
     if full_df.empty:
-        return
+        raise ValueError('No frame-level data for decision dynamics.')
 
     for from_b, to_b in TRANSITIONS_TO_ANALYZE:
         transition_df = extract_transition_windows(
@@ -95,6 +100,11 @@ def main(base_results_dir, group_config, config_obj):
                 transition_df.groupby(['group', 'video_source', 'time_to_transition'], as_index=False)[metric]
                 .mean()
             )
+            per_video = per_video[np.isfinite(per_video[metric])]
+            if per_video.empty:
+                plt.close()
+                continue
+            per_video.to_csv(os.path.join(plots_dir, f'dynamics_{from_b}_to_{to_b}_{metric}.csv'), index=False)
             sns.lineplot(data=per_video, x='time_to_transition', y=metric, hue='group', errorbar='se')
             plt.axvline(0, color='r', linestyle='--', label=f'Switch to {to_b}')
             plt.title(f"Dynamics of '{from_b}' → '{to_b}' Transition")
@@ -102,5 +112,8 @@ def main(base_results_dir, group_config, config_obj):
             plt.ylabel(f"Average {ylabel}")
             plt.savefig(os.path.join(plots_dir, f"dynamics_{from_b}_to_{to_b}_{metric}.png"), dpi=300)
             plt.close()
+            generated += 1
     
+    if not generated:
+        raise ValueError('No complete eligible behavior transitions with finite metrics. Decision dynamics produced no plots.')
     logger.info(f"Decision dynamics analysis complete. Plots saved to: {plots_dir}")

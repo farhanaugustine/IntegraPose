@@ -191,3 +191,55 @@ def test_should_render_preview_uses_stride_but_keeps_first_frame() -> None:
     assert SupervisionInferenceRunner._should_render_preview(0, 3) is True
     assert SupervisionInferenceRunner._should_render_preview(1, 3) is False
     assert SupervisionInferenceRunner._should_render_preview(3, 3) is True
+
+
+def test_portrait_preview_preserves_geometry_in_landscape_viewport():
+    frame = np.full((800, 400, 3), 255, dtype=np.uint8)
+    rendered = SupervisionInferenceRunner._fit_preview_viewport(frame, 1600, 900)
+    assert rendered.shape == (450, 800, 3)
+    nonzero = np.argwhere(rendered[:, :, 0] > 0)
+    assert tuple(nonzero.max(axis=0) - nonzero.min(axis=0) + 1) == (450, 225)
+    assert np.all(frame == 255)
+
+
+def test_landscape_preview_preserves_geometry_in_portrait_viewport():
+    frame = np.full((400, 800, 3), 255, dtype=np.uint8)
+    rendered = SupervisionInferenceRunner._fit_preview_viewport(frame, 900, 1600)
+    assert rendered.shape == (800, 450, 3)
+    nonzero = np.argwhere(rendered[:, :, 0] > 0)
+    assert tuple(nonzero.max(axis=0) - nonzero.min(axis=0) + 1) == (225, 450)
+    assert SupervisionInferenceRunner._fit_preview_viewport(frame, 0, 0) is frame
+
+
+@pytest.mark.parametrize("backend", ["available", "unsupported", "missing"])
+def test_preview_viewport_fallback_preserves_source_and_quit(monkeypatch, backend):
+    from types import SimpleNamespace
+    import cv2
+
+    runner = SupervisionInferenceRunner.__new__(SupervisionInferenceRunner)
+    runner.settings = SimpleNamespace(show=True, preview_frame_stride=2, preview_max_side=800)
+    runner._preview_window_ready = False
+    displayed = []
+    monkeypatch.setattr(cv2, "namedWindow", lambda *args: None)
+    monkeypatch.setattr(cv2, "imshow", lambda name, frame: displayed.append(frame.copy()))
+    monkeypatch.setattr(runner, "_poll_preview_key", lambda delay: ord("q"))
+    if backend == "available":
+        monkeypatch.setattr(cv2, "getWindowImageRect", lambda name: (0, 0, 1600, 900))
+    elif backend == "unsupported":
+        def unavailable(name):
+            raise cv2.error("No window rectangle support")
+        monkeypatch.setattr(cv2, "getWindowImageRect", unavailable)
+    else:
+        monkeypatch.delattr(cv2, "getWindowImageRect")
+    source = np.full((800, 400, 3), 255, dtype=np.uint8)
+    original = source.copy()
+    assert runner._show_preview_frame(0, source) is True
+    assert len(displayed) == 1
+    assert displayed[0].shape == ((450, 800, 3) if backend == "available" else source.shape)
+    assert np.array_equal(source, original)
+    # Skipped display frames must still process the quit key.
+    assert runner._show_preview_frame(1, source) is True
+    assert len(displayed) == 1
+    runner.settings.show = False
+    assert runner._show_preview_frame(2, source) is False
+    assert len(displayed) == 1

@@ -7,6 +7,7 @@ import seaborn as sns
 import os
 import logging
 from .scientific_utils import contiguous_difference
+from .profiles import advanced_unavailable
 try:
     import pyEDM
 except ImportError:  # pragma: no cover - optional dependency
@@ -52,6 +53,10 @@ def _longest_complete_metric_segment(bout_df, variables):
     return max(candidates, key=len).copy() if candidates else None
 
 def main(base_results_dir, group_config, config_obj):
+    reason = advanced_unavailable(config_obj).get('Run Convergent Cross-Mapping (CCM)')
+    if reason:
+        raise ValueError(reason)
+    generated = 0
     if pyEDM is None:
         msg = ("pyEDM is required for CCM analysis. Install it via pip install pyEDM "
                "before running this workflow.")
@@ -106,22 +111,24 @@ def main(base_results_dir, group_config, config_obj):
                             output = pyEDM.CCM(dataFrame=ccm_df_safe, E=EMBED_DIM, tau=TAU, Tp=0, 
                                                columns=safe_var1, target=safe_var2,
                                                libSizes=f"10 {len(ccm_df_safe) // 2} 10", 
-                                               sample=100, showPlot=False)
+                                               sample=100, showPlot=False, seed=42, noTime=True)
                             
                             final_rho = output[f'{safe_var1}:{safe_var2}'].iloc[-1]
-                            ccm_results[group['name']].append(final_rho)
+                            if np.isfinite(final_rho):
+                                ccm_results[group['name']].append({'video_source':video,'rho':float(final_rho)})
                         except Exception as e:
                             logger.error(f"pyEDM failed for {video} on pair ({var1}, {var2}): {e}")
 
-        plot_data = [{"Group": g, "Final Rho": r} for g, res in ccm_results.items() for r in res]
+        plot_data = [{"Group": g, "video_source": r['video_source'], "Final Rho": r['rho'], 'seed':42} for g, res in ccm_results.items() for r in res]
         if not plot_data: 
             logger.warning(f"No valid CCM results for pair ({var1}, {var2}) to plot.")
             continue
             
         df_plot = pd.DataFrame(plot_data)
+        df_plot.to_csv(os.path.join(plots_dir, f'ccm_{var1}_vs_{var2}.csv'), index=False)
         plt.figure(figsize=(8, 7))
         sns.boxplot(data=df_plot, x="Group", y="Final Rho", hue="Group", palette="muted")
-        sns.stripplot(data=df_plot, x="Group", y="Final Rho", color=".25")
+        sns.stripplot(data=df_plot, x="Group", y="Final Rho", color=".25", jitter=False)
         plt.title(
             f'CCM prediction during "{target_behavior}" '
             f'[{var1.replace("_", " ")} xmap {var2.replace("_", " ")}]',
@@ -132,5 +139,8 @@ def main(base_results_dir, group_config, config_obj):
         plt.tight_layout()
         plt.savefig(os.path.join(plots_dir, f"stat_plot_ccm_{target_behavior}_{var1}_vs_{var2}.png"), dpi=300)
         plt.close()
+        generated += 1
 
+    if not generated:
+        raise ValueError('No eligible finite CCM results. Check target behavior, continuous sample length and metric pairs.')
     logger.info(f"CCM analysis complete. Plots saved to: {plots_dir}")

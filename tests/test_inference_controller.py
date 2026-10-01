@@ -235,3 +235,51 @@ def test_run_file_inference_routes_single_video_crop_output_to_verified_runner(
         if "destroy" in commands:
             root.destroy()
         tk._default_root = previous_default_root
+
+
+def test_tracking_labels_include_ids_only_when_visible(tmp_path: Path) -> None:
+    previous_default_root = getattr(tk, "_default_root", None)
+    root = _make_tk_root()
+    tk._default_root = root
+    try:
+        app = MagicMock()
+        app.root = root
+        app.keypoint_names = []
+        app.config = ConfigManager(app)
+        app.config.pose_clustering.skeleton_connections = []
+        app.config.analytics.single_animal_analysis_var.set(False)
+        model_path = tmp_path / "model.pt"
+        video_path = tmp_path / "video.mp4"
+        model_path.write_bytes(b"placeholder")
+        video_path.write_bytes(b"placeholder")
+        cfg = app.config.inference
+        cfg.trained_model_path_infer.set(str(model_path))
+        cfg.video_infer_path.set(str(video_path))
+        controller = InferenceController(app)
+        for tracking, labels, hidden, disabled, expected in [
+            (True, True, False, False, True),
+            (False, True, False, False, False),
+            (True, False, False, False, False),
+            (True, True, True, False, False),
+            (True, True, False, True, False),
+        ]:
+            cfg.use_tracker_var.set(tracking)
+            cfg.sv_use_label_var.set(labels)
+            cfg.infer_hide_labels_var.set(hidden)
+            settings = controller.build_supervision_settings(disable_overlays=disabled)
+            assert settings.annotation.use_tracker_ids is expected
+            assert settings.use_tracker is tracking
+            if disabled:
+                from integra_pose.logic.supervision_runner import SupervisionInferenceRunner
+
+                runner = SupervisionInferenceRunner.__new__(SupervisionInferenceRunner)
+                runner.settings = settings
+                assert runner._has_overlay_layers() is False
+    finally:
+        try:
+            commands = set(root.tk.call("info", "commands"))
+        except tk.TclError:
+            commands = set()
+        if "destroy" in commands:
+            root.destroy()
+        tk._default_root = previous_default_root

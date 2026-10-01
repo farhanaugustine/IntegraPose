@@ -1984,6 +1984,23 @@ class SupervisionInferenceRunner:
             pass
         return cv2.waitKey(max(1, int(delay_ms))) & 0xFF
 
+    @staticmethod
+    def _fit_preview_viewport(frame: np.ndarray, width: int, height: int) -> np.ndarray:
+        """Letterbox for HighGUI backends that stretch resizable windows."""
+        if width <= 0 or height <= 0:
+            return frame
+        source_h, source_w = frame.shape[:2]
+        # Keep the display buffer bounded by the already resized preview.
+        scale = min(1.0, max(source_w, source_h) / max(width, height))
+        canvas_w, canvas_h = max(1, round(width * scale)), max(1, round(height * scale))
+        fit = min(canvas_w / source_w, canvas_h / source_h)
+        image_w, image_h = max(1, round(source_w * fit)), max(1, round(source_h * fit))
+        image = cv2.resize(frame, (image_w, image_h), interpolation=cv2.INTER_AREA if fit < 1 else cv2.INTER_LINEAR)
+        canvas = np.zeros((canvas_h, canvas_w, *frame.shape[2:]), dtype=frame.dtype)
+        left, top = (canvas_w - image_w) // 2, (canvas_h - image_h) // 2
+        canvas[top:top + image_h, left:left + image_w] = image
+        return canvas
+
     def _show_preview_frame(self, frame_index: int, frame: np.ndarray) -> bool:
         if not self.settings.show or frame is None:
             return False
@@ -1992,6 +2009,12 @@ class SupervisionInferenceRunner:
             self._preview_window_ready = True
         if self._should_render_preview(frame_index, self.settings.preview_frame_stride):
             preview_frame = self._resize_preview_frame(frame, self.settings.preview_max_side)
+            try:
+                _, _, viewport_w, viewport_h = cv2.getWindowImageRect(self._WINDOW_NAME)
+                preview_frame = self._fit_preview_viewport(preview_frame, viewport_w, viewport_h)
+            except (cv2.error, AttributeError):
+                # Some HighGUI backends cannot expose their drawing rectangle.
+                pass
             cv2.imshow(self._WINDOW_NAME, preview_frame)
         return self._poll_preview_key(1) == ord("q")
 
